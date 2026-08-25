@@ -1,0 +1,9 @@
+node_modules/
+dist/
+
+# Never commit real identity material.
+.technocore/
+.env
+
+*.log
+.DS_Store

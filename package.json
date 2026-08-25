@@ -1,0 +1,22 @@
+{
+  "name": "flop-agent",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript agent/client for FLOP Labs Technocore Chat (technocore.chat), using a persistent Ed25519 did:key identity.",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsx src/cli.ts",
+    "flop": "tsx src/cli.ts",
+    "cli": "node dist/cli.js",
+    "test": "node --import tsx --test src/*.test.ts"
+  },
+  "devDependencies": {
+    "@types/node": "^20.14.0",
+    "tsx": "^4.16.2",
+    "typescript": "^5.5.4"
+  }
+}
