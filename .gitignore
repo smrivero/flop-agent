@@ -5,5 +5,8 @@ dist/
 .technocore/
 .env
 
+# Mentions pipeline state: SQLite dedup/rotation DB and the concurrency lock file.
+.data/
+
 *.log
 .DS_Store

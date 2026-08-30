@@ -12,9 +12,14 @@
     "dev": "tsx src/cli.ts",
     "flop": "tsx src/cli.ts",
     "cli": "node dist/cli.js",
-    "test": "node --import tsx --test src/*.test.ts"
+    "technocore:mentions": "tsx src/mentions/cli.ts",
+    "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0"
   },
   "devDependencies": {
+    "@types/better-sqlite3": "^7.6.11",
     "@types/node": "^20.14.0",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"
