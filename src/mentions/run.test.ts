@@ -218,3 +218,58 @@ test("run: an OpenAI failure with PUBLISH_IF_ANALYSIS_FAILS=false skips that men
   assert.equal(sendCalls, 0);
   assert.equal(summary.rejected, 1);
 });
+
+// -- persistent backlog ---------------------------------------------------
+
+test("backlog: candidates beyond MAX_POSTS_PER_RUN are not lost -- a later run publishes them", async () => {
+  const config = baseConfig({ maxPostsPerRun: 3 });
+  const provider = new FakeSearchProvider({ "only query": resultsNamed(8) });
+  const sent: string[] = [];
+  const deps = { searchProvider: provider, sendMessage: async (_room: string, text: string) => { sent.push(text); return { seq: sent.length }; } };
+
+  const first = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(first.published, 3); // only the budget for this run
+  assert.equal(first.new, 8); // but all 8 were discovered and registered
+
+  // Second run: the search provider returns the SAME 8 results again (as it
+  // would in real life, since nothing new happened) -- every one of them is
+  // already known (3 published + 5 backlogged), so summary.new should be 0...
+  const second = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(second.new, 0);
+  // ...yet 3 more get published anyway, pulled from the backlog left by the first run.
+  assert.equal(second.published, 3);
+  assert.equal(sent.length, 6);
+
+  // Third run drains the last 2.
+  const third = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(third.published, 2);
+  assert.equal(sent.length, 8);
+
+  // Nothing left to do on a fourth run.
+  const fourth = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(fourth.published, 0);
+});
+
+test("backlog: a dry-run preview does not consume the backlog", async () => {
+  const config = baseConfig({ maxPostsPerRun: 2 });
+  const provider = new FakeSearchProvider({ "only query": resultsNamed(5) });
+  let sendCalls = 0;
+  const deps = { searchProvider: provider, sendMessage: async () => { sendCalls++; return { seq: sendCalls }; } };
+
+  const real = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(real.published, 2); // 3 left in the backlog
+
+  const previewSent: string[] = [];
+  const dryRunResult = await runMentions(config, { dryRun: true }, {
+    searchProvider: new FakeSearchProvider({ "only query": [] }), // no new search results this time
+    sendMessage: async (_room, text) => { previewSent.push(text); return { seq: 1 }; },
+  });
+  assert.equal(dryRunResult.published, 2); // previews 2 of the 3 backlogged items
+  assert.equal(previewSent.length, 0); // but never actually calls sendMessage
+
+  // The backlog is untouched -- a real run right after still finds the same 3 pending.
+  const followUp = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(followUp.published, 2);
+  const final = await runMentions(config, { dryRun: false }, deps);
+  assert.equal(final.published, 1);
+});

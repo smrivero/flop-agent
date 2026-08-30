@@ -105,6 +105,18 @@ export function getMention(db: MentionsDb, id: number): MentionRow | undefined {
   return db.prepare(`SELECT * FROM mentions WHERE id = ?`).get(id) as MentionRow | undefined;
 }
 
+/**
+ * The persistent backlog: mentions found (in this run or an earlier one) that
+ * never got resolved to published/rejected/failed, oldest first. This is what
+ * makes "found 20, published 5" not lose the other 15 -- they stay `discovered`
+ * and are exactly what this returns next time, ahead of brand-new results.
+ */
+export function getPendingBacklog(db: MentionsDb, limit: number): MentionRow[] {
+  return db
+    .prepare(`SELECT * FROM mentions WHERE status = 'discovered' ORDER BY discovered_at ASC, id ASC LIMIT ?`)
+    .all(limit) as MentionRow[];
+}
+
 // -- query rotation -------------------------------------------------------------
 
 /** Read-only: what the next batch would be, without moving the cursor. */

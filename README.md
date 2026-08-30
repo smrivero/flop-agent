@@ -194,15 +194,20 @@ The template below is written with line breaks for readability in code; what act
 gets signed and stored is the same content flattened to one line with spaces:
 
 ```
-New Technocore mention
+Technocore is popping up somewhere new!
 
-<domain>
-<title>
+<domain> — <title>
 
 [<AI summary, 1-2 sentences, only if GENERATE_SUMMARY=true>]
 
-<canonical URL>
+Go check it out -> <canonical URL>
 ```
+
+Wording lives in `formatMessage()` (`publisher/publishMention.ts`) -- it's plain string
+formatting, not AI-generated, so it's a one-line edit if you want a different voice. The
+AI-generated part (the summary, when `GENERATE_SUMMARY=true`) stays factual by design (see
+the OpenAI prompt rules above) -- the enthusiasm is in the wrapper, not put in the model's
+mouth.
 
 ### Domain filtering
 
@@ -212,16 +217,30 @@ New Technocore mention
 into the filtering logic) so the room stays *external* coverage; set it to `true` to
 allow them through.
 
-### Run limits and ordering
+### Run limits, ordering, and the persistent backlog
 
-`MAX_POSTS_PER_RUN` (default 5) bounds how many messages one invocation can send --
-important the first time you run this against a room with a long backlog of candidate
-mentions. Ordering is published date (newest first), then position in the search
-response; relevance (when `FILTER_WITH_OPENAI` is on) is applied as a strict pass/fail
-filter during that same pass rather than as a full re-sort, so cost stays bounded to
-"one page fetch + one OpenAI call per candidate considered" instead of analyzing the
-entire backlog just to reorder it. If you'd rather maximize for relevance even at higher
-cost, that's a one-line change in `run.ts` (`ranked.sort`) -- ask and I'll adjust it.
+`MAX_POSTS_PER_RUN` (default 5) bounds how many mentions one invocation *processes* --
+not how many it successfully sends. Every run considers exactly that many pending
+mentions (fetch/analyze/publish-or-reject each), win or lose, so a run of failures can't
+silently balloon into processing far more than its budget while it hunts for successes.
+
+**Nothing found is ever lost to the cap.** Every newly-deduped candidate is written to
+SQLite as `discovered` immediately, regardless of whether this run gets to it. Each run's
+actual work queue is pulled from that backlog -- oldest `discovered` row first -- which
+naturally mixes in whatever a previous run didn't get to, ahead of this run's fresh finds.
+Found 20 in one run with `MAX_POSTS_PER_RUN=5`? Five get processed now, the other 15 stay
+`discovered` and are exactly what the *next* run picks up first -- even if that next run's
+search comes back with nothing new. It can take several runs to fully drain a large
+backlog; that's intentional, it's the same mechanism that keeps a single run's OpenAI/
+Technocore-write cost predictable.
+
+Within one run, new candidates are ordered by published date (newest first), then position
+in the search response, before being registered -- so when a run's search does turn up
+fresh material, it's queued in a sensible order rather than arbitrarily. Relevance (when
+`FILTER_WITH_OPENAI` is on) is applied as a pass/fail filter per item as its turn comes up,
+not as a global re-sort -- re-sorting the *entire* backlog by relevance would mean
+analyzing all of it with OpenAI just to reorder it, which defeats the cost-consciousness
+this whole pipeline is built around.
 
 ### Dry run and mock search
 
@@ -231,8 +250,11 @@ npm run technocore:mentions -- --dry-run
 
 Runs the full pipeline (search, canonicalize, dedupe, optional OpenAI analysis) and
 prints exactly what it would post, but performs **no** Technocore write and makes
-**no** database write at all (so repeated dry-runs stay reproducible and the query
-rotation doesn't advance either).
+**no** database write at all -- repeated dry-runs stay reproducible: the query rotation
+doesn't advance, and nothing gets registered into the backlog. It previews the *real*
+backlog (a read) plus this run's fresh finds (kept in memory only), so a dry-run
+against a project with a large pending backlog shows you what a real run would actually
+work through next, without touching it.
 
 ```bash
 npm run technocore:mentions -- --limit=2
@@ -315,9 +337,10 @@ booleans, counts, and short error messages.
   (expected, harmless) or a previous run crashed hard enough to leave a lock from a
   still-running PID. Check `.data/mentions.lock`'s `pid` against `ps -p <pid>`; if it's
   not your process, delete the lock file.
-- **Nothing gets published on the first real run** -- check `MAX_POSTS_PER_RUN`; a large
-  backlog of genuinely-new mentions is capped on purpose. Increase `--limit` for one
-  manual catch-up run if that's intentional.
+- **Only `MAX_POSTS_PER_RUN` messages appear even though many more were found** -- correct,
+  on purpose. The rest are sitting in SQLite with `status='discovered'` and will be the
+  *first* things the next run processes -- nothing is lost, it just spreads over several
+  runs. Use `--limit=N` for one larger manual catch-up run if you want it faster.
 - **A mention never reappears after `rejected`** -- correct: any status in the `mentions`
   table (including `rejected`) marks that URL as already-processed, by design, so a
   filtered-out mention isn't retried every hour.
