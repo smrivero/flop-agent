@@ -9,8 +9,15 @@
  * SECURITY
  *  - This module never logs, prints, or returns the seed / private key in any error
  *    message. Errors here name the identity *path*, never its contents.
- *  - It never generates a keypair (see scripts/generate-identity.mjs for that, run
- *    manually and separately).
+ *  - `loadIdentity` (the primary, user-facing identity flow) never generates a
+ *    keypair -- see scripts/generate-identity.mjs for that, run manually and
+ *    separately, for the human operator's own identity.
+ *  - `generateIdentitySeed` below is the one exception, and it is *not* wired into
+ *    `loadIdentity` or the CLI: it exists only for callers that explicitly need to
+ *    self-bootstrap a *different* identity unattended (e.g. an autonomous service's
+ *    own agent DIDs, which must exist before the service can run without a human
+ *    present to run the manual script). It never touches disk itself -- the caller
+ *    decides if/where to persist the result, same discipline as everywhere else here.
  *  - It reads .technocore/identity.json once, synchronously, at load time, and uses
  *    the seed only to construct an in-memory Ed25519 KeyObject for signing --
  *    nothing derived from the seed is ever serialized back out except signatures.
@@ -34,6 +41,7 @@ import {
   createHash,
   createPrivateKey,
   createPublicKey,
+  generateKeyPairSync,
   sign as ed25519Sign,
   verify as ed25519Verify,
 } from "node:crypto";
@@ -51,7 +59,12 @@ const B58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz
 const B58_INDEX = new Map([...B58_ALPHABET].map((c, i) => [c, i]));
 const MULTIBASE_CHARS = 48; // "z" + 47 base58btc chars
 export const DID_PATTERN = /^did:key:z6Mk[1-9A-HJ-NP-Za-km-z]{44}$/;
-export const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{86}$/; // 64 raw bytes, base64url, unpadded
+// 64 raw bytes is 512 bits; 86 base64url chars carry 516, so the last char's low 4 bits
+// are slack a correct encoder always zeroes -- only [AQgw] as the last char is canonical
+// (server-enforced as of technocore-chat #178, confirmed against the live repo). Node's
+// own base64url encoder always produces one of these, so this never affects our own
+// signing -- only tightens what we accept when verifying someone else's.
+export const SIGNATURE_PATTERN = /^[A-Za-z0-9_-]{85}[AQgw]$/; // 64 raw bytes, base64url, unpadded, canonical
 
 // RFC 8410 fixed DER prefixes for Ed25519 (32-byte key material either way; the
 // prefix length never varies, so concatenation is exact, not an approximation).
@@ -99,6 +112,23 @@ export function didFromPublicKey(publicKeyBytes: Uint8Array): string {
     throw new DidError(`internal: bad multibase length ${multibase.length}`);
   }
   return DID_PREFIX + multibase;
+}
+
+/**
+ * Generate a fresh Ed25519 keypair and return it as `{ did, seedHex }` -- the same
+ * shape `loadIdentity` expects on disk. Pure: no file I/O, nothing printed. See the
+ * SECURITY note at the top of this file for who this is (and is not) for.
+ *
+ * Identical construction to scripts/generate-identity.mjs (JWK export for raw
+ * key bytes, verified byte-for-byte against the official did:key decoder) --
+ * kept as a second, independent implementation there deliberately, since that
+ * script is meant to run with zero dependencies/imports for the manual flow.
+ */
+export function generateIdentitySeed(): { did: string; seedHex: string } {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const publicKeyBytes = Buffer.from((publicKey.export({ format: "jwk" }) as { x: string }).x, "base64url");
+  const seedBytes = Buffer.from((privateKey.export({ format: "jwk" }) as { d: string }).d, "base64url");
+  return { did: didFromPublicKey(publicKeyBytes), seedHex: seedBytes.toString("hex") };
 }
 
 /** The 32 raw Ed25519 public-key bytes of a did:key, or throw DidError. Mirrors

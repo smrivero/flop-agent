@@ -62,6 +62,9 @@ export interface Message {
   text: string;
   /** Present only for signed writes. */
   nonce?: number;
+  /** Present only for signed writes (added server-side so a record can be
+   * re-verified offline later -- confirmed against the live repo 2026-08-30). */
+  sig?: string;
 }
 
 export interface RoomView {
@@ -192,6 +195,70 @@ export function verifySignatureLocally(
   return verifyEd25519(request.did, request.signature, canonical);
 }
 
+// -- signed notes (room-owners / room-allow are the only signed-note namespaces) --
+
+export interface SignedNoteRequest {
+  ns: string;
+  key: string;
+  /** Value after the single-line sweep -- what actually gets signed and stored. */
+  sweptValue: string;
+  nonce: string;
+  did: string;
+  signature: string;
+  /** `${ns}|${key}|${nonce}|${sweptValue}` -- exactly what was signed. */
+  canonicalMessage: string;
+  /** GET URL for the signed write, not yet sent (no query string -- caller
+   * appends `?if_absent=1` etc as needed). */
+  url: string;
+}
+
+/**
+ * Build (and sign) a signed note write (`/kv/<ns>/<key>/set-signed/...`) without
+ * sending it. Only `room-owners` and `room-allow` accept signed writes -- every
+ * other namespace is world-writable and uses the plain (unsigned) note lane.
+ *
+ * Signed bytes: UTF-8 of `${ns}|${key}|${nonce}|${sweptValue}` (manual.md
+ * SIGNING / OWNED ROOMS, confirmed against src/app.py `note_write_signed`).
+ */
+export function buildSignedNoteRequest(
+  ns: string,
+  key: string,
+  value: string,
+  options: BuildSignedMessageOptions = {},
+): SignedNoteRequest {
+  assertValidName("namespace", ns);
+  assertValidName("key", key);
+
+  const sweptValue = sweepText(value);
+  if (!sweptValue) {
+    throw new TechnocoreError("nothing visible would be left after the single-line sweep");
+  }
+  if (sweptValue.length > MAX_VALUE_CHARS) {
+    throw new TechnocoreError(`${sweptValue.length} characters after the sweep, over the ${MAX_VALUE_CHARS}-character cap`);
+  }
+
+  const identity = options.identity ?? loadIdentity(options.identityOptions);
+  const nonce = options.nonce ?? nextNonce();
+  if (!NONCE_PATTERN.test(nonce)) {
+    throw new TechnocoreError(`invalid nonce: ${JSON.stringify(nonce)} (must be 1-19 ASCII digits)`);
+  }
+
+  const canonicalMessage = `${ns}|${key}|${nonce}|${sweptValue}`;
+  const signature = identity.sign(canonicalMessage);
+
+  const baseUrl = options.baseUrl ?? DEFAULT_BASE_URL;
+  const url = `${baseUrl}/kv/${ns}/${key}/set-signed/${identity.did}/${signature}/${nonce}/${encodeURIComponent(sweptValue)}`;
+
+  return { ns, key, sweptValue, nonce, did: identity.did, signature, canonicalMessage, url };
+}
+
+export function verifyNoteSignatureLocally(
+  request: Pick<SignedNoteRequest, "ns" | "key" | "nonce" | "sweptValue" | "did" | "signature">,
+): boolean {
+  const canonical = `${request.ns}|${request.key}|${request.nonce}|${request.sweptValue}`;
+  return verifyEd25519(request.did, request.signature, canonical);
+}
+
 // -- HTTP ---------------------------------------------------------------------
 
 export interface TechnocoreClientOptions {
@@ -257,14 +324,38 @@ export class TechnocoreClient {
     return Array.isArray(body) ? body : (body.rooms ?? []);
   }
 
-  /** GET /kv/<ns>/<key> */
+  /**
+   * GET /kv/<ns>/<key>. The plain-text lane always prepends an untrusted-content
+   * banner before the value (`src/app.py` `note_read`: `text(f"{BANNER}\n\n{value}"
+   * + budget_note(...))`) and has no `?format=json` alternative (unlike room
+   * reads) -- confirmed against the live server 2026-08-30. Strip it structurally
+   * (split on the first blank line, take the first line after it) rather than by
+   * matching the banner's exact wording, which is prose and free to change.
+   */
   async readNote(ns: string, key: string): Promise<string | null> {
     assertValidName("namespace", ns);
     assertValidName("key", key);
     const response = await this.fetchImpl(`${this.baseUrl}/kv/${ns}/${key}`);
     if (response.status === 404) return null;
     if (!response.ok) return parseErrorResponse(response);
-    return await response.text();
+    const raw = await response.text();
+    const separatorIndex = raw.indexOf("\n\n");
+    const afterBanner = separatorIndex === -1 ? raw : raw.slice(separatorIndex + 2);
+    return afterBanner.split("\n")[0];
+  }
+
+  /** GET /kv/<ns>/<key>/set/<value> -- the ordinary, unsigned, world-writable
+   * note lane (everything except room-owners/room-allow uses this). */
+  async writeNote(ns: string, key: string, value: string): Promise<void> {
+    assertValidName("namespace", ns);
+    assertValidName("key", key);
+    const swept = sweepText(value);
+    if (!swept) throw new TechnocoreError("nothing visible would be left after the single-line sweep");
+    if (swept.length > MAX_VALUE_CHARS) {
+      throw new TechnocoreError(`${swept.length} characters, over the ${MAX_VALUE_CHARS}-character note cap`);
+    }
+    const response = await this.fetchImpl(`${this.baseUrl}/kv/${ns}/${key}/set/${encodeURIComponent(swept)}`);
+    if (!response.ok) return parseErrorResponse(response);
   }
 
   /**
@@ -289,5 +380,64 @@ export class TechnocoreClient {
     const body = (await response.json()) as RoomView & { posted: Message };
     const { posted, ...view } = body;
     return { posted, view: view as RoomView };
+  }
+
+  /**
+   * Same signed write, over `POST /r/<room>` instead of the GET/URL lane --
+   * confirmed against the current `room_post` handler: body
+   * `{did, sig, nonce, text}`, where `text` may be the already-swept text (the
+   * server sweeps again before storing/verifying, and sweeping is idempotent,
+   * so sending the exact bytes we signed is safe and avoids any drift between
+   * this client's sweep and the server's). Preferred over the GET lane for
+   * longer messages -- no URL-length concern, and the message never needs
+   * percent-encoding.
+   */
+  async sendSignedMessagePost(
+    room: string,
+    text: string,
+    options: BuildSignedMessageOptions = {},
+  ): Promise<{ posted: Message; view: RoomView }> {
+    const built = buildSignedMessageRequest(room, text, options);
+
+    if (!verifySignatureLocally(built)) {
+      throw new TechnocoreError("local signature verification failed -- refusing to send");
+    }
+
+    const response = await this.fetchImpl(`${this.baseUrl}/r/${room}?format=json`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ did: built.did, sig: built.signature, nonce: built.nonce, text: built.sweptText }),
+    });
+    if (!response.ok) return parseErrorResponse(response);
+    const body = (await response.json()) as RoomView & { posted: Message };
+    const { posted, ...view } = body;
+    return { posted, view: view as RoomView };
+  }
+
+  /** GET /kv/<ns>/<key>/set-signed/... -- only room-owners / room-allow accept this.
+   * `condition` maps to `?if_absent=1` or `?if=<expected>`, same as the unsigned lane. */
+  async setSignedNote(
+    built: SignedNoteRequest,
+    condition: { ifAbsent?: boolean; ifEquals?: string } = {},
+  ): Promise<void> {
+    if (!verifyNoteSignatureLocally(built)) {
+      throw new TechnocoreError("local signature verification failed -- refusing to send");
+    }
+    const params = new URLSearchParams();
+    if (condition.ifAbsent) params.set("if_absent", "1");
+    if (condition.ifEquals !== undefined) params.set("if", condition.ifEquals);
+    const query = params.toString();
+
+    const response = await this.fetchImpl(query ? `${built.url}?${query}` : built.url);
+    if (!response.ok) return parseErrorResponse(response);
+  }
+
+  /** GET /kv/room-nonce/<room> -- server-written replay counter shared by the
+   * room-owners and room-allow signed-note namespaces. 0 if never written. */
+  async readRoomNonce(room: string): Promise<number> {
+    const raw = await this.readNote("room-nonce", room);
+    if (raw === null) return 0;
+    const n = Number.parseInt(raw.trim(), 10);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
   }
 }

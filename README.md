@@ -344,3 +344,177 @@ booleans, counts, and short error messages.
 - **A mention never reappears after `rejected`** -- correct: any status in the `mentions`
   table (including `rejected`) marks that URL as already-processed, by design, so a
   filtered-out mention isn't retried every hour.
+
+## Autonomous debate service (`src/debate/`)
+
+Two independent, persistent AI agents debate a configurable topic forever, each posting
+signed Technocore messages under its own `did:key` identity. One long-running process, one
+event loop, a random delay between turns -- not cron, not a fixed number of rounds.
+
+### Architecture
+
+```
+src/debate/
+  types.ts       shared interfaces (DebateConfig, DebateDefinition, LoadedAgent, ...)
+  config.ts       .env (secrets/infra) + config/debate.yaml (the conversation) loading
+  identity.ts      load-or-generate per-agent identity (never regenerates an existing one)
+  runtime.ts        wires config + identities + clients together; idempotent room setup
+  ownership.ts       d-room claim + allow-list, exact current Technocore protocol
+  history.ts          reads the room, filters to agent-signed messages, turn alternation
+  state.ts             bounded local memory (data/state/<room>.json) -- an aid, not the
+                       source of truth for turn order (the room always is)
+  sanitize.ts           single-line + MAX_MESSAGE_CHARS enforcement, right before signing
+  openai.ts              one Responses API call per turn, hosted web_search tool
+  prompt.ts               builds `instructions` (personality, always highest priority) and
+                          `input` (topic, recent conversation, opponent's latest message,
+                          memory of arguments already used) -- room content never leaks
+                          into `instructions`
+  loop.ts                 one turn, and the outer sleep-and-repeat loop with graceful
+                          SIGTERM/SIGINT shutdown
+  cli.ts / setup-cli.ts / status-cli.ts   the three entry points below
+  testUtils.ts             an in-memory fake Technocore server, tests only
+```
+
+Reuses completely, unchanged: `TechnocoreClient` (`../technocore.ts`) for every Technocore
+call, and `identity.ts`'s existing `did:key` sign/verify/DID-encoding for every signature
+this service produces. The only additions to those shared files were: a `sig?` field on
+`Message` (the server now returns it), `buildSignedNoteRequest`/`setSignedNote`/`writeNote`
+(room-ownership and topic writes didn't exist before), `sendSignedMessagePost` (POST lane,
+preferred here for message size), and `generateIdentitySeed` (pure keygen, opt-in, not
+wired into the primary manual-identity flow at all). The mentions pipeline is untouched.
+
+### Configuration: two files, on purpose
+
+- **`.env`** -- secrets and infrastructure (`OPENAI_API_KEY`, timeouts, paths).
+- **`config/debate.yaml`** -- the conversation itself (room, topic, language, both agents'
+  name/position/personality file). Never holds a secret. Swapping this file (plus the
+  personality files it points at) reconfigures the entire debate with zero code changes.
+- **`prompts/*.md`** -- each agent's personality, in its own file, referenced by
+  `personalityFile` in the YAML (path resolved relative to the YAML file itself).
+
+### OpenAI setup
+
+Only `OPENAI_API_KEY` is required. `OPENAI_MODEL` is read as a plain string and never
+hardcoded anywhere -- swapping models is a config-only change. One
+`client.responses.create(...)` call per turn, with `tools: [{ type: "web_search" }]`
+when `WEB_SEARCH_ENABLED=true` (the current tool type per OpenAI's docs, confirmed while
+building this -- the installed SDK's bundled types still only list the older
+`web_search_preview` variants, so that one field carries a deliberate, commented type
+escape; the request itself is plain JSON and unaffected). `OPENAI_MAX_OUTPUT_TOKENS`
+bounds cost per turn. Retry/backoff for 429/5xx and the request timeout are both the
+official SDK's own `maxRetries`/`timeout` client options -- not reimplemented.
+
+### Technocore setup
+
+Re-verified against the live repo and `/openapi.json` while building this (protocol had
+genuinely changed since earlier work in this project): signed writes now require a
+*canonical* signature encoding (enforced client-side too, see `identity.ts`
+`SIGNATURE_PATTERN`), and the server now refuses posting the same exact text 5+ times
+within 60s (422) -- handled here as a distinct, non-retried failure (retrying identical
+bytes would just be refused again). Messages are posted via `POST /r/<room>` (preferred
+per this project's own requirement, and avoids any URL-length concern from longer
+messages). Room ownership uses the exact signed-note flow in `manual.md`'s OWNED ROOMS
+section: Agent A claims via `room-owners`, Agent B is added to `room-allow`, both nonces
+read fresh from `/kv/room-nonce/<room>` before every write.
+
+### DID persistence
+
+Each agent's identity lives at `AGENT_A_IDENTITY_PATH` / `AGENT_B_IDENTITY_PATH` (default
+`./data/identities/agent-{a,b}.json`, gitignored, `0600`/`0700` permissions). On startup:
+file exists -> load it; file absent -> generate it once and save it. A restart, a crash, a
+container recreate -- none of these ever regenerate an existing identity; only deleting the
+file would. If you already have a DID for Agent A, put its `{did, seedHex}` JSON at that
+exact path before first start and it will be loaded, not replaced.
+
+### Turn order and crash safety
+
+The room is the only source of truth for whose turn it is: every turn starts by reading
+the room fresh and looking at the last agent-signed message in it (empty room -> Agent A;
+otherwise the other agent from whoever spoke last). Local state (`data/state/<room>.json`)
+is never consulted for this -- it only holds a bounded "arguments already used" memory aid.
+This is what makes a crash between "message posted" and "local state saved" harmless: on
+restart, the room already shows the post, so the next turn correctly goes to the other
+agent and nothing is ever reposted.
+
+### Running locally
+
+```bash
+cp .env.example .env   # fill in OPENAI_API_KEY at minimum
+npm install
+npm run debate:setup   # idempotent: claims the room for Agent A, allow-lists Agent B
+npm run debate         # the long-running service -- Ctrl+C for graceful shutdown
+```
+
+```bash
+npm run status         # read-only snapshot -- never prints secrets
+```
+
+### Changing the debate (no code changes, no rebuild)
+
+Edit `config/debate.yaml` (room, topic, language, agent name/position/personality path) or
+the personality files it points at, then restart:
+
+```bash
+nano config/debate.yaml
+docker compose restart debate   # or Ctrl+C / npm run debate again, locally
+```
+
+Changing `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` (frequency) is a plain `.env` edit +
+restart, same as any other setting there.
+
+### Running with Docker
+
+```bash
+docker compose up -d
+docker compose logs -f
+docker compose restart debate
+docker compose down
+```
+
+`restart: unless-stopped`, and `./data` is bind-mounted (`Dockerfile`/`docker-compose.yml`)
+so both identities and local memory survive container recreation -- never stored only in
+the ephemeral container filesystem. `./config` and `./prompts` are also bind-mounted, which
+is what makes "edit the YAML, `docker compose restart`" work without a rebuild.
+
+### Logs
+
+```
+[startup] autonomous debate service
+[room] d-elclasico
+[topic] Two autonomous football agents debate which is the greatest club: FC Barcelona or Real Madrid.
+[agent-a] did:key:z6Mk...
+[agent-b] did:key:z6Mk...
+[turn] next_speaker=cules-ai
+[openai] generating=true web_search=true
+[openai] input=3120 output=340
+[technocore] posted=seq=108
+[sleep] next message in 184 seconds
+```
+
+Never logs `OPENAI_API_KEY`, DID private keys, or request headers.
+
+### Stopping / restarting
+
+`Ctrl+C` (SIGINT) or `docker compose stop` (SIGTERM) both trigger graceful shutdown: the
+service finishes whatever it's doing, does not start a new turn, and exits without waiting
+out a pending sleep. `docker compose restart` / re-running `npm run debate` resumes exactly
+where the room says the conversation is -- never restarts from Agent A.
+
+### Complete example: Barcelona vs Real Madrid
+
+This is the shipped default (`config/debate.yaml`, `prompts/barcelona.md`,
+`prompts/real-madrid.md`) -- `npm run debate:setup && npm run debate` runs it as-is. To run
+a different debate instead (no code changes):
+
+```yaml
+room: d-btc-gold
+topic: Bitcoin vs Gold
+agentA:
+  name: btc-maximalist
+  position: Bitcoin is the superior monetary asset
+  personalityFile: ./prompts/bitcoin-maximalist.md
+agentB:
+  name: gold-investor
+  position: Gold is the superior monetary asset
+  personalityFile: ./prompts/gold-investor.md
+```

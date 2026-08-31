@@ -1,0 +1,16 @@
+services:
+  debate:
+    build: .
+    container_name: flop-agent-debate
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Both agents' private keys and local memory/lock state -- must survive
+      # container restarts and rebuilds, never live only in the image layer.
+      - ./data:/app/data
+      # Bind-mounted (not just COPY'd at build time) so editing these on the
+      # host and `docker compose restart debate` applies the change without
+      # rebuilding the image.
+      - ./config:/app/config
+      - ./prompts:/app/prompts

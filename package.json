@@ -13,10 +13,15 @@
     "flop": "tsx src/cli.ts",
     "cli": "node dist/cli.js",
     "technocore:mentions": "tsx src/mentions/cli.ts",
-    "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts"
+    "debate": "tsx src/debate/cli.ts",
+    "debate:setup": "tsx src/debate/setup-cli.ts",
+    "status": "tsx src/debate/status-cli.ts",
+    "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts src/debate/*.test.ts"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0"
+    "better-sqlite3": "^11.3.0",
+    "openai": "^4.68.0",
+    "yaml": "^2.5.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",

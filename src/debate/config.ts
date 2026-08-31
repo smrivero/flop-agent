@@ -1,0 +1,137 @@
+/**
+ * Secrets/infrastructure (.env) and the conversation definition (config/debate.yaml)
+ * are deliberately separate files, per the project's own requirement: changing the
+ * room, topic, personalities or pacing must never mean editing source code, and
+ * must never mean touching the file that holds API keys either.
+ */
+
+import { readFileSync } from "node:fs";
+import { dirname, resolve } from "node:path";
+import { parse as parseYaml } from "yaml";
+import type { AgentSpec, DebateConfig, DebateDefinition } from "./types.js";
+
+export class DebateConfigError extends Error {}
+
+function requireEnv(env: NodeJS.ProcessEnv, key: string): string {
+  const value = env[key];
+  if (!value) throw new DebateConfigError(`${key} is required (set it in .env)`);
+  return value;
+}
+
+function parseIntEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw === "") return defaultValue;
+  const n = Number.parseInt(raw, 10);
+  if (!Number.isFinite(n) || n < 0) throw new DebateConfigError(`${key} must be a non-negative integer, got ${JSON.stringify(raw)}`);
+  return n;
+}
+
+function parseBoolEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: boolean): boolean {
+  const raw = env[key];
+  if (raw === undefined || raw === "") return defaultValue;
+  return raw.trim().toLowerCase() === "true";
+}
+
+export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateConfig {
+  const minDelaySeconds = parseIntEnv(env, "MIN_DELAY_SECONDS", 60);
+  const maxDelaySeconds = parseIntEnv(env, "MAX_DELAY_SECONDS", 300);
+  if (maxDelaySeconds < minDelaySeconds) {
+    throw new DebateConfigError(`MAX_DELAY_SECONDS (${maxDelaySeconds}) must be >= MIN_DELAY_SECONDS (${minDelaySeconds})`);
+  }
+
+  const logLevel = (env.LOG_LEVEL?.trim().toLowerCase() || "info") as DebateConfig["logLevel"];
+  if (!["debug", "info", "warn", "error"].includes(logLevel)) {
+    throw new DebateConfigError(`LOG_LEVEL must be one of debug/info/warn/error, got ${JSON.stringify(env.LOG_LEVEL)}`);
+  }
+
+  return {
+    openAiApiKey: requireEnv(env, "OPENAI_API_KEY"),
+    openAiModel: requireEnv(env, "OPENAI_MODEL"),
+    openAiMaxOutputTokens: parseIntEnv(env, "OPENAI_MAX_OUTPUT_TOKENS", 900),
+    webSearchEnabled: parseBoolEnv(env, "WEB_SEARCH_ENABLED", true),
+
+    technocoreBaseUrl: env.TECHNOCORE_BASE_URL?.trim() || "https://technocore.chat",
+
+    agentAIdentityPath: env.AGENT_A_IDENTITY_PATH?.trim() || "./data/identities/agent-a.json",
+    agentBIdentityPath: env.AGENT_B_IDENTITY_PATH?.trim() || "./data/identities/agent-b.json",
+
+    debateConfigPath: env.DEBATE_CONFIG?.trim() || "./config/debate.yaml",
+
+    minDelaySeconds,
+    maxDelaySeconds,
+    historyMessages: parseIntEnv(env, "HISTORY_MESSAGES", 12),
+    maxMessageChars: parseIntEnv(env, "MAX_MESSAGE_CHARS", 3500),
+
+    httpTimeoutMs: parseIntEnv(env, "HTTP_TIMEOUT_MS", 30000),
+    maxRetries: parseIntEnv(env, "MAX_RETRIES", 3),
+
+    logLevel,
+
+    statePath: env.DEBATE_STATE_PATH?.trim() || "./data/state",
+    lockPath: env.DEBATE_LOCK_PATH?.trim() || "./data/state/debate.lock",
+  };
+}
+
+function requireField(obj: Record<string, unknown>, path: string, field: string): unknown {
+  if (!(field in obj) || obj[field] === undefined || obj[field] === null || obj[field] === "") {
+    throw new DebateConfigError(`${path}: missing required field "${field}"`);
+  }
+  return obj[field];
+}
+
+function parseAgentSpec(raw: unknown, path: string): AgentSpec {
+  if (typeof raw !== "object" || raw === null) throw new DebateConfigError(`${path} must be an object`);
+  const obj = raw as Record<string, unknown>;
+  const name = requireField(obj, path, "name");
+  const position = requireField(obj, path, "position");
+  const personalityFile = requireField(obj, path, "personalityFile");
+  if (typeof name !== "string" || typeof position !== "string" || typeof personalityFile !== "string") {
+    throw new DebateConfigError(`${path}: name, position and personalityFile must all be strings`);
+  }
+  return { name, position, personalityFile };
+}
+
+/** Loads and validates config/debate.yaml. Personality file paths are resolved
+ * relative to the YAML file's own directory, so the config is portable. */
+export function loadDebateDefinition(path: string): DebateDefinition {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    throw new DebateConfigError(`no debate config at ${path} (set DEBATE_CONFIG to point elsewhere)`);
+  }
+
+  let parsed: unknown;
+  try {
+    parsed = parseYaml(raw);
+  } catch (err) {
+    throw new DebateConfigError(`${path} is not valid YAML: ${(err as Error).message}`);
+  }
+  if (typeof parsed !== "object" || parsed === null) {
+    throw new DebateConfigError(`${path} must contain a YAML mapping`);
+  }
+  const obj = parsed as Record<string, unknown>;
+
+  const room = requireField(obj, path, "room");
+  const topic = requireField(obj, path, "topic");
+  const language = obj.language ?? "English";
+  if (typeof room !== "string" || typeof topic !== "string" || typeof language !== "string") {
+    throw new DebateConfigError(`${path}: room, topic and language must be strings`);
+  }
+
+  const configDir = dirname(resolve(path));
+  const agentA = parseAgentSpec(obj.agentA, `${path}: agentA`);
+  const agentB = parseAgentSpec(obj.agentB, `${path}: agentB`);
+  agentA.personalityFile = resolve(configDir, agentA.personalityFile);
+  agentB.personalityFile = resolve(configDir, agentB.personalityFile);
+
+  return { room: room.trim(), topic: topic.trim(), language: language.trim(), agentA, agentB };
+}
+
+export function loadPersonality(path: string): string {
+  try {
+    return readFileSync(path, "utf8").trim();
+  } catch {
+    throw new DebateConfigError(`no personality file at ${path}`);
+  }
+}

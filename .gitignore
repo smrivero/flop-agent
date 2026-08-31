@@ -8,5 +8,9 @@ dist/
 # Mentions pipeline state: SQLite dedup/rotation DB and the concurrency lock file.
 .data/
 
+# Debate service: both agents' private keys, and local memory/lock state.
+data/identities/
+data/state/
+
 *.log
 .DS_Store
