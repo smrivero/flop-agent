@@ -38,6 +38,20 @@ export interface MentionsConfig {
 
   publishIfAnalysisFails: boolean;
 
+  /** Show a short (8 hex char) form of the finding's content hash in the
+   * public message (`Evidence: sha256:...`). The full hash is always stored
+   * in SQLite regardless of this flag -- it only controls public visibility. */
+  publishContentHash: boolean;
+
+  /** At most once per 24h, publish real aggregated activity numbers from
+   * run_log. Off by default -- never a per-run heartbeat. */
+  publishDailyStatus: boolean;
+
+  /** Mirror {last_run, last_finding, total_findings} to a Technocore note as
+   * public, checkable evidence of activity. SQLite stays the source of truth
+   * regardless -- this is a courtesy copy, never read back by this project. */
+  publishRadarState: boolean;
+
   dbPath: string;
   lockPath: string;
 }
@@ -129,6 +143,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): MentionsConfig
     maxRetries: parseInt10(env.MAX_RETRIES, 2, "MAX_RETRIES"),
 
     publishIfAnalysisFails: parseBool(env.PUBLISH_IF_ANALYSIS_FAILS, true),
+
+    publishContentHash: parseBool(env.PUBLISH_CONTENT_HASH, false),
+    publishDailyStatus: parseBool(env.PUBLISH_DAILY_STATUS, false),
+    publishRadarState: parseBool(env.PUBLISH_RADAR_STATE, false),
 
     dbPath: env.MENTIONS_DB_PATH?.trim() || ".data/mentions.sqlite3",
     lockPath: env.MENTIONS_LOCK_PATH?.trim() || ".data/mentions.lock",

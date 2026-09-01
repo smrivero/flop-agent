@@ -26,21 +26,53 @@
 import { fetchWithTimeout } from "../http.js";
 import { TechnocoreClient } from "../../technocore.js";
 import type { MentionsConfig } from "../config.js";
+import type { AggregatedActivity } from "../database.js";
 
 /** Just the fields the message template needs -- works for a fresh Candidate or
  * a MentionRow pulled back out of the backlog, without coupling this file to
  * either shape specifically. */
 export interface MessageSubject {
+  findingId: string;
   canonicalUrl: string;
   title: string;
   domain: string;
 }
 
-export function formatMessage(subject: MessageSubject, summary: string | undefined): string {
-  const lines = ["Technocore is popping up somewhere new!", "", `${subject.domain} — ${subject.title || "(untitled)"}`];
-  if (summary) lines.push("", summary);
-  lines.push("", `Go check it out -> ${subject.canonicalUrl}`);
+/**
+ * The finding message: a short, verifiable claim, not a link dump. `finding`
+ * is the 1-2 sentence factual claim from analyzeMention.ts (or omitted
+ * entirely when GENERATE_SUMMARY=false -- the ID, title and URL alone are
+ * still a valid, checkable finding). `contentHashShort`, when given, is the
+ * only trace of the evidence hash that appears in the public message -- the
+ * full hash always lives in SQLite regardless (PUBLISH_CONTENT_HASH just
+ * controls whether the short form is *also* visible in the room).
+ */
+export function formatMessage(subject: MessageSubject, finding: string | undefined, contentHashShort: string | undefined): string {
+  const lines = [
+    "Technocore Radar",
+    "",
+    `Finding: ${subject.findingId}`,
+    `Source: ${subject.domain}`,
+    `Title: ${subject.title || "(untitled)"}`,
+  ];
+  if (finding) lines.push("", "Finding:", finding);
+  lines.push("", "Source:", subject.canonicalUrl);
+  if (contentHashShort) lines.push("", `Evidence: sha256:${contentHashShort}`);
   return lines.join("\n");
+}
+
+/** Optional, at most once per 24h, gated entirely outside this function (see
+ * database.ts getLastDailyStatusAt / run.ts) -- this only formats real,
+ * measured numbers, never invents or estimates anything. */
+export function formatDailyStatusMessage(activity: AggregatedActivity): string {
+  return [
+    "Technocore Radar Status",
+    "",
+    `Searches: ${activity.searches}`,
+    `Results inspected: ${activity.resultsInspected}`,
+    `Duplicates: ${activity.duplicates}`,
+    `New findings: ${activity.newFindings}`,
+  ].join("\n");
 }
 
 export interface PublishedMessage {

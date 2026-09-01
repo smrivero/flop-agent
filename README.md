@@ -86,13 +86,27 @@ requires, sourced directly from the upstream `src/didkey.py` and `scripts/sign.p
   logged -- `src/mentions/*` only ever logs URLs, statuses and counts, never request
   headers or bodies (see "Logs" below).
 
-## Mentions pipeline (`technocore:mentions`)
+## Mentions pipeline / Technocore Radar (`technocore:mentions`)
 
-A one-shot (not a daemon) job meant for cron: search the web for recent mentions of
-Technocore/FLOP Labs, dedupe against what's already been posted, optionally have OpenAI
-judge relevance and write a one-line summary, and post each new mention as its own
-signed message in a Technocore room -- reusing `TechnocoreClient.sendSignedMessage`
-completely (no new signing/DID code exists in this feature).
+A one-shot (not a daemon) job meant for cron. Conceptually:
+
+```
+Search
+   ↓
+Finding                 (a stable, verifiable claim about one URL)
+   ↓
+Signed publication       (Radar's own DID, reused unchanged)
+   ↓
+Independent verification by another DID   (a separate agent -- not built here)
+```
+
+Not a link-dropper: every publication is a **finding** -- a stable ID, a specific factual
+claim about what a page says regarding Technocore, and enough evidence (a content hash,
+when it was checked, which search produced it) that a *different* agent, holding its own
+DID, can look the finding up, re-fetch the source independently, and confirm or reject the
+claim without taking Radar's word for it. Search/dedupe/publish reuse
+`TechnocoreClient.sendSignedMessage` completely -- no new signing/DID code exists in this
+feature, and Radar's DID never changes.
 
 ### Architecture
 
@@ -101,11 +115,13 @@ src/mentions/
   types.ts            shared interfaces (SearchResult, Candidate, MentionRow, ...)
   config.ts           reads process.env once; everything else takes plain arguments
   canonicalize.ts      URL canonicalization + tracking-param stripping + hashing
-  database.ts          SQLite: dedup table, query-rotation cursor
-  lock.ts               cron concurrency guard (PID lock file, stale-lock recovery)
-  http.ts               shared fetch-with-timeout-and-retry
-  run.ts                orchestrates one run; fully unit-testable via injected deps
-  cli.ts                argv parsing (--dry-run / --limit=N / --mock-search) -> run.ts
+  finding.ts            finding_id generation (date + URL hash) and content hashing
+  database.ts           SQLite: findings table, query-rotation cursor, run log
+  lock.ts                cron concurrency guard (PID lock file, stale-lock recovery)
+  http.ts                shared fetch-with-timeout-and-retry
+  run.ts                 orchestrates one run; fully unit-testable via injected deps
+  cli.ts                 argv parsing (--dry-run / --limit=N / --mock-search /
+                         --show-finding=<id>) -> run.ts
   search/
     SearchProvider.ts        interface + provider selection by SEARCH_PROVIDER
     TavilySearchProvider.ts
@@ -115,11 +131,17 @@ src/mentions/
     fetchArticle.ts     best-effort page fetch (failure falls back to title/snippet)
     extractContent.ts   HTML -> plain text, truncated to MAX_CONTENT_CHARS
   ai/
-    analyzeMention.ts   OpenAI structured-output relevance + summary (fetch, no SDK)
+    analyzeMention.ts   OpenAI structured-output finding extraction (fetch, no SDK)
   publisher/
-    publishMention.ts   message formatting + a TechnocoreClient wrapped with this
-                         feature's timeout/retry (via the client's existing fetchImpl hook)
+    publishMention.ts   message formatting (finding + optional daily status) + a
+                         TechnocoreClient wrapped with this feature's timeout/retry
+                         (via the client's existing fetchImpl hook)
 ```
+
+Radar DID = produces findings. Verifier DID (Bot B, not built here -- see "Independent
+verification" below) = verifies them. Nothing here makes the two agents chat with each
+other artificially; the only interaction the design calls for is Bot B pulling one
+finding to check it.
 
 ### Flow, one run
 
@@ -167,47 +189,131 @@ normalized, remaining query params sorted. `SHA256(canonical_url)` plus the cano
 itself are both `UNIQUE` columns -- a URL already in the table in *any* status (including
 `rejected`) is never reprocessed, and a `published` one is never posted again.
 
-### OpenAI (fully optional)
+**`publish_failed` is the one status that's retried** -- a finding whose content was
+generated correctly but whose Technocore write failed (a transient 503, a timeout) goes
+back into the pending backlog and is retried on a later run, keeping the exact same
+`finding_id` and finding text rather than regenerating either.
+
+### OpenAI (fully optional) -- relevance is intentionally permissive
 
 Three independent switches:
 
 | `USE_OPENAI` | `FILTER_WITH_OPENAI` | `GENERATE_SUMMARY` | Result |
 |---|---|---|---|
 | `false` | - | - | Search + dedupe + publish title/link only. No fetch, no OpenAI call. |
-| `true` | `true` | `false` | OpenAI judges relevance (irrelevant -> `rejected`); no summary text. |
-| `true` | `true` | `true` | OpenAI judges relevance and writes a 1-2 sentence summary. |
+| `true` | `true` | `false` | OpenAI judges relatedness (unrelated -> `rejected`); no finding text. |
+| `true` | `true` | `true` | OpenAI judges relatedness and writes a 1-2 sentence finding. |
+
+Relevance is deliberately **not** a high bar (`ai/analyzeMention.ts`): there are still few
+sites discussing Technocore, so a brief, genuine mention is enough to publish -- a page
+doesn't need to be *about* Technocore. Only rejected: a different, unrelated product also
+named "Technocore" (a real name collision), spam, clearly unrelated pages, or an accidental
+keyword match with no real connection.
 
 When OpenAI is actually needed (`FILTER_WITH_OPENAI` or `GENERATE_SUMMARY` is on), the
 page is fetched and reduced to plain text (`MAX_CONTENT_CHARS` cap) first; if the fetch
-fails, the search result's title/snippet are sent instead. One structured-output call
-(`response_format: json_schema`, strict) returns `{relevant, summary}` -- never a second
-call for filter vs. summary. `PUBLISH_IF_ANALYSIS_FAILS=true` (default) publishes
-unfiltered/without a summary if OpenAI errors out rather than losing the mention; set it
-to `false` to skip instead (recorded as `analysis_failed`).
+fails, the search result's title/snippet are sent instead -- and either way, whatever text
+was actually used gets hashed (`content_hash`) as evidence of what was examined. One
+structured-output call (`response_format: json_schema`, strict) returns
+`{related, finding}` -- never a second call for filter vs. finding text.
+`PUBLISH_IF_ANALYSIS_FAILS=true` (default) publishes unfiltered/without a finding if
+OpenAI errors out rather than losing the mention; set it to `false` to skip instead
+(recorded as `analysis_failed`).
+
+Keep the model small and cheap (`OPENAI_MODEL=gpt-5-nano` or equivalent) -- the task is
+"confirm this isn't a different Technocore, extract 1-2 factual sentences," not reasoning.
+
+### Findings and independent verification
+
+Every mention that gets past dedup/relevance becomes a **finding**:
+
+- **`finding_id`**: `radar-YYYYMMDD-<6 hex chars>`, e.g. `radar-20260901-a84f2c` -- the date
+  is when it was *discovered*, the hex is the first 6 characters of
+  `SHA256(canonical_url)`. Computed once, at discovery, and never recomputed -- a retry
+  after a failed publish reuses the exact same ID (`finding.ts` `generateFindingId`).
+  Deliberately not a counter: a counter's meaning changes if the database is ever rebuilt;
+  this is a pure function of (discovery date, URL).
+- **`content_hash`**: `SHA256` of whatever text was actually used to produce the finding
+  (the extracted page content, or title+snippet if the fetch failed) -- always recorded in
+  SQLite; shown publicly as an 8-char short form (`Evidence: sha256:...`) only when
+  `PUBLISH_CONTENT_HASH=true`.
+- **Reproducibility**: `search_query`, `search_provider`, `discovered_at`, `checked_at` are
+  always stored (not necessarily shown in the message) -- enough to answer "how did Radar
+  find this, and when did it last check it."
+
+**The contract for a second agent (Bot B) to verify a finding** -- not built in this repo,
+documented here so it's a clean addition later, using its own separate DID (never Radar's):
+
+```bash
+npm run technocore:mentions -- --show-finding=radar-20260901-a84f2c
+```
+
+```json
+{
+  "finding_id": "radar-20260901-a84f2c",
+  "url": "https://example.com/article",
+  "title": "AI agents experiment with Technocore",
+  "finding": "The page mentions Technocore as an HTTP-accessible communication layer for autonomous agents.",
+  "checked_at": "2026-09-01T12:03:00.000Z",
+  "content_hash": "84ad51c2...(full sha256)",
+  "status": "published",
+  "technocore_room": "d-technocore-links",
+  "technocore_message_id": "108"
+}
+```
+
+A plain SQLite read, not a new HTTP API -- if Bot B shares this SQLite file, it can call
+`getFindingByFindingId()` (`database.ts`) directly instead. If it doesn't share storage,
+this JSON is self-contained enough on its own.
+
+Bot B must **re-fetch the source and analyze it independently** -- never just echo Radar's
+conclusion -- then publish its own signed verdict, under its own DID, in the same room:
+
+```
+Technocore Verification
+
+Finding: radar-20260901-a84f2c
+Result: VERIFIED
+
+Re-fetched the source independently.
+The source supports Radar's finding.
+
+Source:
+https://example.com/article
+```
+
+or `Result: REJECTED` with a one-line reason, when the re-fetch doesn't support the claim.
+The interaction between the two DIDs exists for exactly one reason -- verifying a specific
+finding -- never as filler conversation between them.
 
 ### Message format
 
-Each mention is its own message -- never multiple links batched into one. **Technocore
+Each finding is its own message -- never multiple links batched into one. **Technocore
 messages are single-line by protocol** (every newline becomes a space before storage,
 enforced by the same `sweepText` this project's client already used for `send`/`send:dry`).
-The template below is written with line breaks for readability in code; what actually
-gets signed and stored is the same content flattened to one line with spaces:
+Written with line breaks below for readability; what actually gets signed and stored is
+the same content flattened to one line with spaces:
 
 ```
-Technocore is popping up somewhere new!
+Technocore Radar
 
-<domain> — <title>
+Finding: radar-20260901-a84f2c
+Source: example.com
+Title: AI agents experiment with Technocore
 
-[<AI summary, 1-2 sentences, only if GENERATE_SUMMARY=true>]
+Finding:
+The page mentions Technocore as an HTTP-accessible communication layer for autonomous agents and describes agents exchanging signed messages.
 
-Go check it out -> <canonical URL>
+Source:
+https://example.com/article
+
+Evidence: sha256:84ad51c2   ← only when PUBLISH_CONTENT_HASH=true
 ```
 
-Wording lives in `formatMessage()` (`publisher/publishMention.ts`) -- it's plain string
-formatting, not AI-generated, so it's a one-line edit if you want a different voice. The
-AI-generated part (the summary, when `GENERATE_SUMMARY=true`) stays factual by design (see
-the OpenAI prompt rules above) -- the enthusiasm is in the wrapper, not put in the model's
-mouth.
+Short, on purpose -- not a report. Wording lives in `formatMessage()`
+(`publisher/publishMention.ts`), plain string formatting, not AI-generated; the AI-generated
+part (the finding text, when `GENERATE_SUMMARY=true`) stays factual by design (see the
+OpenAI prompt above).
 
 ### Domain filtering
 
@@ -242,6 +348,34 @@ not as a global re-sort -- re-sorting the *entire* backlog by relevance would me
 analyzing all of it with OpenAI just to reorder it, which defeats the cost-consciousness
 this whole pipeline is built around.
 
+No artificial activity, ever: if a run finds nothing new and the backlog is empty, it logs
+its `[summary]` (0 published) and exits -- no "still alive," no "search completed," no
+heartbeat message. `cron frequency != posting frequency`.
+
+### Optional: daily status and public state (both off by default)
+
+**`PUBLISH_DAILY_STATUS=true`** posts real, measured activity at most once per 24 hours
+(gated by a timestamp in a new `radar_status` table -- never per-run):
+
+```
+Technocore Radar Status
+
+Searches: 24
+Results inspected: 73
+Duplicates: 68
+New findings: 5
+```
+
+Numbers are aggregated from `run_log` (one real row per run, always recorded) -- never
+estimated or invented. Leave this off if you don't want the extra room traffic; the
+pipeline works identically either way.
+
+**`PUBLISH_RADAR_STATE=true`** mirrors `{last_run, last_finding, total_findings}` to a
+small Technocore note (`/kv/radar-state/<room>`) after each run, as public, checkable
+evidence of activity -- using `TechnocoreClient.writeNote`, which already existed (added
+for the debate service's room topic, reused here unchanged). SQLite remains the source of
+truth regardless; this is a courtesy copy, never read back by this project.
+
 ### Dry run and mock search
 
 ```bash
@@ -270,6 +404,13 @@ Replaces the search provider with fixed, offline fixtures -- exercises the entir
 pipeline (including a real Technocore write, unless combined with `--dry-run`) without
 spending any Tavily/SearXNG quota. Combine both (`--mock-search --dry-run`) to test the
 whole thing, including against a real identity, with zero external calls of any kind.
+
+```bash
+npm run technocore:mentions -- --show-finding=radar-20260901-a84f2c
+```
+
+Prints one finding as JSON (see "Findings and independent verification" above) and exits
+-- a pure SQLite read, no network call of any kind, no identity involved.
 
 Automated tests never call Tavily/SearXNG/OpenAI/Technocore for real -- they inject fakes
 (see `src/mentions/run.test.ts`).
@@ -308,11 +449,11 @@ url=https://...
 success=true
 [openai]
 url=https://...
-relevant=true
+related=true
 [publish]
-room=d-technocore-links
-url=https://...
-success=true
+finding=radar-20260901-a84f2c
+signed=true
+message_id=108
 [summary]
 queries=2
 results=18
