@@ -17,6 +17,10 @@ export interface DebateConfig {
   openAiModel: string;
   openAiMaxOutputTokens: number;
   webSearchEnabled: boolean;
+  /** When true (and webSearchEnabled), tool_choice is forced to "required" and
+   * a turn whose response contains no web_search_call is rejected rather than
+   * published. */
+  webSearchRequired: boolean;
 
   technocoreBaseUrl: string;
 
@@ -29,6 +33,10 @@ export interface DebateConfig {
   maxDelaySeconds: number;
   historyMessages: number;
   maxMessageChars: number;
+
+  /** Jaccard word-trigram similarity, 0-1, above which a draft is considered a
+   * repeat of the same agent's own recent messages and gets one regeneration. */
+  repetitionThreshold: number;
 
   httpTimeoutMs: number;
   maxRetries: number;

@@ -13,10 +13,20 @@
 import { determineNextSpeaker, mostRecentTurns, readDebateHistory } from "./history.js";
 import { generateDebateTurn, type GenerateTurnParams, type GenerateTurnResult } from "./openai.js";
 import { buildInput, buildInstructions } from "./prompt.js";
+import { checkRepetition } from "./repetition.js";
+import { randomResponseMode } from "./responseMode.js";
 import { sanitizeDebateMessage } from "./sanitize.js";
 import { loadState, recordTurn, saveState } from "./state.js";
 import type { Runtime } from "./runtime.js";
 import type { AgentId, LoadedAgent } from "./types.js";
+
+/** How many of the same agent's own recent messages the repetition check
+ * compares a fresh draft against. */
+const REPETITION_LOOKBACK = 8;
+
+const REGENERATE_INSTRUCTION =
+  "\n\nYour previous draft was too similar to earlier messages. Change the argument, sentence " +
+  "structure, opening, and ending.";
 
 function logLine(text: string): void {
   console.log(text);
@@ -75,16 +85,38 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
 
   const state = loadState(config.statePath, definition.room);
   const recent = mostRecentTurns(snapshot.turns, config.historyMessages);
+  const ownRecentMessages = snapshot.turns
+    .filter((t) => t.agentId === speakerId)
+    .slice(-REPETITION_LOOKBACK)
+    .map((t) => t.text);
 
-  const instructions = buildInstructions(speaker, definition, config.maxMessageChars, config.webSearchEnabled);
-  const input = buildInput(speaker, recent, state);
+  const mode = randomResponseMode();
+  logLine(`[mode] ${mode}`);
+
+  const instructions = buildInstructions(speaker, definition, config.webSearchEnabled);
+  const generate = deps.generate ?? ((params: GenerateTurnParams) => generateDebateTurn(runtime.openai, config, params));
 
   logEvent("openai", { generating: true, web_search: config.webSearchEnabled });
-  const generate = deps.generate ?? ((params: GenerateTurnParams) => generateDebateTurn(runtime.openai, config, params));
-  const result = await generate({ instructions, input });
-  if (result.usage) logEvent("openai", { input: result.usage.inputTokens, output: result.usage.outputTokens });
+  let input = buildInput(speaker, recent, state, mode, config.maxMessageChars);
+  let result = await generate({ instructions, input });
+  logSearchOutcome(result);
 
-  const sanitized = sanitizeDebateMessage(result.text, config.maxMessageChars);
+  let sanitized = sanitizeDebateMessage(result.text, config.maxMessageChars);
+  let check = checkRepetition(sanitized, ownRecentMessages, config.repetitionThreshold);
+
+  if (check.tooSimilar) {
+    logEvent("repetition", { detected: true, score: check.maxScore.toFixed(2), regenerating: true });
+    input = buildInput(speaker, recent, state, mode, config.maxMessageChars) + REGENERATE_INSTRUCTION;
+    result = await generate({ instructions, input });
+    logSearchOutcome(result);
+    sanitized = sanitizeDebateMessage(result.text, config.maxMessageChars);
+    check = checkRepetition(sanitized, ownRecentMessages, config.repetitionThreshold);
+    // No further retries: publish this attempt regardless of the second
+    // check's outcome (no infinite regeneration loops), just note it.
+    if (check.tooSimilar) logEvent("repetition", { detected: true, score: check.maxScore.toFixed(2), regenerating: false });
+  }
+
+  logLine(`[response] ${sanitized.length} chars`);
 
   const { posted } = await client.sendSignedMessagePost(definition.room, sanitized, { identity: speaker });
   logEvent("technocore", { posted: `seq=${posted.seq}` });
@@ -96,11 +128,26 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
     // a decent "don't repeat this" memory aid on its own. Real topic extraction
     // would need a second model call, which the per-turn cost budget rules out.
     newClaims: [sanitized.length > 200 ? `${sanitized.slice(0, 200)}…` : sanitized],
-    newSources: sanitized.match(URL_RE) ?? undefined,
+    newSources: result.webSearch.sources.length > 0 ? result.webSearch.sources : (sanitized.match(URL_RE) ?? undefined),
   });
   saveState(config.statePath, newState);
 
   return { seq: posted.seq, speakerId, speakerName: speaker.name, usage: result.usage };
+}
+
+function logSearchOutcome(result: GenerateTurnResult): void {
+  if (result.usage) logEvent("openai", { input: result.usage.inputTokens, output: result.usage.outputTokens });
+  if (result.webSearch.called) {
+    logLine("[facts] searched web");
+    logLine("[openai] web search executed");
+    logLine(`[openai] queries=${result.webSearch.queries.length}`);
+    if (result.webSearch.sources.length > 0) {
+      logLine(`[openai] sources=${result.webSearch.sources.length}`);
+      logLine(`[sources] ${result.webSearch.sources.join(", ")}`);
+    }
+  } else {
+    logLine("[facts] no web search performed this turn");
+  }
 }
 
 export interface LoopOptions {

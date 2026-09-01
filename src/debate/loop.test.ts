@@ -9,6 +9,12 @@ import { FakeTechnocoreServer, makeTestIdentity, buildTestAgent } from "./testUt
 import { loadState } from "./state.js";
 import type { Runtime } from "./runtime.js";
 import type { DebateConfig, DebateDefinition } from "./types.js";
+import type { GenerateTurnResult } from "./openai.js";
+
+/** A generate() mock result -- no web search performed (these tests don't exercise that path). */
+function textResult(text: string): GenerateTurnResult {
+  return { text, webSearch: { called: false, queries: [], sources: [] } };
+}
 
 function tempStateDir(): string {
   return mkdtempSync(join(tmpdir(), "debate-loop-test-"));
@@ -26,6 +32,7 @@ function buildTestRuntime(overrides: { server?: FakeTechnocoreServer; statePath?
     openAiModel: "gpt-test",
     openAiMaxOutputTokens: 900,
     webSearchEnabled: false,
+    webSearchRequired: false,
     technocoreBaseUrl: "https://technocore.chat",
     agentAIdentityPath: "unused-in-tests.json",
     agentBIdentityPath: "unused-in-tests.json",
@@ -34,6 +41,7 @@ function buildTestRuntime(overrides: { server?: FakeTechnocoreServer; statePath?
     maxDelaySeconds: 300,
     historyMessages: 12,
     maxMessageChars: 200,
+    repetitionThreshold: 0.45,
     httpTimeoutMs: 5000,
     maxRetries: 0,
     logLevel: "info",
@@ -87,7 +95,7 @@ test("sleep: an already-aborted signal resolves immediately", async () => {
 
 test("runOneTurn: Agent A speaks first in an empty room", async () => {
   const runtime = buildTestRuntime();
-  const result = await runOneTurn(runtime, { generate: async () => ({ text: "Opening argument for cules-ai." }) });
+  const result = await runOneTurn(runtime, { generate: async () => textResult("Opening argument for cules-ai.") });
   assert.equal(result.speakerId, "A");
   assert.equal(result.speakerName, "cules-ai");
 
@@ -100,7 +108,7 @@ test("runOneTurn: Agent A speaks first in an empty room", async () => {
 test("runOneTurn: alternates correctly across consecutive turns", async () => {
   const runtime = buildTestRuntime();
   let n = 0;
-  const generate = async () => ({ text: `Message number ${++n}.` });
+  const generate = async () => textResult(`Message number ${++n}.`);
 
   const first = await runOneTurn(runtime, { generate });
   const second = await runOneTurn(runtime, { generate });
@@ -125,7 +133,7 @@ test("restart recovery: a message already in the room (crash before local state 
   const result = await runOneTurn(runtime, {
     generate: async () => {
       generateCalls++;
-      return { text: "Agent B's reply." };
+      return textResult("Agent B's reply.");
     },
   });
 
@@ -142,7 +150,7 @@ test("runOneTurn: sanitizes model output (multi-line, over-length) before signin
   const runtime = buildTestRuntime(); // maxMessageChars: 200 in buildTestRuntime's config
   const longText = "First line of argument.\nSecond line goes on and on. ".repeat(20);
 
-  await runOneTurn(runtime, { generate: async () => ({ text: longText }) });
+  await runOneTurn(runtime, { generate: async () => textResult(longText) });
 
   const view = await runtime.client.readRoom("d-testroom");
   const posted = view.messages[0].text;
@@ -152,7 +160,7 @@ test("runOneTurn: sanitizes model output (multi-line, over-length) before signin
 
 test("runOneTurn: local state records the speaker DID and increments totalMessages", async () => {
   const runtime = buildTestRuntime();
-  await runOneTurn(runtime, { generate: async () => ({ text: "First message." }) });
+  await runOneTurn(runtime, { generate: async () => textResult("First message.") });
   const state = loadState(runtime.config.statePath, "d-testroom");
   assert.equal(state.totalMessages, 1);
   assert.equal(state.lastSpeakerDid, runtime.agentA.did);

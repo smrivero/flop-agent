@@ -32,6 +32,16 @@ function parseBoolEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: boolean
   return raw.trim().toLowerCase() === "true";
 }
 
+function parseFloatEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: number, min: number, max: number): number {
+  const raw = env[key];
+  if (raw === undefined || raw === "") return defaultValue;
+  const n = Number.parseFloat(raw);
+  if (!Number.isFinite(n) || n < min || n > max) {
+    throw new DebateConfigError(`${key} must be a number between ${min} and ${max}, got ${JSON.stringify(raw)}`);
+  }
+  return n;
+}
+
 export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateConfig {
   const minDelaySeconds = parseIntEnv(env, "MIN_DELAY_SECONDS", 60);
   const maxDelaySeconds = parseIntEnv(env, "MAX_DELAY_SECONDS", 300);
@@ -44,11 +54,18 @@ export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateCo
     throw new DebateConfigError(`LOG_LEVEL must be one of debug/info/warn/error, got ${JSON.stringify(env.LOG_LEVEL)}`);
   }
 
+  const webSearchEnabled = parseBoolEnv(env, "WEB_SEARCH_ENABLED", true);
+  const webSearchRequired = parseBoolEnv(env, "WEB_SEARCH_REQUIRED", true);
+  if (webSearchRequired && !webSearchEnabled) {
+    throw new DebateConfigError("WEB_SEARCH_REQUIRED=true needs WEB_SEARCH_ENABLED=true too -- there's no tool to require a call from otherwise");
+  }
+
   return {
     openAiApiKey: requireEnv(env, "OPENAI_API_KEY"),
     openAiModel: requireEnv(env, "OPENAI_MODEL"),
     openAiMaxOutputTokens: parseIntEnv(env, "OPENAI_MAX_OUTPUT_TOKENS", 900),
-    webSearchEnabled: parseBoolEnv(env, "WEB_SEARCH_ENABLED", true),
+    webSearchEnabled,
+    webSearchRequired,
 
     technocoreBaseUrl: env.TECHNOCORE_BASE_URL?.trim() || "https://technocore.chat",
 
@@ -61,6 +78,7 @@ export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateCo
     maxDelaySeconds,
     historyMessages: parseIntEnv(env, "HISTORY_MESSAGES", 12),
     maxMessageChars: parseIntEnv(env, "MAX_MESSAGE_CHARS", 3500),
+    repetitionThreshold: parseFloatEnv(env, "REPETITION_THRESHOLD", 0.45, 0, 1),
 
     httpTimeoutMs: parseIntEnv(env, "HTTP_TIMEOUT_MS", 30000),
     maxRetries: parseIntEnv(env, "MAX_RETRIES", 3),
