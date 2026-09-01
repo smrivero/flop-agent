@@ -21,6 +21,7 @@ flop-agent/
     cli.ts         `npm run flop -- <command>` -- argv -> library glue only
     index.ts       public exports, shaped so each one can become an MCP tool
     mentions/      automated "Technocore mentions" crawler -- see below
+    verifier/      Technocore Verifier -- independently re-checks Radar's findings, own DID
   scripts/         generate-identity.mjs / show-public-identity.mjs (manual, never auto-run)
   .technocore/     local identity storage -- gitignored, created on demand
   .data/           mentions SQLite DB + concurrency lock -- gitignored, created on demand
@@ -241,8 +242,7 @@ Every mention that gets past dedup/relevance becomes a **finding**:
   always stored (not necessarily shown in the message) -- enough to answer "how did Radar
   find this, and when did it last check it."
 
-**The contract for a second agent (Bot B) to verify a finding** -- not built in this repo,
-documented here so it's a clean addition later, using its own separate DID (never Radar's):
+**Any finding is inspectable this way**, whether or not you use the Verifier below:
 
 ```bash
 npm run technocore:mentions -- --show-finding=radar-20260901-a84f2c
@@ -262,29 +262,118 @@ npm run technocore:mentions -- --show-finding=radar-20260901-a84f2c
 }
 ```
 
-A plain SQLite read, not a new HTTP API -- if Bot B shares this SQLite file, it can call
-`getFindingByFindingId()` (`database.ts`) directly instead. If it doesn't share storage,
-this JSON is self-contained enough on its own.
+A plain SQLite read, not a new HTTP API -- `getFindingByFindingId()` (`mentions/database.ts`)
+directly, if a caller shares this SQLite file (the Verifier does, see below). If it doesn't
+share storage, this JSON is self-contained enough on its own.
 
-Bot B must **re-fetch the source and analyze it independently** -- never just echo Radar's
-conclusion -- then publish its own signed verdict, under its own DID, in the same room:
+### Technocore Verifier (`technocore:verify`)
+
+A second, independent process -- `src/verifier/` -- that re-checks findings Radar already
+published. **This is a producer and an independent verifier, not two agents talking to each
+other.** The Verifier never messages Radar, never reads Radar's reasoning, and never treats
+Radar's stored `finding` text as source material -- only as the specific claim it re-checks
+against content it fetched itself, just now.
+
+Flow, per finding:
+
+1. Select findings with `status='published'` in `mentions` that don't yet have a finalized
+   verification (`getPendingFindingsToVerify()`, `verifier/database.ts`) -- oldest first, up
+   to `VERIFIER_MAX_PER_RUN`, thinned further by `VERIFIER_SAMPLE_RATE`.
+2. **Independently re-fetch** `canonical_url` (`mentions/content/fetchArticle.ts`, reused
+   as-is) -- never Radar's stored content or finding text.
+3. Ask OpenAI (`verifier/openai.ts`, `VERIFIER_MODEL`) to judge whether the freshly-fetched
+   content actually supports Radar's original finding: `VERIFIED` or `REJECTED`, with a
+   one-sentence reason.
+4. Publish the verdict, signed with **Agent B's identity** (`VERIFIER_IDENTITY_PATH`, default
+   `.technocore/identityB.json` -- a separate DID from Radar's own `identity.json`), in the
+   *same room* the original finding was published to.
+5. Persist the result in a `verifications` row (one per `finding_id`), keyed for retry.
+
+**Identity safety.** `verifier/identity.ts` loads both `TECHNOCORE_IDENTITY_PATH` (Radar) and
+`VERIFIER_IDENTITY_PATH` (Agent B) at the start of every run -- before the lock, before the
+database, before `--dry-run` or `--mock` are even considered -- and compares their resolved
+DIDs. If they're ever equal (same file, or two files holding the same key), the process
+aborts immediately with:
 
 ```
-Technocore Verification
+[verifier] ERROR: Radar and Verifier resolve to the same DID. ...
+Refusing to publish -- this would let Radar verify its own work.
+```
+
+and nothing is published. `verifier/publisher.ts` always passes the loaded identity to
+`sendSignedMessage` explicitly (`{ identity }`) for the same reason: omitting it would make
+`buildSignedMessageRequest` silently fall back to loading `.technocore/identity.json` from
+disk, i.e. sign as Radar. Covered directly by `publisher.test.ts`'s security test.
+
+**Content hash is informational, not a verdict.** `original_content_hash` (Radar's, stored on
+the finding) and `verification_content_hash` (the Verifier's own fetch, just now) are both
+recorded for audit, and logged as `hash_match`. A mismatch never forces a REJECTED outcome by
+itself -- pages get reworded, ads change, timestamps update. Only OpenAI's judgment on the
+freshly-fetched content decides the verdict.
+
+**Failure handling, retry semantics:**
+
+| What failed | Row status | Retried by re-running the CLI | Re-spends OpenAI? |
+|---|---|---|---|
+| Independent fetch (HTTP error, non-HTML, timeout) | `verification_failed` | yes -- refetch + reanalyze from scratch | yes |
+| OpenAI analysis (HTTP error, bad JSON) | `verification_failed` | yes -- refetch + reanalyze from scratch | yes |
+| Technocore publish, *after* a successful analysis | `publish_failed` | yes -- retries **only** the publish, reusing the cached `result`/`reason`/`verification_content_hash` | **no** |
+
+A fetch or OpenAI failure is never turned into a REJECTED verdict -- "couldn't check" and
+"checked, and it's wrong" are different things, and only the second is ever published.
+
+Message format (single-line by protocol, same `sweepText` flattening as Radar's own messages
+-- written here with line breaks for readability):
+
+```
+Technocore Verifier
 
 Finding: radar-20260901-a84f2c
 Result: VERIFIED
 
-Re-fetched the source independently.
-The source supports Radar's finding.
+Original finding:
+The page mentions Technocore as an HTTP-accessible communication layer for autonomous agents.
+
+Reason:
+The fetched content describes Technocore as an HTTP-based protocol agents use to exchange signed messages.
 
 Source:
 https://example.com/article
 ```
 
-or `Result: REJECTED` with a one-line reason, when the re-fetch doesn't support the claim.
-The interaction between the two DIDs exists for exactly one reason -- verifying a specific
-finding -- never as filler conversation between them.
+or `Result: REJECTED` with a reason that says what the fetched content actually says instead.
+
+**CLI flags** (`npm run technocore:verify --`):
+
+- `--dry-run` -- runs fetch + OpenAI analysis for real, prints what would be published, never
+  writes to Technocore or finalizes the verification row.
+- `--finding=<id>` -- verify exactly one finding by ID, ignoring `VERIFIER_MAX_PER_RUN` /
+  `VERIFIER_SAMPLE_RATE`.
+- `--force` -- (only with `--finding=`) re-verify a finding whose verification is already
+  finalized (`verified`/`rejected`). Testing only -- publishes a second verdict message.
+- `--mock` -- replaces the independent fetch, the OpenAI call, *and* the Technocore sender
+  with fixed in-memory stand-ins. Zero real network calls of any kind. Always combine with
+  `--dry-run` for a demo (`--mock` alone still runs the real code path end-to-end, on fake
+  data, but there's no reason not to keep both on for anything other than exercising publish
+  itself).
+
+Config: `VERIFIER_ENABLED`, `VERIFIER_MAX_PER_RUN`, `VERIFIER_SAMPLE_RATE`, `VERIFIER_MODEL`
+(falls back to `OPENAI_MODEL`), `VERIFIER_IDENTITY_PATH`, `VERIFIER_LOCK_PATH` -- see
+`.env.example`. Everything else (`OPENAI_API_KEY`, `HTTP_TIMEOUT_MS`, `MAX_RETRIES`,
+`MAX_CONTENT_CHARS`, `MENTIONS_DB_PATH`) is reused from the mentions pipeline's own config --
+the Verifier reads and writes the *same* SQLite file Radar does, one additional table
+(`verifications`), added by its own non-destructive migration (`verifier/database.ts`) run on
+top of Radar's, never touching `mentions`/`query_rotation`/`run_log`/`radar_status`.
+
+**Cron.** One-shot, cron-friendly, no daemon -- same shape as `technocore:mentions`. Stagger
+it after Radar's own cron tick so there's usually something fresh to verify:
+
+```cron
+0 * * * *   cd /path/to/flop-agent && npm run technocore:mentions >> logs/mentions.log 2>&1
+20 * * * *  cd /path/to/flop-agent && npm run technocore:verify >> logs/verifier.log 2>&1
+```
+
+(Documented here only -- nothing in this repo edits crontab for you.)
 
 ### Message format
 

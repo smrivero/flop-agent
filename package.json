@@ -13,10 +13,11 @@
     "flop": "tsx src/cli.ts",
     "cli": "node dist/cli.js",
     "technocore:mentions": "tsx src/mentions/cli.ts",
+    "technocore:verify": "tsx src/verifier/cli.ts",
     "debate": "tsx src/debate/cli.ts",
     "debate:setup": "tsx src/debate/setup-cli.ts",
     "status": "tsx src/debate/status-cli.ts",
-    "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts src/mentions/ai/*.test.ts src/debate/*.test.ts"
+    "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts src/mentions/ai/*.test.ts src/debate/*.test.ts src/verifier/*.test.ts"
   },
   "dependencies": {
     "better-sqlite3": "^11.3.0",
