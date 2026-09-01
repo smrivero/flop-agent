@@ -42,9 +42,13 @@ function parseFloatEnv(env: NodeJS.ProcessEnv, key: string, defaultValue: number
   return n;
 }
 
+const SUPPORTED_INFERENCE_PROVIDERS = ["openai"] as const;
+
 export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateConfig {
-  const minDelaySeconds = parseIntEnv(env, "MIN_DELAY_SECONDS", 60);
-  const maxDelaySeconds = parseIntEnv(env, "MAX_DELAY_SECONDS", 300);
+  // 2-6 hours by default -- the original 1-5 minute defaults made this a spam
+  // bot, not a persistent discussion. Still fully overridable per deployment.
+  const minDelaySeconds = parseIntEnv(env, "MIN_DELAY_SECONDS", 7200);
+  const maxDelaySeconds = parseIntEnv(env, "MAX_DELAY_SECONDS", 21600);
   if (maxDelaySeconds < minDelaySeconds) {
     throw new DebateConfigError(`MAX_DELAY_SECONDS (${maxDelaySeconds}) must be >= MIN_DELAY_SECONDS (${minDelaySeconds})`);
   }
@@ -60,7 +64,17 @@ export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateCo
     throw new DebateConfigError("WEB_SEARCH_REQUIRED=true needs WEB_SEARCH_ENABLED=true too -- there's no tool to require a call from otherwise");
   }
 
+  const inferenceProvider = (env.INFERENCE_PROVIDER?.trim().toLowerCase() || "openai") as DebateConfig["inferenceProvider"];
+  if (!(SUPPORTED_INFERENCE_PROVIDERS as readonly string[]).includes(inferenceProvider)) {
+    throw new DebateConfigError(
+      `INFERENCE_PROVIDER=${JSON.stringify(env.INFERENCE_PROVIDER)} is not implemented. Only "openai" exists today -- ` +
+        "see src/debate/inference.ts for the extension point a future FLOP provider would fill in.",
+    );
+  }
+
   return {
+    inferenceProvider,
+
     openAiApiKey: requireEnv(env, "OPENAI_API_KEY"),
     openAiModel: requireEnv(env, "OPENAI_MODEL"),
     openAiMaxOutputTokens: parseIntEnv(env, "OPENAI_MAX_OUTPUT_TOKENS", 900),
@@ -76,9 +90,21 @@ export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateCo
 
     minDelaySeconds,
     maxDelaySeconds,
+    maxMessagesPerDay: parseIntEnv(env, "MAX_MESSAGES_PER_DAY", 4),
+    allowSkipTurn: parseBoolEnv(env, "ALLOW_SKIP_TURN", true),
     historyMessages: parseIntEnv(env, "HISTORY_MESSAGES", 12),
     maxMessageChars: parseIntEnv(env, "MAX_MESSAGE_CHARS", 3500),
     repetitionThreshold: parseFloatEnv(env, "REPETITION_THRESHOLD", 0.45, 0, 1),
+    recentMessagesForSimilarity: parseIntEnv(env, "RECENT_MESSAGES_FOR_SIMILARITY", 8),
+
+    checkpointEnabled: parseBoolEnv(env, "CHECKPOINT_ENABLED", true),
+    checkpointEveryMessages: parseIntEnv(env, "CHECKPOINT_EVERY_MESSAGES", 10),
+
+    archiveEnabled: parseBoolEnv(env, "ARCHIVE_ENABLED", true),
+    archiveIntervalHours: parseIntEnv(env, "ARCHIVE_INTERVAL_HOURS", 24),
+
+    identityMaintenanceEnabled: parseBoolEnv(env, "IDENTITY_MAINTENANCE_ENABLED", true),
+    identityRefreshHours: parseIntEnv(env, "IDENTITY_REFRESH_HOURS", 72),
 
     httpTimeoutMs: parseIntEnv(env, "HTTP_TIMEOUT_MS", 30000),
     maxRetries: parseIntEnv(env, "MAX_RETRIES", 3),
@@ -87,6 +113,7 @@ export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateCo
 
     statePath: env.DEBATE_STATE_PATH?.trim() || "./data/state",
     lockPath: env.DEBATE_LOCK_PATH?.trim() || "./data/state/debate.lock",
+    archivePath: env.DEBATE_ARCHIVE_PATH?.trim() || "./data/archive",
   };
 }
 

@@ -1,0 +1,104 @@
+import { test } from "node:test";
+import assert from "node:assert/strict";
+import { CLAIMS_DELIMITER } from "./claims.js";
+import { buildInput, buildInstructions } from "./prompt.js";
+import type { DebateDefinition, DebateState, LoadedAgent } from "./types.js";
+
+function testAgent(): LoadedAgent {
+  return {
+    id: "A",
+    name: "cules-ai",
+    position: "FC Barcelona is the greatest club",
+    opponentName: "madridista-ai",
+    opponentPosition: "Real Madrid is the greatest club",
+    personality: "You are a die-hard Barcelona supporter.",
+    did: "did:key:z6MkTest",
+    sign: () => "sig",
+  };
+}
+
+function testDefinition(): DebateDefinition {
+  return {
+    room: "d-elclasico",
+    topic: "Which club is greatest",
+    language: "English",
+    agentA: { name: "cules-ai", position: "p", personalityFile: "unused" },
+    agentB: { name: "madridista-ai", position: "p", personalityFile: "unused" },
+  };
+}
+
+function testState(): DebateState {
+  return {
+    room: "d-elclasico",
+    lastProcessedSeq: 0,
+    lastSpeakerDid: null,
+    totalMessages: 0,
+    recentTopics: [],
+    recentClaims: [],
+    recentSources: [],
+    currentDay: "2026-09-01",
+    messagesToday: 0,
+    claimRecords: [],
+    claimStats: { verified: 0, disputed: 0, corrected: 0 },
+    claimCounter: 0,
+    messagesSinceCheckpoint: 0,
+    checkpointCount: 0,
+    lastArchiveAt: null,
+    lastIdentityRefreshA: null,
+    lastIdentityRefreshB: null,
+    updatedAt: new Date().toISOString(),
+  };
+}
+
+test("buildInstructions: includes the personality verbatim", () => {
+  const instructions = buildInstructions(testAgent(), testDefinition(), true);
+  assert.ok(instructions.includes("You are a die-hard Barcelona supporter."));
+});
+
+test("buildInstructions: tells the model it may return exactly SKIP", () => {
+  const instructions = buildInstructions(testAgent(), testDefinition(), true);
+  assert.match(instructions, /\bSKIP\b/);
+  assert.match(instructions, /nothing new or useful/i);
+});
+
+test("buildInstructions: asks for the claims trailer using the shared delimiter constant", () => {
+  const instructions = buildInstructions(testAgent(), testDefinition(), true);
+  assert.ok(instructions.includes(CLAIMS_DELIMITER));
+});
+
+test("buildInstructions: current UTC date is injected dynamically, not hardcoded", () => {
+  const instructions = buildInstructions(testAgent(), testDefinition(), true);
+  const today = new Date().toISOString().slice(0, 10);
+  assert.ok(instructions.includes(`CURRENT DATE: ${today}`));
+});
+
+test("buildInstructions: source-preference guidance is general (field-appropriate), not hardcoded to football domains in application logic", () => {
+  const instructions = buildInstructions(testAgent(), testDefinition(), true);
+  // The prompt may still name football sources as an EXAMPLE (it does, by design),
+  // but must also state the general, subject-agnostic principle for other topics.
+  assert.match(instructions, /crypto|AI|economics|technology|science/);
+});
+
+test("buildInstructions: web search block is omitted entirely when webSearchEnabled=false", () => {
+  const withSearch = buildInstructions(testAgent(), testDefinition(), true);
+  const withoutSearch = buildInstructions(testAgent(), testDefinition(), false);
+  assert.match(withSearch, /FACTUAL CLAIM POLICY/);
+  assert.doesNotMatch(withoutSearch, /FACTUAL CLAIM POLICY/);
+});
+
+test("buildInput: an empty room produces an opening-message instruction, no 'recent conversation' section", () => {
+  const input = buildInput(testAgent(), [], testState(), "SHORT", 3500);
+  assert.match(input, /first message of the debate/i);
+  assert.doesNotMatch(input, /Recent conversation/);
+});
+
+test("buildInput: a non-empty room includes the opponent's latest message for direct reply", () => {
+  const state = testState();
+  const turns = [
+    { seq: 1, agentId: "A" as const, did: "did:key:z6MkA", text: "Opening for Barca.", ts: "" },
+    { seq: 2, agentId: "B" as const, did: "did:key:z6MkB", text: "Real Madrid has more trophies.", ts: "" },
+  ];
+  const input = buildInput(testAgent(), turns, state, "SHORT", 3500);
+  assert.match(input, /Opponent's latest message/);
+  assert.match(input, /Real Madrid has more trophies\./);
+});

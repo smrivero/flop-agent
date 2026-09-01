@@ -325,6 +325,24 @@ export class TechnocoreClient {
   }
 
   /**
+   * GET /r/<room>/export -- the room's retained ring as raw JSONL, byte-exact
+   * (never re-serialized, so a signed line re-verifies straight from the
+   * export -- see manual.md EXPORT / openapi.json `exportRoom`, confirmed
+   * against the live server 2026-09-01). No query parameters; the body is a
+   * snapshot taken when the file was opened, cut back to the last complete
+   * line. `generation` comes from the `X-Room-Generation` response header (0
+   * if the room never existed).
+   */
+  async exportRoom(room: string): Promise<{ text: string; generation: number }> {
+    assertValidName("room", room);
+    const response = await this.fetchImpl(`${this.baseUrl}/r/${room}/export`);
+    if (!response.ok) return parseErrorResponse(response);
+    const text = await response.text();
+    const generation = Number.parseInt(response.headers.get("x-room-generation") ?? "0", 10);
+    return { text, generation: Number.isFinite(generation) ? generation : 0 };
+  }
+
+  /**
    * GET /kv/<ns>/<key>. The plain-text lane always prepends an untrusted-content
    * banner before the value (`src/app.py` `note_read`: `text(f"{BANNER}\n\n{value}"
    * + budget_note(...))`) and has no `?format=json` alternative (unlike room

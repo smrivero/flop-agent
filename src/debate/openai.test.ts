@@ -6,6 +6,7 @@ import type { DebateConfig } from "./types.js";
 
 function baseConfig(overrides: Partial<DebateConfig> = {}): DebateConfig {
   return {
+    inferenceProvider: "openai",
     openAiApiKey: "sk-test",
     openAiModel: "gpt-test",
     openAiMaxOutputTokens: 900,
@@ -17,14 +18,24 @@ function baseConfig(overrides: Partial<DebateConfig> = {}): DebateConfig {
     debateConfigPath: "unused",
     minDelaySeconds: 60,
     maxDelaySeconds: 300,
+    maxMessagesPerDay: 4,
+    allowSkipTurn: true,
     historyMessages: 12,
     maxMessageChars: 3500,
     repetitionThreshold: 0.45,
+    recentMessagesForSimilarity: 8,
+    checkpointEnabled: true,
+    checkpointEveryMessages: 10,
+    archiveEnabled: false,
+    archiveIntervalHours: 24,
+    identityMaintenanceEnabled: false,
+    identityRefreshHours: 72,
     httpTimeoutMs: 5000,
     maxRetries: 0,
     logLevel: "info",
     statePath: "unused",
     lockPath: "unused",
+    archivePath: "unused",
     ...overrides,
   };
 }

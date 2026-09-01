@@ -9,6 +9,7 @@ import { fetchWithTimeout } from "../mentions/http.js";
 import { TechnocoreClient } from "../technocore.js";
 import { loadDebateConfig, loadDebateDefinition, loadPersonality } from "./config.js";
 import { buildLoadedAgent, loadOrCreateIdentity } from "./identity.js";
+import { createInferenceProvider, type InferenceProvider } from "./inference.js";
 import { createOpenAiClient } from "./openai.js";
 import { ensureRoomOwnership, RoomOwnershipConflictError } from "./ownership.js";
 import type { DebateConfig, DebateDefinition, LoadedAgent } from "./types.js";
@@ -22,6 +23,9 @@ export interface Runtime {
   agentBCreated: boolean;
   client: TechnocoreClient;
   openai: OpenAI;
+  /** What loop.ts actually calls to generate a turn -- see inference.ts. Never
+   * the OpenAI SDK directly; this is the FLOP-readiness extension point. */
+  inferenceProvider: InferenceProvider;
 }
 
 /**
@@ -70,8 +74,9 @@ export function initializeRuntime(): Runtime {
   });
 
   const openai = createOpenAiClient(config);
+  const inferenceProvider = createInferenceProvider(openai, config);
 
-  return { config, definition, agentA, agentB, agentACreated, agentBCreated, client, openai };
+  return { config, definition, agentA, agentB, agentACreated, agentBCreated, client, openai, inferenceProvider };
 }
 
 export interface SetupResult {

@@ -16,8 +16,11 @@ test("config: loads required + defaulted env vars", () => {
   const config = loadDebateConfig({ OPENAI_API_KEY: "sk-x", OPENAI_MODEL: "gpt-test" });
   assert.equal(config.openAiApiKey, "sk-x");
   assert.equal(config.openAiModel, "gpt-test");
-  assert.equal(config.minDelaySeconds, 60);
-  assert.equal(config.maxDelaySeconds, 300);
+  assert.equal(config.minDelaySeconds, 7200);
+  assert.equal(config.maxDelaySeconds, 21600);
+  assert.equal(config.maxMessagesPerDay, 4);
+  assert.equal(config.allowSkipTurn, true);
+  assert.equal(config.inferenceProvider, "openai");
   assert.equal(config.historyMessages, 12);
   assert.equal(config.maxMessageChars, 3500);
   assert.equal(config.webSearchEnabled, true);

@@ -176,6 +176,19 @@ export function didNoteFingerprint(did: string): string {
   return createHash("sha256").update(did, "utf8").digest("hex").slice(0, 16);
 }
 
+/**
+ * The current sharded DID-note path (patterns.md #3, confirmed against the
+ * live docs 2026-09-01): fingerprint split into its first 2 hex characters
+ * (the namespace shard) and remaining 14 (the key), so the public directory
+ * stays spread across bounded per-namespace limits instead of one giant
+ * `did` namespace. Readers should still fall back to the legacy
+ * `/kv/did/<fingerprint>` path for notes published before this convention.
+ */
+export function didNoteShardedPath(did: string): { ns: string; key: string } {
+  const fingerprint = didNoteFingerprint(did);
+  return { ns: `did-${fingerprint.slice(0, 2)}`, key: fingerprint.slice(2) };
+}
+
 // -- Ed25519 sign / verify over raw key bytes -----------------------------------
 
 function privateKeyObjectFromSeed(seedBytes: Buffer) {

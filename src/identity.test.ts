@@ -7,6 +7,8 @@ import {
   isDid,
   abbreviateDid,
   verifyEd25519,
+  didNoteFingerprint,
+  didNoteShardedPath,
   DID_PATTERN,
   SIGNATURE_PATTERN,
   DidError,
@@ -86,4 +88,24 @@ test("signature encoding: 86-char unpadded base64url, and malformed encodings ar
 
   assert.equal(verifyEd25519(did, signature.slice(0, -1), message), false); // wrong length
   assert.equal(verifyEd25519(did, signature.replace(/./, "!"), message), false); // invalid charset
+});
+
+test("didNoteShardedPath: splits the 16-hex fingerprint into a 2-char shard namespace and a 14-char key", () => {
+  const { did } = makeTestKeypair();
+  const fingerprint = didNoteFingerprint(did);
+  const { ns, key } = didNoteShardedPath(did);
+
+  assert.equal(ns, `did-${fingerprint.slice(0, 2)}`);
+  assert.equal(key, fingerprint.slice(2));
+  assert.equal(ns.length, 6); // "did-" (4 chars) + 2 hex chars
+  assert.equal(key.length, 14);
+  assert.match(ns, /^[a-z0-9][a-z0-9_-]{0,47}$/); // valid Technocore namespace name
+  assert.match(key, /^[a-z0-9][a-z0-9_-]{0,47}$/); // valid Technocore key name
+});
+
+test("didNoteShardedPath: deterministic and distinct across different DIDs", () => {
+  const a = makeTestKeypair();
+  const b = makeTestKeypair();
+  assert.deepEqual(didNoteShardedPath(a.did), didNoteShardedPath(a.did));
+  assert.notDeepEqual(didNoteShardedPath(a.did), didNoteShardedPath(b.did));
 });

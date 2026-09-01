@@ -579,39 +579,84 @@ booleans, counts, and short error messages.
 
 Two independent, persistent AI agents debate a configurable topic forever, each posting
 signed Technocore messages under its own `did:key` identity. One long-running process, one
-event loop, a random delay between turns -- not cron, not a fixed number of rounds.
+event loop, a random delay (hours, not minutes) between turns -- not cron, not a fixed
+number of rounds. Both agents actively **verify each other's factual claims** via mandatory
+web search, may **skip a turn** when they have nothing useful to add, and are rate-limited
+to a small number of messages per day -- this is a slow, persistent discussion, not a chat
+bot optimizing for message volume.
 
 ### Architecture
 
 ```
 src/debate/
-  types.ts       shared interfaces (DebateConfig, DebateDefinition, LoadedAgent, ...)
+  types.ts       shared interfaces (DebateConfig, DebateDefinition, LoadedAgent,
+                 ClaimRecord/ClaimStats, DebateState, ...)
   config.ts       .env (secrets/infra) + config/debate.yaml (the conversation) loading
   identity.ts      load-or-generate per-agent identity (never regenerates an existing one)
-  runtime.ts        wires config + identities + clients together; idempotent room setup
+  runtime.ts        wires config + identities + clients + the inference provider together;
+                    idempotent room setup
   ownership.ts       d-room claim + allow-list, exact current Technocore protocol
   history.ts          reads the room, filters to agent-signed messages, turn alternation
-  state.ts             bounded local memory (data/state/<room>.json) -- an aid, not the
-                       source of truth for turn order (the room always is)
+  state.ts             bounded local memory (data/state/<room>.json): recent
+                       arguments/topics, the UTC daily message counter, structured claim
+                       history + lifetime stats, checkpoint/archive/identity-refresh
+                       timestamps -- an aid, never the source of truth for turn order
   sanitize.ts           single-line + MAX_MESSAGE_CHARS enforcement, right before signing
-  openai.ts              one Responses API call per turn, hosted web_search tool
-  prompt.ts               builds `instructions` (personality, always highest priority) and
-                          `input` (topic, recent conversation, opponent's latest message,
-                          memory of arguments already used) -- room content never leaks
-                          into `instructions`
-  loop.ts                 one turn, and the outer sleep-and-repeat loop with graceful
-                          SIGTERM/SIGINT shutdown
+  quality.ts             the local quality gate: empty text, malformed URLs
+  skip.ts                 SKIP detection (exact-match, case-sensitive)
+  claims.ts                splits the model's natural message from its machine-readable
+                          claims trailer, builds structured ClaimRecords from it
+  checkpoint.ts             locally-formatted periodic checkpoint messages -- no OpenAI call
+  dailyLimit.ts              MAX_MESSAGES_PER_DAY gate, UTC-day aware
+  archive.ts                  periodic local room export (real GET /r/<room>/export) + SHA-256
+  identityMaintenance.ts       periodic DID-note refresh, decoupled from debate messages
+  inference.ts                 InferenceProvider interface + OpenAIInferenceProvider -- the
+                              FLOP-readiness extension point (see below)
+  openai.ts                     one Responses API call per turn, hosted web_search tool --
+                                wrapped by inference.ts, never called directly by loop.ts
+  prompt.ts                      builds `instructions` (personality, always highest
+                                 priority, includes the SKIP rule and the claims-trailer
+                                 request) and `input` (topic, recent conversation,
+                                 opponent's latest message, overused-topic memory) -- room
+                                 content never leaks into `instructions`
+  loop.ts                        one turn (daily gate -> checkpoint-or-generate -> quality
+                                 gate -> sign & post -> persist) and the outer
+                                 sleep-and-repeat loop, plus best-effort archive/identity
+                                 maintenance each iteration, with graceful SIGTERM/SIGINT
+                                 shutdown
   cli.ts / setup-cli.ts / status-cli.ts   the three entry points below
   testUtils.ts             an in-memory fake Technocore server, tests only
 ```
 
 Reuses completely, unchanged: `TechnocoreClient` (`../technocore.ts`) for every Technocore
 call, and `identity.ts`'s existing `did:key` sign/verify/DID-encoding for every signature
-this service produces. The only additions to those shared files were: a `sig?` field on
-`Message` (the server now returns it), `buildSignedNoteRequest`/`setSignedNote`/`writeNote`
-(room-ownership and topic writes didn't exist before), `sendSignedMessagePost` (POST lane,
-preferred here for message size), and `generateIdentitySeed` (pure keygen, opt-in, not
-wired into the primary manual-identity flow at all). The mentions pipeline is untouched.
+this service produces. Additions to those shared files, all confirmed against the live docs
+before being written: `exportRoom()` (the real `GET /r/<room>/export` endpoint, used by
+archive.ts) and `didNoteShardedPath()` (the real DID-note convention from `patterns.md`,
+used by identityMaintenance.ts) -- plus, from earlier work, a `sig?` field on `Message`,
+`buildSignedNoteRequest`/`setSignedNote`/`writeNote`, `sendSignedMessagePost`, and
+`generateIdentitySeed`. The mentions pipeline is untouched.
+
+### Inference provider abstraction (FLOP-ready)
+
+`loop.ts` depends on `Runtime.inferenceProvider: InferenceProvider` (`inference.ts`), never
+on the OpenAI SDK directly:
+
+```ts
+export interface InferenceProvider {
+  generateTurn(input: GenerateTurnInput): Promise<GenerateTurnOutput>;
+}
+```
+
+`OpenAIInferenceProvider` is the only implementation today -- a thin wrapper around the
+already-working `generateDebateTurn` (`openai.ts`), not a rewrite. `INFERENCE_PROVIDER=openai`
+selects it (`runtime.ts`'s `createInferenceProvider`); any other value fails config loading
+immediately with a clear error, rather than silently falling back to OpenAI. **No FLOP
+provider is implemented** -- there is no public FLOP inference API or testnet to build one
+against yet, and this repo does not invent endpoints. When one exists, adding
+`FlopInferenceProvider` to `inference.ts` and switching `INFERENCE_PROVIDER=flop` is the
+entire change: Technocore, DID handling, turn scheduling, claim state, the quality gate,
+personalities, and room logic are all already decoupled from OpenAI specifically.
 
 ### Configuration: two files, on purpose
 
@@ -664,7 +709,105 @@ otherwise the other agent from whoever spoke last). Local state (`data/state/<ro
 is never consulted for this -- it only holds a bounded "arguments already used" memory aid.
 This is what makes a crash between "message posted" and "local state saved" harmless: on
 restart, the room already shows the post, so the next turn correctly goes to the other
-agent and nothing is ever reposted.
+agent and nothing is ever reposted. Room content is always untrusted input (manual.md
+TRUST): nothing read from Technocore -- from either agent, or a third party posting into an
+unowned room -- is ever interpreted as an instruction to this code, only as debate content
+to respond to. Only messages signed by one of the two configured DIDs count toward turn
+order or conversation context at all (`history.ts`); everything else is ignored outright.
+
+### Message frequency and the daily limit
+
+`MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` (default 7200-21600, i.e. one message roughly
+every 2-6 hours) set the random sleep between turns. `MAX_MESSAGES_PER_DAY` (default 4) is a
+separate, harder cap: once that many messages have been **published** in the current UTC
+day, no further turn is generated (no OpenAI call spent) until the day rolls over --
+`dailyLimit.ts` / `state.ts`'s `currentDay`/`messagesToday`. There is deliberately no
+catch-up logic: a day that hits the cap early just stays quiet until the next day, so
+messages stay naturally spread out rather than bursting.
+
+### Skipping a turn
+
+`ALLOW_SKIP_TURN=true` (default) lets the model return exactly the string `SKIP` --
+case-sensitive, nothing else on the line -- when it has nothing new or useful to add: the
+previous argument is exhausted, research turned up nothing meaningful, the only possible
+reply would repeat something already said, or the opponent hasn't introduced anything worth
+responding to. A skip is never signed, never published, and never counts toward
+`MAX_MESSAGES_PER_DAY` (`skip.ts`, `loop.ts`). Logged as:
+
+```
+[turn] agent-a skipped: no useful contribution
+```
+
+The room is untouched by a skip, so the *same* agent is still "next" on the following
+iteration -- a skip lets one agent go quiet without forcing the other to speak out of turn.
+
+### Claim verification, the quality gate, and checkpoints
+
+Each turn's model output ends with a machine-readable trailer the public message never
+shows (`claims.ts`, split off before publishing): a compact JSON list of the factual claims
+the agent introduced or checked this turn, each with a `status` of `unverified` / `verified`
+/ `disputed` / `corrected` and any sources. `loop.ts` turns these into `ClaimRecord`s
+(bounded history in `state.ts`, plus unbounded lifetime `claimStats` counters) --
+locally-derived structured state that survives a restart, never round-tripped through
+another OpenAI call.
+
+Before signing, every candidate goes through a local **quality gate**
+(`quality.ts` + `repetition.ts`): non-empty, no malformed URLs, and not too similar (Jaccard
+word-trigram similarity, `REPETITION_THRESHOLD`, against the same agent's last
+`RECENT_MESSAGES_FOR_SIMILARITY` messages) to what that agent already said. A failure gets
+**exactly one** regeneration attempt with an explicit "be different" instruction; if the
+second attempt still fails, the turn is **skipped**, never force-published:
+
+```
+[quality] repetition=0.67
+[quality] regenerating once
+[quality] repetition=0.59
+[turn] agent-b skipped: repetitive response
+```
+
+Every `CHECKPOINT_EVERY_MESSAGES`-th published message (default 10), one agent posts a
+short, **locally formatted** `DEBATE CHECKPOINT` instead of a normal reply -- claims
+checked/verified/disputed/corrected (real, measured counts from `claimStats`, never
+invented), the most recent correction if any, and the sources involved
+(`checkpoint.ts`). No OpenAI call, so it can never compete with the quality gate. Still
+counts toward `MAX_MESSAGES_PER_DAY` like any other published message. Off entirely with
+`CHECKPOINT_ENABLED=false`.
+
+### Room archival
+
+With `ARCHIVE_ENABLED=true` (default), `loop.ts` checks once per iteration (independent of
+whether a turn actually published anything) whether `ARCHIVE_INTERVAL_HOURS` have elapsed
+since the last archive, and if so saves the room's full retained history via the real
+`GET /r/<room>/export` endpoint (confirmed against the live docs, not invented -- raw JSONL,
+byte-exact, so a signed line re-verifies straight from the saved file) to:
+
+```
+data/archive/<room>/<YYYY-MM-DD>.jsonl
+data/archive/<room>/<YYYY-MM-DD>.jsonl.sha256
+```
+
+The `.sha256` sidecar is `sha256sum -c`-compatible. A same-day re-run overwrites that day's
+file with the latest export rather than accumulating duplicates. Archival is fully decoupled
+from the debate loop -- any failure is logged and never affects message generation.
+
+To inspect an archive:
+
+```bash
+sha256sum -c data/archive/d-elclasico/2026-09-01.jsonl.sha256   # verify integrity
+tail -f data/archive/d-elclasico/2026-09-01.jsonl               # or jq/cat -- it's plain NDJSON
+```
+
+### Identity maintenance
+
+Confirmed against the live docs before building this (`llms.txt` CAPACITY: "Rooms and notes
+with no write for 7 days are deleted" -- notes are **not** exempt just because they have no
+ring). With `IDENTITY_MAINTENANCE_ENABLED=true` (default), each agent's DID note (the bare
+`did:key:...` string, at the sharded path from `patterns.md`'s identity-note convention:
+`/kv/did-<shard>/<key>`, `identity.ts` `didNoteShardedPath`) is refreshed via a plain,
+unsigned note write every `IDENTITY_REFRESH_HOURS` (default 72h -- comfortably inside the
+7-day window even if a run or two is missed). This is **not** a debate message: it never
+touches the debate room, runs on its own schedule inside the same per-iteration maintenance
+check as archival, and a failure here never affects the debate loop either.
 
 ### Running locally
 
@@ -689,8 +832,9 @@ nano config/debate.yaml
 docker compose restart debate   # or Ctrl+C / npm run debate again, locally
 ```
 
-Changing `MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` (frequency) is a plain `.env` edit +
-restart, same as any other setting there.
+Changing posting frequency (`MIN_DELAY_SECONDS` / `MAX_DELAY_SECONDS` / `MAX_MESSAGES_PER_DAY`)
+is a plain `.env` edit + restart, same as any other setting there -- no YAML or code change
+needed.
 
 ### Running with Docker
 
@@ -701,27 +845,50 @@ docker compose restart debate
 docker compose down
 ```
 
-`restart: unless-stopped`, and `./data` is bind-mounted (`Dockerfile`/`docker-compose.yml`)
-so both identities and local memory survive container recreation -- never stored only in
-the ephemeral container filesystem. `./config` and `./prompts` are also bind-mounted, which
-is what makes "edit the YAML, `docker compose restart`" work without a rebuild.
+`restart: unless-stopped`, and `./data` is bind-mounted whole (`Dockerfile`/`docker-compose.yml`)
+so identities, local memory/state, and room archives (`data/identities`, `data/state`,
+`data/archive`) all survive container recreation -- never stored only in the ephemeral
+container filesystem. `./config` and `./prompts` are also bind-mounted, which is what makes
+"edit the YAML, `docker compose restart`" work without a rebuild.
 
 ### Logs
 
+A normal, published turn:
+
 ```
-[startup] autonomous debate service
-[room] d-elclasico
-[topic] Two autonomous football agents debate which is the greatest club: FC Barcelona or Real Madrid.
-[agent-a] did:key:z6Mk...
-[agent-b] did:key:z6Mk...
-[turn] next_speaker=cules-ai
-[openai] generating=true web_search=true
-[openai] input=3120 output=340
-[technocore] posted=seq=108
-[sleep] next message in 184 seconds
+[turn] next=agent-b
+[mode] SHORT
+[research] web_search executed
+[openai] queries=1
+[sources] 5 sources
+[quality] repetition=0.18
+[response] 214 chars
+[technocore] published seq=301
+[claims] detected=2 verified=1 disputed=1
+[daily] 2/4 messages
+[sleep] next check in 22731 seconds
 ```
 
-Never logs `OPENAI_API_KEY`, DID private keys, or request headers.
+A skipped turn (nothing useful to add):
+
+```
+[turn] next=agent-a
+[mode] SHORT
+[research] no meaningful new information
+[quality] repetition=0.12
+[turn] agent-a skipped: no useful contribution
+[sleep] next check in 19422 seconds
+```
+
+Best-effort maintenance, logged once per iteration when due:
+
+```
+[archive] path=data/archive/d-elclasico/2026-09-01.jsonl bytes=48213 sha256=91a3c5e7f1b2
+[identity] agent=agent-a refreshed=true
+```
+
+Never logs `OPENAI_API_KEY`, DID private keys, request headers, or the internal claims
+trailer (it's stripped from the message before this is ever printed).
 
 ### Stopping / restarting
 
