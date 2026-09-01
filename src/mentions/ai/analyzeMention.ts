@@ -100,7 +100,14 @@ export async function analyzeMention(input: AnalyzeMentionInput, options: Analyz
   );
 
   if (!response.ok) {
-    throw new Error(`OpenAI request failed: HTTP ${response.status}`);
+    // Safe to include: an OpenAI error body describes what was wrong with the
+    // *request* (bad parameter, content policy, rate limit detail) -- it never
+    // echoes the Authorization header or the API key. Without this, a 400 like
+    // the one that turned out to be a one-off transient failure (reproduced
+    // successfully moments later, same request) is undiagnosable from logs
+    // alone -- this is what would have shown the real reason immediately.
+    const body = await response.text().catch(() => "");
+    throw new Error(`OpenAI request failed: HTTP ${response.status}${body ? ` -- ${body.slice(0, 300)}` : ""}`);
   }
 
   const body = (await response.json()) as { choices?: { message?: { content?: string } }[] };
