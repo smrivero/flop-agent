@@ -232,6 +232,28 @@ export function recordOfferDecision(
   ).run(fields.offerId, fields.fromDid, fields.decision, fields.reason, fields.contractId ?? null, fields.amount ?? null, fields.asset ?? null, new Date().toISOString());
 }
 
+/** Offers REJECTed for a reason that is about OUR OWN capacity/config at the
+ * moment, not the offer's own terms -- `max_concurrent_deals_reached` chiefly
+ * -- so it can go stale the moment a deal completes and a slot frees up.
+ * Everything else (unsupported_rail, unsupported_asset, missing_job, ...) is
+ * permanent: the offer's own fields never change. */
+const RETRYABLE_REJECT_REASONS = ["max_concurrent_deals_reached"] as const;
+
+/** Offer ids REJECTed for a retryable reason -- worker.ts re-evaluates each
+ * one fresh (from the already-cached offer frame, no network re-read needed)
+ * every tick, so a transient rejection never becomes a permanent one. */
+export function listRetryableRejections(db: TclkMarketDb): string[] {
+  const placeholders = RETRYABLE_REJECT_REASONS.map(() => "?").join(",");
+  const rows = db
+    .prepare(`SELECT offer_id FROM tclk_market_offer_decisions WHERE decision = 'REJECT' AND reason IN (${placeholders})`)
+    .all(...RETRYABLE_REJECT_REASONS) as { offer_id: string }[];
+  return rows.map((r) => r.offer_id);
+}
+
+export function deleteOfferDecision(db: TclkMarketDb, offerId: string): void {
+  db.prepare(`DELETE FROM tclk_market_offer_decisions WHERE offer_id = ?`).run(offerId);
+}
+
 // -- contracts ---------------------------------------------------------------------
 
 export interface TclkMarketContractRow {
@@ -333,6 +355,36 @@ export function countActiveContractsByRole(db: TclkMarketDb, role: "payer" | "pa
 }
 
 // -- published offers ------------------------------------------------------------
+
+/**
+ * Every offer we published that's still marked 'open' but whose own
+ * `expiresMs` has passed is closed out (status='expired') -- otherwise it
+ * counts against `TCLK_MKT_MAX_OPEN_OFFERS` forever, silently blocking
+ * auto-publish long after the offer itself became un-acceptable to anyone.
+ * Reads the cached offer frame (never the network) to get `expiresMs`; a row
+ * whose frame isn't cached (shouldn't happen -- publisher.ts stores it
+ * immediately) is left alone rather than guessed at.
+ */
+export function closeExpiredPublishedOffers(db: TclkMarketDb, now: number): number {
+  const open = db.prepare(`SELECT offer_id FROM tclk_market_published_offers WHERE status = 'open'`).all() as { offer_id: string }[];
+  let closed = 0;
+  const update = db.prepare(`UPDATE tclk_market_published_offers SET status = 'expired', updated_at = ? WHERE offer_id = ?`);
+  for (const { offer_id } of open) {
+    const frameRow = offerFrameById(db, offer_id);
+    if (frameRow === undefined) continue;
+    let expiresMs: number | undefined;
+    try {
+      expiresMs = (JSON.parse(frameRow.frame_json) as { expiresMs?: number }).expiresMs;
+    } catch {
+      continue;
+    }
+    if (typeof expiresMs === "number" && now >= expiresMs) {
+      update.run(new Date().toISOString(), offer_id);
+      closed++;
+    }
+  }
+  return closed;
+}
 
 export function insertPublishedOffer(
   db: TclkMarketDb,

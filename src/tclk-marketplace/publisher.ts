@@ -16,7 +16,7 @@ import type { TechnocoreClient } from "../technocore.js";
 import type { TechnocoreIdentity } from "../identity.js";
 import { postFrame } from "../tclk/frames.js";
 import type { TclkMarketConfig } from "./config.js";
-import { countOpenPublishedOffers, insertPublishedOffer, lastPublishedOfferAt, storeFrame, type TclkMarketDb } from "./database.js";
+import { closeExpiredPublishedOffers, countOpenPublishedOffers, insertPublishedOffer, lastPublishedOfferAt, storeFrame, type TclkMarketDb } from "./database.js";
 import type { TclkMarketLogger } from "./logger.js";
 
 export interface PublishOfferOptions {
@@ -95,6 +95,13 @@ export async function maybeAutoPublish(
   log: TclkMarketLogger,
   now: () => number = Date.now,
 ): Promise<AutoPublishOutcome> {
+  // Runs regardless of TCLK_MKT_AUTO_PUBLISH -- an offer past its own
+  // expiresMs is un-acceptable to anyone and must stop counting against
+  // TCLK_MKT_MAX_OPEN_OFFERS (and against tclk:status's "open" count) even on
+  // a worker that only ever published offers by hand (`npm run tclk:offer`).
+  const closed = closeExpiredPublishedOffers(db, now());
+  if (closed > 0) log.info("[PUBLISHER][EXPIRED]", { closed });
+
   if (!config.autoPublish) return { published: false, reason: "auto_publish_disabled" };
 
   const openCount = countOpenPublishedOffers(db);

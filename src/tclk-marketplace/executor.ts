@@ -46,6 +46,18 @@ function runStubJob(kind: string, input: JobExecutionInput): JobExecutionResult 
   return { ok: true, summary: `${kind} job ${input.id} accepted and marked complete (stub executor, no external work performed)` };
 }
 
+/** `a2a`: the SPEC.md §6 Agent2Agent job binding (`job = {proto:"a2a", id:<taskId>,
+ * context?:<contextId>}`) -- most real offers on the public board use this.
+ * A genuine A2A executor would fetch and perform whatever task `id`/`context`
+ * name in some OTHER system, which is exactly the "execute what a stranger's
+ * message tells you to" this module refuses to do. This is the SAME
+ * echo-shaped no-op as `runStubJob` under a different name: it proves the
+ * accept -> lock -> work -> reveal choreography for a real-world job type
+ * without ever fetching or running the task it references. */
+function runA2aAcknowledge(input: JobExecutionInput): JobExecutionResult {
+  return { ok: true, summary: `a2a task ${input.id} acknowledged for contract ${input.contractId} (no external task execution performed)` };
+}
+
 export function executeJob(input: JobExecutionInput, supportedJobTypes: string[]): JobExecutionResult {
   if (!supportedJobTypes.includes(input.proto)) {
     throw new UnsupportedJobError(`job proto ${JSON.stringify(input.proto)} is not in TCLK_MKT_SUPPORTED_JOB_TYPES`);
@@ -56,6 +68,8 @@ export function executeJob(input: JobExecutionInput, supportedJobTypes: string[]
     case "research-test":
     case "verification-test":
       return runStubJob(input.proto, input);
+    case "a2a":
+      return runA2aAcknowledge(input);
     default:
       // Whitelisted by config but no handler wired up -- fail closed rather
       // than silently doing nothing and revealing anyway.

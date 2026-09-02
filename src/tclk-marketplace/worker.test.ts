@@ -23,6 +23,8 @@ import { FakeTechnocore, makeTestIdentity } from "../tclk/testUtils.js";
 import { openSecretStore } from "../tclk/secretStore.js";
 import type { TclkMarketConfig } from "./config.js";
 import {
+  closeExpiredPublishedOffers,
+  countOpenPublishedOffers,
   getContract,
   getOfferDecision,
   insertContract,
@@ -30,10 +32,11 @@ import {
   openTclkMarketDatabase,
   setRoomCursor,
   storeFrame,
+  updateContractCache,
   type TclkMarketDb,
 } from "./database.js";
 import { createLogger } from "./logger.js";
-import { publishOffer } from "./publisher.js";
+import { maybeAutoPublish, publishOffer } from "./publisher.js";
 import { runTclkMarketTick, type TickSummary } from "./worker.js";
 import type { TechnocoreIdentity } from "../identity.js";
 
@@ -410,4 +413,125 @@ test("regression: a contract folds correctly even long after its offer's expires
 
   db.close();
   secretDb.close();
+});
+
+// Regression: a real deployment saw two of its own counterparty's offers
+// REJECTed with max_concurrent_deals_reached while at capacity, then never
+// reconsidered even once the blocking deal finished and a slot freed up --
+// offer_decisions treats REJECT as permanent by design (never re-evaluate
+// spam), which is correct for a structural mismatch (wrong rail/asset/job
+// type) but wrong for "our own capacity was full a moment ago". Fixed via
+// listRetryableRejections + reconsiderCapacityRejections: only
+// max_concurrent_deals_reached gets retried, purely from the already-cached
+// offer frame, no network re-read needed.
+test("capacity rejection is retried once a slot frees up, and accepted then -- other REJECT reasons are never retried", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const agentA = makeTestIdentity();
+  const agentB = makeTestIdentity();
+
+  const configA = baseConfig({ dbPath: tempPath("a.sqlite3") });
+  const dbA = openTclkMarketDatabase(configA.dbPath);
+  const { offer } = await publishOffer(dbA, client, configA, agentA, { jobType: "echo", jobId: "job-capacity" }, noopLog);
+  dbA.close();
+
+  const dbPathB = tempPath("b.sqlite3");
+  const dbB = openTclkMarketDatabase(dbPathB);
+  const secretDbB = openSecretStore(tempPath("secrets-b.sqlite3"));
+  const configB = baseConfig({ dbPath: dbPathB, maxConcurrentDeals: 1 });
+
+  // Simulate "we already have 1 active deal" -- a fake blocking contract,
+  // no need to run a real accept/lock cycle to get into this state.
+  insertContract(dbB, {
+    contract_id: "0xblocking", offer_id: "0xsomeotheroffer", role: "payee", payer_did: agentA.did, payee_did: agentB.did,
+    asset: "PAPER", amount: "1", rail: "paper", job_proto: "echo", job_id: "blocker",
+    deal_room: "mb-p-tclk-blocking", cached_status: "accepted", claim_by_ms: Date.now() + 60_000,
+    refund_after_ms: Date.now() + 120_000, expires_ms: Date.now() + 30_000, secret_fingerprint: null,
+  });
+
+  const first = await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  assert.equal(first.offersAccepted, 0);
+  assert.equal(getOfferDecision(dbB, offer.id)?.reason, "max_concurrent_deals_reached");
+
+  // A second tick with the slot STILL full must not re-accept -- confirms
+  // this isn't just "always retry everything every time".
+  const stillBlocked = await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  assert.equal(stillBlocked.offersAccepted, 0);
+
+  // The slot frees up (the blocking deal completed).
+  updateContractCache(dbB, "0xblocking", { cachedStatus: "claimed" });
+
+  const afterFreed = await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  assert.equal(afterFreed.offersAccepted, 1);
+  assert.equal(getOfferDecision(dbB, offer.id)?.decision, "ACCEPT");
+
+  dbB.close();
+  secretDbB.close();
+});
+
+test("a REJECT for a structural reason (unsupported job type) is never retried, even after ticks pass", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const agentA = makeTestIdentity();
+  const agentB = makeTestIdentity();
+
+  const configA = baseConfig({ dbPath: tempPath("a.sqlite3") });
+  const dbA = openTclkMarketDatabase(configA.dbPath);
+  const { offer } = await publishOffer(dbA, client, configA, agentA, { jobType: "not-a-real-job-type", jobId: "job-x" }, noopLog);
+  dbA.close();
+
+  const dbPathB = tempPath("b.sqlite3");
+  const dbB = openTclkMarketDatabase(dbPathB);
+  const secretDbB = openSecretStore(tempPath("secrets-b.sqlite3"));
+  const configB = baseConfig({ dbPath: dbPathB });
+
+  await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  assert.equal(getOfferDecision(dbB, offer.id)?.reason, "unsupported_job_type");
+
+  await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  // Still rejected, exact same reason -- never silently re-considered.
+  assert.equal(getOfferDecision(dbB, offer.id)?.reason, "unsupported_job_type");
+
+  dbB.close();
+  secretDbB.close();
+});
+
+// Regression: a real deployment's own published offers piled up as
+// permanently "open" in local bookkeeping even long after their own
+// expiresMs passed, silently blocking TCLK_MKT_AUTO_PUBLISH forever once
+// TCLK_MKT_MAX_OPEN_OFFERS was reached by offers nobody could accept anymore.
+test("closeExpiredPublishedOffers: an offer past its own expiresMs stops counting as open, unblocking auto-publish", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const identity = makeTestIdentity();
+
+  const dbPath = tempPath("a.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  const config = baseConfig({ dbPath, autoPublish: true, maxOpenOffers: 1, offerExpiresMinutes: 30, minOfferIntervalMs: 60_000 });
+
+  await publishOffer(db, client, config, identity, { jobType: "echo" }, noopLog);
+  assert.equal(countOpenPublishedOffers(db), 1);
+
+  // Not expired yet -- nothing closes.
+  const notYet = closeExpiredPublishedOffers(db, Date.now());
+  assert.equal(notYet, 0);
+  assert.equal(countOpenPublishedOffers(db), 1);
+
+  // A second offer can't be auto-published -- at the cap.
+  const blocked = await maybeAutoPublish(db, client, config, identity, noopLog, () => Date.now());
+  assert.equal(blocked.published, false);
+  assert.equal(blocked.reason, "max_open_offers_reached");
+
+  // 31 minutes later (past the 30-minute expiresMinutes) -- the stale offer closes...
+  const future = Date.now() + 31 * 60_000;
+  const closedCount = closeExpiredPublishedOffers(db, future);
+  assert.equal(closedCount, 1);
+  assert.equal(countOpenPublishedOffers(db), 0);
+
+  // ...and auto-publish (which calls closeExpiredPublishedOffers itself) can proceed.
+  const unblocked = await maybeAutoPublish(db, client, config, identity, noopLog, () => future);
+  assert.equal(unblocked.published, true);
+
+  db.close();
 });

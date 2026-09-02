@@ -38,12 +38,14 @@ import { technocoreNoteStore } from "../tclk/noteStore.js";
 import type { TclkMarketConfig } from "./config.js";
 import {
   countActiveContractsByRole,
+  deleteOfferDecision,
   getContract,
   getOfferDecision,
   getRoomCursor,
   incrementErrorCounter,
   insertContract,
   listOpenContracts,
+  listRetryableRejections,
   markPublishedOfferAccepted,
   offerFrameById,
   recordOfferDecision,
@@ -169,6 +171,12 @@ async function scanOffersRoom(ctx: TclkMarketWorkerContext, summary: TickSummary
   // runs even if the room is unreachable this tick. See persistAcceptedContract.
   reconcileOrphanedAccepts(ctx);
 
+  // Re-evaluate any offer REJECTed only because OUR capacity was full at the
+  // time (max_concurrent_deals_reached) -- purely local (the offer frame is
+  // already cached), so a freed-up slot gets used on the very next tick
+  // instead of that offer being permanently lost.
+  await reconsiderCapacityRejections(ctx, summary);
+
   const since = getRoomCursor(db, config.offerRoom);
   const result = await scanRoomForFrames(client, config.offerRoom, since, { waitSeconds: config.longPollWaitSeconds, maxRetries: config.maxRetries });
   log.info("[SCANNER]", { room: config.offerRoom, since, last_seq: result.lastSeq, frames_found: result.frames.length });
@@ -240,6 +248,32 @@ function reconcileOrphanedAccepts(ctx: TclkMarketWorkerContext): void {
       log.info("[ACCEPT][RECOVERED]", { offer: accept.ref, contract: accept.contract });
     } catch (err) {
       log.info("[ERROR]", { stage: "reconcile_accept", contract: accept.contract, error: err instanceof Error ? err.message : String(err) });
+      incrementErrorCounter(db);
+    }
+  }
+}
+
+/**
+ * Re-run policy fresh (from the already-cached offer frame, no network read)
+ * for every offer id whose only REJECT reason was our own capacity being
+ * full at the time -- see database.ts's `listRetryableRejections`. Deletes
+ * the stale decision first, then goes through the exact same
+ * `handleOfferFrame` path a first-time sighting would, so every check runs
+ * again (not just capacity): an offer that ALSO expired in the meantime
+ * correctly ends up REJECTed for that instead, never silently re-accepted
+ * past its own terms.
+ */
+async function reconsiderCapacityRejections(ctx: TclkMarketWorkerContext, summary: TickSummary): Promise<void> {
+  const { db, log } = ctx;
+  for (const offerId of listRetryableRejections(db)) {
+    const offerRow = offerFrameById(db, offerId);
+    if (offerRow === undefined) continue; // shouldn't happen -- the frame was cached when first evaluated
+    try {
+      deleteOfferDecision(db, offerId);
+      const offer = JSON.parse(offerRow.frame_json) as OfferFrame;
+      await handleOfferFrame(ctx, offer, offerRow.from_did, summary);
+    } catch (err) {
+      log.info("[ERROR]", { stage: "reconsider_rejection", offer: offerId, error: err instanceof Error ? err.message : String(err) });
       incrementErrorCounter(db);
     }
   }
