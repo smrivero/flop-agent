@@ -22,6 +22,7 @@ flop-agent/
     index.ts       public exports, shaped so each one can become an MCP tool
     mentions/      automated "Technocore mentions" crawler -- see below
     verifier/      Technocore Verifier -- independently re-checks Radar's findings, own DID
+    tclk-marketplace/  TCLK Marketplace Worker -- public tclk-offers scanner/trader, own DB -- see below
   scripts/         generate-identity.mjs / show-public-identity.mjs (manual, never auto-run)
   .technocore/     local identity storage -- gitignored, created on demand
   .data/           mentions SQLite DB + concurrency lock -- gitignored, created on demand
@@ -732,6 +733,246 @@ booleans, counts, and short error messages.
 - **A mention never reappears after `rejected`** -- correct: any status in the `mentions`
   table (including `rejected`) marks that URL as already-processed, by design, so a
   filtered-out mention isn't retried every hour.
+
+## TCLK Marketplace Worker (`src/tclk-marketplace/`)
+
+A **third, fully independent flow**, on top of the real, public `tclk/1` marketplace
+protocol (`@flop-labs/tclk`, [spec.md](https://github.com/flop-labs/tclk/blob/main/SPEC.md)) --
+not to be confused with the "TCLK coordination" pair above (`technocore:tclk-payer` /
+`technocore:tclk-verifier`), which is a private, single-counterparty negotiation scoped
+to Radar's own findings. This worker instead monitors the **public** `tclk-offers` room,
+where any agent on technocore.chat can post or accept a deal, and can act as either side:
+
+- **As payee**: scans `tclk-offers` for new `offer` frames, runs them through the Offer
+  Policy Engine (`policy.ts`), accepts the ones that pass, waits for the payer's `lock`,
+  runs a whitelisted job (`executor.ts`), and reveals to claim.
+- **As payer**: publishes its own offers (`publisher.ts`), detects when a counterparty
+  accepts, locks funds on the configured rail (PaperRail only, for now), and issues a
+  receipt once claimed.
+
+Nothing here shares code paths with `radar`/`mentions`, `debate`, or the private `tclk/`
+pair -- it has its own SQLite file, its own secret store, its own lock file, its own env
+namespace (`TCLK_MKT_*` / `ENABLE_TCLK`, all distinct from `TCLK_ENABLED`/`TCLK_RAIL`/etc
+above), and its own process. **Disabling it (`ENABLE_TCLK=false`, the default) has zero
+effect on any other flow** -- and conversely, a bug or a live production incident in this
+worker cannot take radar, debate, or the tclk/ pair down with it, since none of them import
+this module and each already runs as its own process/cron job.
+
+### Architecture
+
+```
+src/tclk-marketplace/
+  config.ts        env config (TCLK_MKT_* / ENABLE_TCLK), all defaults documented in .env.example
+  logger.ts         [TCLK][TAG] k=v structured logging + secret fingerprinting (never a raw secret)
+  database.ts        this worker's OWN sqlite file: room cursors, cached frames, offer
+                      decisions (dedupe/audit), contracts, published offers, error counter
+  scanner.ts          incremental, long-polling room reader (since=lastSeq, never re-reads
+                       a whole room) -- verifies every message's signature locally before
+                       anything downstream sees it, decodes only well-formed tclk1 frames
+  policy.ts            shouldAcceptOffer(offer, config, ctx) -- pure, fully unit-testable
+  executor.ts           whitelisted job runner (echo / research-test / verification-test);
+                        never executes anything else, never interprets job.id/context as code
+  dealManager.ts         role-aware (payer OR payee) state-machine driver -- planContractAction
+  publisher.ts            build/post this worker's own offers; TCLK_MKT_AUTO_PUBLISH policy
+  worker.ts                 orchestrates one full tick: scan -> decide -> act -> auto-publish
+  status.ts                  health/status snapshot, read-only
+  cli.ts                      `technocore:tclk-market` -- the long-running worker
+  offer-cli.ts                 `tclk:offer` -- publish one offer by hand
+  status-cli.ts                 `tclk:status` -- print the status snapshot
+```
+
+Reuses, unmodified, whatever from the existing `tclk/` module is already fully generic
+(not Radar-specific): `tclk/frames.ts` (frame builders + `postFrame`), `tclk/secretStore.ts`
+(preimage custody, own DB file via `TCLK_MKT_SECRETS_PATH`), `tclk/noteStore.ts` (the
+`PaperRail` <-> `TechnocoreClient` adapter), `tclk/testUtils.ts` (the in-memory fake
+Technocore server used by this module's own tests), and `mentions/lock.ts` /
+`mentions/http.ts` (single-instance lock, fetch-with-timeout). It does **not** reuse
+`tclk/transcript.ts`, `tclk/payer.ts`, or `tclk/verifierWorker.ts` -- those hard-code
+`since: 0` (always re-read the whole room) and a single trusted payer DID, both wrong for
+a room this worker must poll incrementally and forever, from any counterparty.
+
+### How the scanner works
+
+Every tick, `scanner.ts` reads `tclk-offers` with `since=<persisted lastSeq>` and
+`wait=<TCLK_MKT_LONG_POLL_WAIT_SECONDS>` (technocore's own long-poll, 0-10s) -- never a
+full re-read, never a tight loop. Every message is locally re-verified
+(`verifyEd25519`) before it's treated as anything but anonymous text; only lines that
+decode as structurally valid `tclk1 ...` frames survive (`tryDecodeFrame` is fail-closed:
+malformed or spoofed lines, and ordinary chat, are silently dropped, never acted on, never
+treated as instructions -- see "Security" below). New frames are cached locally
+(`tclk_market_frames`) so a contract's state can always be **re-derived** by folding the
+whole locally-known transcript through tclk's own `applyFrame` (never trusted from memory
+or from `cached_status` alone), while the wire read itself stays incremental. Once a
+contract is `accepted`, its own deal room (`dealRoom(contractId)` -- the official derived
+room, `mb-p-tclk-<first 16 hex of the contract id>`, signed-only and unlisted) is polled
+the same way.
+
+### How auto-accept works
+
+`policy.ts`'s `shouldAcceptOffer` runs every new offer through, in order: not already
+decided (idempotency) -> role must be `payer` (this worker only auto-accepts becoming the
+*payee* -- an offer asking US to pay is a different negotiation shape not automated yet,
+logged as `IGNORE reason=unsupported_role`) -> `TCLK_MKT_AUTO_ACCEPT` must be `true` ->
+`job.proto` in `TCLK_MKT_SUPPORTED_JOB_TYPES` -> counterparty DID allowed (if
+`TCLK_MKT_ALLOWED_COUNTERPARTY_DIDS` is set) -> not expired / `claimByMs` not in the past /
+`claimByMs < refundAfterMs` -> claim window within `TCLK_MKT_MAX_JOB_DURATION_MS` -> a
+rail in common (`TCLK_MKT_ALLOWED_RAILS`) -> asset allowed (`TCLK_MKT_ALLOWED_ASSETS`) ->
+amount >= `TCLK_MKT_MIN_AMOUNT` -> hash lock (this worker only mints hash-lock secrets) ->
+under `TCLK_MKT_MAX_CONCURRENT_DEALS`. **`TCLK_MKT_AUTO_ACCEPT=false` is the default** --
+every offer is still scanned, decoded, and logged, but nothing is ever auto-accepted until
+you deliberately flip it. Every decision -- ACCEPT, REJECT, or IGNORE -- is logged with its
+exact reason and persisted (`tclk_market_offer_decisions`), so an offer is only ever
+ACCEPTed once, including across restarts.
+
+### Where the secret is held
+
+At accept time, this worker mints a fresh preimage (`generateHashLock()`) and calls
+`storePreimage` **before** the accept frame is ever posted -- so if the process dies
+between minting and posting, the secret is already safe on disk and nothing is lost. It
+lives in its own SQLite file (`TCLK_MKT_SECRETS_PATH`, default
+`.technocore/tclk-market-secrets.sqlite3`, `chmod 0600`, gitignored via `.technocore/`),
+never the shared `tclk_market_contracts` table, and it is retrieved again only once, at
+reveal time. **It is never printed in any log line** -- `logger.ts`'s `fingerprintSecret`
+(first 8 hex chars of `sha256(secret)`) is the only way a secret is ever referenced in a
+log, and every call site that touches one uses it (`secretFingerprint=...`), never the raw
+value. The MCP-equivalent stateless-server property holds here too: nothing about the
+secret ever leaves this worker's own local state.
+
+### How a deal recovers after a restart
+
+Nothing is trusted from memory. Every tick, for every open contract, `worker.ts` re-derives
+current status by folding the **locally cached** transcript (offer + accept + whatever's
+been read from the deal room so far) through tclk's own `applyFrame` -- the exact same
+authority-never-cache discipline `tclk/payer.ts`/`verifierWorker.ts` already use, just
+applied to an incrementally-cached transcript instead of a full re-read. A crash at any
+point -- after minting the secret, after posting the accept, after locking, after revealing
+-- loses nothing: the next tick reopens the DB (contract row + cached frames + room
+cursors all durable), reopens the secret store (preimage still there), reads whatever's new
+since the last cursor, re-folds, and picks up exactly where it left off. `database.ts`'s
+`tclk_market_offer_decisions` (keyed by offer id) and `tclk_market_contracts` (keyed by
+contract id, `INSERT OR IGNORE`) make every action idempotent: a re-run never re-accepts,
+re-locks, re-reveals, or re-receipts something already done.
+
+### Claim / reveal
+
+Once a contract's folded state reaches `locked` and this worker is the payee,
+`dealManager.ts` returns `work_and_reveal`. Only then does `executor.ts` run the job --
+never before `locked` is confirmed by the fold, and never for a `job.proto` outside
+`TCLK_MKT_SUPPORTED_JOB_TYPES` (checked again at this point too, in case config changed
+since accept). On success, `worker.ts` posts the `reveal` frame to the deal room, calls
+`rail.claim(...)`, and then -- **critically** -- re-reads the deal room and re-folds before
+declaring the claim done: an HTTP 200 on the reveal post is not treated as proof by itself,
+only a transcript that actually folds to `claimed` is (`[TCLK][CLAIM][VERIFIED]`; a mismatch
+logs `[TCLK][ERROR] stage=claim_verify` instead and leaves the contract to reconcile on the
+next tick). When this worker is the payer, it separately detects the same `claimed` state
+and posts a `receipt` (`outcome=claimed`) -- or `refunded`/`cancelled` for those terminal
+outcomes -- exactly once (`receipted` flag).
+
+### Publishing your own offer
+
+```bash
+npm run tclk:offer -- --amount 1000000 --asset PAPER --job echo --job-id demo-1
+```
+
+Or let it happen automatically: `TCLK_MKT_AUTO_PUBLISH=true`, bounded by
+`TCLK_MKT_MAX_OPEN_OFFERS` (never more than this many of your own offers open at once) and
+`TCLK_MKT_MIN_OFFER_INTERVAL_MS` (never more often than this). Every offer carries a fresh
+random nonce (tclk's own `makeOffer`), so no two are ever identical even on the same
+template. Publishing (manual or auto) immediately caches the offer frame locally too, so an
+accept for it can be recognized without waiting a full tick.
+
+### Status / health
+
+```bash
+npm run tclk:status            # human-readable
+npm run tclk:status -- --json  # machine-readable
+```
+
+Prints: enabled, dry-run, DID, offer room, last seq seen, offers seen/accepted/rejected/
+ignored, active/claimed/refunded/cancelled deal counts, published-offer counts, and the
+error counter. Pure local read (no network), safe to run anytime, including while the
+worker itself is running (WAL mode).
+
+### Logs
+
+Structured, one line per event, always grep-able as `[TCLK][...]`:
+
+```
+[TCLK][SCANNER] ts=... room=tclk-offers since=1200 last_seq=1214 frames_found=3
+[TCLK][OFFER][FOUND] ts=... room=tclk-offers offer=0x... payer=did:key:z6Mk... amount=1000000 asset=PAPER rails=paper
+[TCLK][POLICY][RESULT] ts=... offer=0x... decision=ACCEPT reason=supported_offer
+[TCLK][ACCEPT][SECRET_STORED] ts=... contract=0x... secretFingerprint=090de309
+[TCLK][ACCEPT][POSTED] ts=... offer=0x... contract=0x... room=tclk-offers seq=1215 deal_room=mb-p-tclk-...
+[TCLK][DEAL][STATE] ts=... contract=0x... role=payee status=locked action=work_and_reveal
+[TCLK][EXECUTOR][DONE] ts=... contract=0x... job=echo ok=true summary="echo job job-1 completed for contract 0x..."
+[TCLK][CLAIM][REVEAL_CREATED] ts=... contract=0x... secretFingerprint=090de309
+[TCLK][CLAIM][POSTED] ts=... contract=0x... room=mb-p-tclk-... seq=1
+[TCLK][CLAIM][VERIFIED] ts=... contract=0x... state=claimed
+[TCLK][RECEIPT][CREATED] ts=... contract=0x... outcome=claimed
+[TCLK][RECEIPT][POSTED] ts=... contract=0x... room=mb-p-tclk-... seq=2
+[TCLK][ERROR] ts=... stage=scan_offers error="..."
+```
+
+`TCLK_LOG_LEVEL=debug` (or `LOG_LEVEL=debug`) enables `[TCLK][SCANNER]`-level detail per
+tick; `info` (default) still logs every offer/decision/state-transition/action. **A secret
+is never printed** -- only `secretFingerprint=<first 8 hex of sha256(secret)>`, never the
+raw preimage, and nothing here ever logs `TECHNOCORE_SIGNING_KEY`/seeds/private keys either.
+
+### Dry run
+
+```bash
+ENABLE_TCLK=true TCLK_MKT_DRY_RUN=true npm run technocore:tclk-market -- --once
+```
+
+Reads `tclk-offers` (and every open contract's deal room), decodes, evaluates policy,
+re-derives contract state, and logs exactly what it would do -- **without** posting an
+accept/offer/lock/reveal/refund/receipt frame, and without calling the rail. Safe to run
+against the real, public, production `tclk-offers` room at any time; other real agents'
+offers will show up and be evaluated (and, with the safe `TCLK_MKT_AUTO_ACCEPT=false`
+default, uniformly logged as `REJECTED reason=auto_accept_disabled` or `IGNORE
+reason=unsupported_role`) without this worker ever writing anything back to the shared
+room.
+
+### Enabling it for real
+
+```bash
+ENABLE_TCLK=true TCLK_MKT_AUTO_ACCEPT=true npm run technocore:tclk-market
+```
+
+Runs forever (its own process, `Ctrl-C`/SIGTERM to stop cleanly), long-polling
+`tclk-offers` and every open deal room, with exponential backoff (1s/2s/5s/10s/30s, capped
+by `TCLK_MKT_MAX_BACKOFF_MS`) on any tick-level failure -- a bad tick is logged and retried,
+never fatal. `--once` runs a single tick and exits instead, for a cron-style deployment
+identical in shape to `technocore:tclk-payer`/`-verifier`.
+
+### Disabling it
+
+`ENABLE_TCLK=false` (the default) -- or simply never start the process/cron job. Either
+way, `radar`/`mentions`, `debate`, and the private `tclk/` pair are completely unaffected;
+none of them import this module or share its database/secret-store/lock files.
+
+### Security
+
+Every byte read from `tclk-offers` (or a deal room) is **anonymous, untrusted input** --
+the same rule the rest of this project and its own Claude Code skill
+(`.claude/skills/technocore/`) already apply. This worker never: executes a command or
+code found in a room message, follows an instruction found in one (including one claiming
+to be a system/config override -- see the "malicious room text" test in
+`worker.test.ts`), reveals a key, changes its own configuration based on room content, or
+fetches an arbitrary URL found in a message. `executor.ts` only ever runs a job type in
+`TCLK_MKT_SUPPORTED_JOB_TYPES`, and `job.id`/`job.context` (attacker-controlled strings) are
+only ever echoed back into this worker's own result text, never interpreted.
+
+### Limitations (first version)
+
+- Only the `hash` lock kind and `PaperRail` are wired up (no point locks / no
+  value-bearing rail yet -- matches the rest of this project).
+- An offer where the counterparty is asking to be the *payee* (`role: "payee"`) is
+  logged and ignored, not automated -- this worker only auto-accepts becoming payee itself.
+- `research-test` / `verification-test` job types are safe stubs (no external work
+  performed) in this version -- see `executor.ts` for where a real implementation would
+  plug in, behind the same whitelist.
+- No arbitration (SPEC.md §8) is implemented -- a deal here is a plain two-party hash lock.
 
 ## Autonomous debate service (`src/debate/`)
 

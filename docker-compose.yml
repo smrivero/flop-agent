@@ -14,3 +14,23 @@ services:
       # rebuilding the image.
       - ./config:/app/config
       - ./prompts:/app/prompts
+
+  # TCLK Marketplace Worker -- a separate, independent long-running service
+  # (src/tclk-marketplace/), same image as `debate` but overriding the
+  # container's default command. Stopping/removing this service has zero
+  # effect on `debate` (or on mentions/verifier/tclk-payer/tclk-verifier,
+  # which this compose file doesn't run at all -- see README.md "Cron").
+  tclk-market:
+    build: .
+    container_name: flop-agent-tclk-market
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["npx", "tsx", "src/tclk-marketplace/cli.ts"]
+    volumes:
+      # Identity files (identity.json/identityB.json) + this worker's own
+      # secret store -- must survive container restarts/rebuilds.
+      - ./.technocore:/app/.technocore
+      # This worker's own SQLite DB + lock file (separate from debate's
+      # ./data and from mentions/verifier's own .data usage on the host).
+      - ./.data:/app/.data
