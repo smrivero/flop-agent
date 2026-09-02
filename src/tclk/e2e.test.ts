@@ -61,12 +61,12 @@ function baseConfig(overrides: Partial<TclkConfig> = {}): TclkConfig {
 
 function noopLog(): void {}
 
-function seedFinding(dbPath: string, findingId: string): void {
+function seedFinding(dbPath: string, findingId: string, urlSuffix = "1"): void {
   const db = openMentionsDatabase(dbPath);
   const candidate: Candidate = {
-    canonicalUrl: "https://example.com/technocore-article",
-    urlHash: "hash-1",
-    originalUrl: "https://example.com/technocore-article",
+    canonicalUrl: `https://example.com/technocore-article-${urlSuffix}`,
+    urlHash: `hash-${urlSuffix}`,
+    originalUrl: `https://example.com/technocore-article-${urlSuffix}`,
     title: "An article about Technocore",
     domain: "example.com",
     snippet: "snippet",
@@ -431,4 +431,66 @@ test("e2e regression: accepting an offer and advancing it happen correctly withi
   // not "proposed, not accepted yet".
   const phase2Entry = entriesForFinding.find((e) => e.action.kind === "none");
   assert.equal(phase2Entry?.action.kind === "none" ? phase2Entry.action.reason : undefined, "waiting for the payer to lock");
+});
+
+// Regression: a real run hit AbortError (a network timeout) writing the
+// PaperRail note for ONE contract's lock, and that exception propagated all
+// the way out of runTclkPayer -- aborting the whole batch before it ever got
+// to the SECOND, unrelated contract that was also ready to lock. Fixed by
+// isolating each contract's action in its own try/catch (payer.ts /
+// verifierWorker.ts), same discipline mentions/run.ts and verifier/run.ts
+// already use in their own per-item loops.
+test("e2e regression: one contract's action failing does not abort the rest of the batch", async () => {
+  const server = new FakeTechnocore();
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+  const dbPath = tempPath("mentions.sqlite3");
+  const findingA = "radar-20260902-batchA";
+  const findingB = "radar-20260902-batchB";
+  seedFinding(dbPath, findingA, "a");
+  seedFinding(dbPath, findingB, "b");
+
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const config = baseConfig({ dbPath, allowedPayerDid: payer.did });
+
+  for (const findingId of [findingA, findingB]) {
+    const db = openTclkDatabase(dbPath);
+    await ensureTclkOffer(db, client, config, payer, { findingId }, noopLog);
+    db.close();
+  }
+
+  const secretDb = openSecretStore(tempPath("secrets.sqlite3"));
+  const dbB = openTclkDatabase(dbPath);
+  await runTclkVerifier({
+    db: dbB, secretDb, client, config, identity: payee, openAiApiKey: "k", verifierModel: "m",
+    dryRun: false, log: noopLog, fetchArticleFn: mockFetchOk, analyzeFn: mockAnalyzeVerified,
+  });
+  dbB.close();
+  secretDb.close();
+
+  const { PaperRail: RealPaperRail, MemoryNoteStore, paperNote } = await import("@flop-labs/tclk");
+  const contractA = (() => { const d = openTclkDatabase(dbPath); const r = getContractByFindingId(d, findingA)!; d.close(); return r; })();
+  const faultyNs = paperNote(contractA.tclk_contract_id!).ns;
+
+  // Wraps a real MemoryNoteStore, but throws (simulating a network timeout)
+  // for exactly the note contract A's lock would write to.
+  const inner = new MemoryNoteStore();
+  const faultyNotes = {
+    get: (ns: string, key: string) => inner.get(ns, key),
+    set: (ns: string, key: string, value: string, condition?: { ifAbsent: true } | { if: string }) => {
+      if (ns === faultyNs) throw new Error("AbortError: This operation was aborted");
+      return inner.set(ns, key, value, condition);
+    },
+  };
+  const rail = new RealPaperRail(faultyNotes);
+
+  const dbA = openTclkDatabase(dbPath);
+  const summary = await runTclkPayer({ db: dbA, client, config, identity: payer, dryRun: false, log: noopLog, rail: rail as never });
+  dbA.close();
+
+  const entryA = summary.contracts.find((c) => c.findingId === findingA)!;
+  const entryB = summary.contracts.find((c) => c.findingId === findingB)!;
+  assert.ok(entryA.error?.includes("AbortError")); // A's failure is reported, not swallowed silently
+  assert.equal(entryA.posted, undefined);
+  assert.equal(entryB.posted?.kind, "lock"); // B still got locked despite A's failure
 });

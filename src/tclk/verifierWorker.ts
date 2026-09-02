@@ -110,6 +110,10 @@ export interface VerifierContractReport {
   status: string;
   action: VerifierAction;
   posted?: { kind: string; messageId: number };
+  /** Set when accepting or advancing this contract threw (e.g. a network
+   * timeout) -- the run continues to the next contract rather than aborting
+   * the whole batch; a later cron tick retries. */
+  error?: string;
 }
 
 export interface VerifierRunSummary {
@@ -169,32 +173,41 @@ export async function runTclkVerifier(options: RunTclkVerifierOptions): Promise<
   const report: VerifierContractReport[] = [];
   let acceptedCount = 0;
 
-  // Phase 1: accept any new, valid offer from the trusted payer.
+  // Phase 1: accept any new, valid offer from the trusted payer. Isolated per
+  // offer -- same discipline as mentions/run.ts and verifier/run.ts's own
+  // per-item loops: one offer's network failure must not stop the others in
+  // this same batch from being accepted.
   for (const offer of findAcceptableOffers(db, config, frames)) {
     const findingId = offer.job!.id;
     if (dryRun) {
       report.push({ findingId, status: "proposed", action: { kind: "accept" } });
       continue;
     }
-    const lock = generateHashLock();
-    const accept = makeAccept(offer, { from: identity.did, statement: lock.hash });
-    // Persist the preimage BEFORE the accept is ever posted -- once the accept
-    // (and its statement) is public, the secret must already be safe on disk;
-    // posting first and storing after would risk minting a statement nothing
-    // can ever open if the process died in between.
-    storePreimage(secretDb, accept.contract, lock.preimage);
-    const posted = await postFrame(client, config.room, accept, identity);
-    recordAccepted(db, { findingId, contractId: accept.contract, offerId: offer.id, acceptMessageId: String(posted.seq) });
-    // Fold this accept into the in-memory transcript immediately -- `frames`
-    // was read once, before this loop started, so without this Phase 2 below
-    // would re-derive state for this SAME contract against a snapshot that
-    // predates the accept it just posted, and wrongly report it as still
-    // "proposed". Appending at the end keeps `frames` seq-ordered, since
-    // `posted.seq` is necessarily the highest seq seen so far.
-    frames.push({ seq: posted.seq, from: identity.did, frame: accept });
-    acceptedCount++;
-    log("accept", { finding: findingId, contract: accept.contract, message_id: posted.seq });
-    report.push({ findingId, contractId: accept.contract, status: "accepted", action: { kind: "accept" }, posted: { kind: "accept", messageId: posted.seq } });
+    try {
+      const lock = generateHashLock();
+      const accept = makeAccept(offer, { from: identity.did, statement: lock.hash });
+      // Persist the preimage BEFORE the accept is ever posted -- once the
+      // accept (and its statement) is public, the secret must already be
+      // safe on disk; posting first and storing after would risk minting a
+      // statement nothing can ever open if the process died in between.
+      storePreimage(secretDb, accept.contract, lock.preimage);
+      const posted = await postFrame(client, config.room, accept, identity);
+      recordAccepted(db, { findingId, contractId: accept.contract, offerId: offer.id, acceptMessageId: String(posted.seq) });
+      // Fold this accept into the in-memory transcript immediately -- `frames`
+      // was read once, before this loop started, so without this Phase 2 below
+      // would re-derive state for this SAME contract against a snapshot that
+      // predates the accept it just posted, and wrongly report it as still
+      // "proposed". Appending at the end keeps `frames` seq-ordered, since
+      // `posted.seq` is necessarily the highest seq seen so far.
+      frames.push({ seq: posted.seq, from: identity.did, frame: accept });
+      acceptedCount++;
+      log("accept", { finding: findingId, contract: accept.contract, message_id: posted.seq });
+      report.push({ findingId, contractId: accept.contract, status: "accepted", action: { kind: "accept" }, posted: { kind: "accept", messageId: posted.seq } });
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log("action_failed", { finding: findingId, action: "accept", error: message });
+      report.push({ findingId, status: "proposed", action: { kind: "accept" }, error: message });
+    }
   }
 
   // Phase 2: advance every contract we've already accepted.
@@ -223,23 +236,32 @@ export async function runTclkVerifier(options: RunTclkVerifierOptions): Promise<
 
     if (dryRun || action.kind !== "work_and_reveal" || contractId === undefined) continue;
 
-    entry.posted = await workAndReveal({
-      db,
-      secretDb,
-      client,
-      config,
-      identity,
-      rail,
-      row,
-      state,
-      contractId,
-      messages,
-      openAiApiKey: options.openAiApiKey,
-      verifierModel: options.verifierModel,
-      fetchArticleFn,
-      analyzeFn,
-      log,
-    });
+    try {
+      entry.posted = await workAndReveal({
+        db,
+        secretDb,
+        client,
+        config,
+        identity,
+        rail,
+        row,
+        state,
+        contractId,
+        messages,
+        openAiApiKey: options.openAiApiKey,
+        verifierModel: options.verifierModel,
+        fetchArticleFn,
+        analyzeFn,
+        log,
+      });
+    } catch (err) {
+      // Isolated per contract -- one contract's failure (network timeout on
+      // the independent fetch, OpenAI error, publish failure) must not stop
+      // phase 2 from checking every other open contract this run.
+      const message = err instanceof Error ? err.message : String(err);
+      entry.error = message;
+      log("action_failed", { finding: row.finding_id, contract: contractId, action: "work_and_reveal", error: message });
+    }
   }
 
   return { contracts: report, acceptedCount };

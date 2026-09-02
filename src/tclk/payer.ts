@@ -65,6 +65,11 @@ export interface PayerContractReport {
   status: string;
   action: PayerAction;
   posted?: { kind: string; messageId: number };
+  /** Set when executing this contract's action threw (e.g. a network timeout
+   * writing the PaperRail note) -- the run continues to the next contract
+   * rather than aborting the whole batch; a later cron tick retries, since
+   * nothing here was recorded as done. */
+  error?: string;
 }
 
 export interface PayerRunSummary {
@@ -131,19 +136,30 @@ export async function runTclkPayer(options: RunTclkPayerOptions): Promise<PayerR
     if (dryRun || action.kind === "none") continue;
     if (contractId === undefined) continue; // "none" already covers proposed; guard for the type-checker
 
-    entry.posted = await executePayerAction(action.kind, {
-      db,
-      client,
-      config,
-      identity,
-      rail,
-      row,
-      offer,
-      state,
-      contractId,
-      messages,
-      log,
-    });
+    try {
+      entry.posted = await executePayerAction(action.kind, {
+        db,
+        client,
+        config,
+        identity,
+        rail,
+        row,
+        offer,
+        state,
+        contractId,
+        messages,
+        log,
+      });
+    } catch (err) {
+      // Isolated per contract, same discipline as mentions/run.ts and
+      // verifier/run.ts's own per-item loops: a transient failure on ONE
+      // contract (a network timeout writing the rail note, say) must not
+      // abort every other contract this run still needed to check. Nothing
+      // was recorded as done, so the next cron tick just retries this one.
+      const message = err instanceof Error ? err.message : String(err);
+      entry.error = message;
+      log("action_failed", { finding: row.finding_id, contract: contractId, action: action.kind, error: message });
+    }
   }
 
   return { contracts: report };

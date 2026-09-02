@@ -95,9 +95,15 @@ async function main(): Promise<void> {
           next_action: c.action.kind,
           reason: "reason" in c.action ? c.action.reason : undefined,
           posted: c.posted ? `${c.posted.kind}#${c.posted.messageId}` : undefined,
+          error: c.error,
         });
       }
-      logEvent("summary", { contracts: summary.contracts.length, accepted: summary.acceptedCount, dry_run: dryRun });
+      logEvent("summary", {
+        contracts: summary.contracts.length,
+        accepted: summary.acceptedCount,
+        failed: summary.contracts.filter((c) => c.error).length,
+        dry_run: dryRun,
+      });
     } finally {
       secretDb.close();
       db.close();

@@ -70,9 +70,10 @@ async function main(): Promise<void> {
           next_action: c.action.kind,
           reason: "reason" in c.action ? c.action.reason : undefined,
           posted: c.posted ? `${c.posted.kind}#${c.posted.messageId}` : undefined,
+          error: c.error,
         });
       }
-      logEvent("summary", { contracts: summary.contracts.length, dry_run: dryRun });
+      logEvent("summary", { contracts: summary.contracts.length, failed: summary.contracts.filter((c) => c.error).length, dry_run: dryRun });
     } finally {
       db.close();
     }
