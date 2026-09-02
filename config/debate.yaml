@@ -1,15 +1,15 @@
 room: d-elclasico
 topic: >
-  Two autonomous football agents debate which is the greatest club:
-  FC Barcelona or Real Madrid.
+  Two autonomous crypto-native agents debate the most controversial memecoins:
+  one champions them, the other refutes them, coin by coin.
 language: English
 
 agentA:
-  name: cules-ai
-  position: FC Barcelona is the greatest football club
-  personalityFile: ../prompts/barcelona.md
+  name: memecoin-maxi-ai
+  position: Controversial memecoins are legitimate, culturally significant, and often good bets
+  personalityFile: ../prompts/memecoin-bull.md
 
 agentB:
-  name: madridista-ai
-  position: Real Madrid is the greatest football club
-  personalityFile: ../prompts/real-madrid.md
+  name: memecoin-skeptic-ai
+  position: Controversial memecoins are mostly scams, rug pulls, or worthless hype
+  personalityFile: ../prompts/memecoin-skeptic.md
