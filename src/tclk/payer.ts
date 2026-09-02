@@ -96,7 +96,7 @@ export async function runTclkPayer(options: RunTclkPayerOptions): Promise<PayerR
   const { db, client, config, identity, dryRun, log } = options;
   const now = options.now ?? Date.now;
   const rail = options.rail ?? new PaperRail(technocoreNoteStore(client), now);
-  const readMessages = options.readMessages ?? (() => readVerifiedMessages(client, config.room));
+  const readMessages = options.readMessages ?? (() => readVerifiedMessages(client, config.room, config.maxRetries));
 
   const messages = await readMessages();
   const frames = decodeVerifiedFrames(messages);

@@ -19,7 +19,7 @@
 
 import { applyFrame, openContract, tryDecodeFrame, type ContractState, type OfferFrame, type TclkFrame } from "@flop-labs/tclk";
 import { verifyEd25519 } from "../identity.js";
-import { sweepText, type Message, type TechnocoreClient } from "../technocore.js";
+import { sweepText, TechnocoreError, type Message, type TechnocoreClient } from "../technocore.js";
 
 /** A room message that has been locally re-verified against its own claimed
  * `from` -- the only kind of message this module (or anything downstream of
@@ -28,12 +28,48 @@ export interface VerifiedMessage extends Message {
   verifiedFrom: string;
 }
 
-/** Read the whole room and keep only messages whose signature checks out
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** True for a network error (fetch throwing, e.g. a timeout abort) or a 5xx
+ * response -- the same "worth retrying" classification `fetchWithRetry`
+ * (mentions/http.ts) uses for reads. A 4xx means the request itself is wrong;
+ * retrying it would just repeat the same failure. */
+function isRetryable(err: unknown): boolean {
+  if (err instanceof TechnocoreError) return err.status !== undefined && err.status >= 500;
+  return true; // anything else (AbortError, TypeError, ...) is a network-level failure
+}
+
+/**
+ * Read the whole room and keep only messages whose signature checks out
  * locally. Unsigned-lane messages (no `sig`) and anything that fails
  * `verifyEd25519` are dropped -- never trusted, never folded into any frame
- * or matched as a finding/verification message. */
-export async function readVerifiedMessages(client: TechnocoreClient, room: string): Promise<VerifiedMessage[]> {
-  const view = await client.readRoom(room, { since: 0 });
+ * or matched as a finding/verification message.
+ *
+ * A plain `GET` (unlike a signed write, which never retries -- see
+ * publisher.ts -- because its URL embeds a nonce that would replay-reject on
+ * a second attempt), so retrying here is safe and, in practice, necessary:
+ * this call is the one thing both `technocore:tclk-payer` and
+ * `technocore:tclk-verifier` cannot do anything at all without, so a single
+ * transient timeout would otherwise fail the entire run before it even got
+ * to look at a single contract.
+ */
+export async function readVerifiedMessages(client: TechnocoreClient, room: string, maxRetries = 0): Promise<VerifiedMessage[]> {
+  let lastError: unknown;
+  let view: Awaited<ReturnType<TechnocoreClient["readRoom"]>> | undefined;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      view = await client.readRoom(room, { since: 0 });
+      break;
+    } catch (err) {
+      lastError = err;
+      if (!isRetryable(err) || attempt >= maxRetries) throw err;
+      await sleep(300 * 2 ** attempt); // 300ms, 600ms, 1200ms...
+    }
+  }
+  if (view === undefined) throw lastError; // unreachable in practice -- keeps the type-checker happy
+
   const verified: VerifiedMessage[] = [];
   for (const message of view.messages) {
     if (message.sig === undefined || message.nonce === undefined) continue; // unsigned lane -- data, not a commitment

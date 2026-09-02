@@ -109,6 +109,34 @@ test("transcript: a corrupted/non-tclk line among verified messages is ignored, 
   assert.equal(decodeVerifiedFrames(messages).length, 0);
 });
 
+// Regression: a real run hit an AbortError (timeout) reading the room, and it
+// killed the entire run before either worker could look at a single
+// contract. readVerifiedMessages is a plain GET (safe to retry, unlike a
+// signed write) and both workers depend on it for everything -- retry it.
+test("transcript: readVerifiedMessages retries a transient network failure and still returns the room's messages", async () => {
+  const server = new FakeTechnocore();
+  const identity = makeTestIdentity();
+  server.postSigned("room", identity, "hello");
+  let calls = 0;
+  const flakyFetch: typeof fetch = async (input, init) => {
+    calls++;
+    if (calls < 3) throw new Error("AbortError: This operation was aborted");
+    return server.fetch(input, init);
+  };
+  const client = new TechnocoreClient({ fetchImpl: flakyFetch });
+  const messages = await readVerifiedMessages(client, "room", 2);
+  assert.equal(calls, 3);
+  assert.equal(messages.length, 1);
+});
+
+test("transcript: readVerifiedMessages gives up once retries are exhausted, throwing the last error", async () => {
+  let calls = 0;
+  const alwaysFails: typeof fetch = async () => { calls++; throw new Error("AbortError: This operation was aborted"); };
+  const client = new TechnocoreClient({ fetchImpl: alwaysFails });
+  await assert.rejects(() => readVerifiedMessages(client, "room", 2));
+  assert.equal(calls, 3); // initial attempt + 2 retries
+});
+
 // -- transcript: fold via applyFrame replays correctly (test #16) -------------
 
 test("transcript: foldContract replays offer+accept+lock+reveal to the correct terminal state", () => {

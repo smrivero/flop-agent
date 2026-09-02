@@ -164,7 +164,7 @@ export function formatTclkVerificationMessage(fields: {
 export async function runTclkVerifier(options: RunTclkVerifierOptions): Promise<VerifierRunSummary> {
   const { db, secretDb, client, config, identity, dryRun, log } = options;
   const rail = options.rail ?? new PaperRail(technocoreNoteStore(client));
-  const readMessages = options.readMessages ?? (() => readVerifiedMessages(client, config.room));
+  const readMessages = options.readMessages ?? (() => readVerifiedMessages(client, config.room, config.maxRetries));
   const fetchArticleFn = options.fetchArticleFn ?? fetchArticleClassified;
   const analyzeFn = options.analyzeFn ?? verifyAnalysis;
 
