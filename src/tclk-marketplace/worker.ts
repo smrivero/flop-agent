@@ -50,6 +50,7 @@ import {
   setRoomCursor,
   storeFrame,
   updateContractCache,
+  type StoredFrame,
   type TclkMarketDb,
   type TclkMarketContractRow,
 } from "./database.js";
@@ -137,6 +138,13 @@ function foldFromStore(db: TclkMarketDb, offerId: string, contractId: string): C
 
 async function scanOffersRoom(ctx: TclkMarketWorkerContext, summary: TickSummary): Promise<void> {
   const { db, client, config, log } = ctx;
+
+  // Heal any accept we posted ourselves whose local bookkeeping didn't finish
+  // (a DB error, a process kill, right after the network post already went
+  // through) BEFORE reading anything new -- pure local reconciliation, so it
+  // runs even if the room is unreachable this tick. See persistAcceptedContract.
+  reconcileOrphanedAccepts(ctx);
+
   const since = getRoomCursor(db, config.offerRoom);
   const result = await scanRoomForFrames(client, config.offerRoom, since, { waitSeconds: config.longPollWaitSeconds, maxRetries: config.maxRetries });
   log.info("[SCANNER]", { room: config.offerRoom, since, last_seq: result.lastSeq, frames_found: result.frames.length });
@@ -148,18 +156,103 @@ async function scanOffersRoom(ctx: TclkMarketWorkerContext, summary: TickSummary
     // itself the authority for what's new (idempotent: (room,seq) is unique).
     storeFrame(db, toFrameRow(config.offerRoom, m));
 
-    if (m.frame.type === "offer") {
-      summary.offersFound++;
-      await handleOfferFrame(ctx, m.frame, m.from, summary);
-    } else if (m.frame.type === "accept") {
-      await handleAcceptFrame(ctx, m.frame, m.from);
+    // Isolated per message: one message's failure (e.g. a transient DB error)
+    // must never abort the rest of this batch -- and, critically, must never
+    // block `setRoomCursor` below, or the SAME batch (including whatever DID
+    // succeed) gets re-processed next tick. Same discipline advanceContracts
+    // already applies per contract.
+    try {
+      if (m.frame.type === "offer") {
+        summary.offersFound++;
+        await handleOfferFrame(ctx, m.frame, m.from, summary);
+      } else if (m.frame.type === "accept") {
+        if (m.frame.from === ctx.identity.did) {
+          // Our own accept, read back off the wire -- reconcileOrphanedAccepts
+          // above already covers the recovery case; nothing further to do here.
+          continue;
+        }
+        await handleAcceptFrame(ctx, m.frame, m.from);
+      }
+      // Other frame types are never expected in tclk-offers per SPEC.md
+      // ("Where"), but if a stray one appears it's just cached above and
+      // otherwise ignored -- never acted on outside its actual deal room.
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      log.info("[ERROR]", { stage: "process_message", room: config.offerRoom, seq: m.seq, frame_type: m.frame.type, error: message });
+      incrementErrorCounter(db);
+      summary.errors++;
     }
-    // Other frame types are never expected in tclk-offers per SPEC.md ("Where"),
-    // but if a stray one appears it's just cached above and otherwise ignored --
-    // never acted on outside its actual deal room.
   }
 
   if (!ctx.config.dryRun) setRoomCursor(db, config.offerRoom, result.lastSeq);
+}
+
+/**
+ * Local-only reconciliation: find any `accept` frame this worker itself
+ * posted (from_did = our own identity) that has no matching row in
+ * `tclk_market_contracts` -- meaning the accept went out over the network
+ * (irreversible) but the local bookkeeping that should have followed it
+ * never completed. `tclk_market_frames` is durable and never pruned, so this
+ * works regardless of where the room-read cursor currently sits -- it does
+ * NOT depend on ever re-scanning that message from the network again.
+ */
+function reconcileOrphanedAccepts(ctx: TclkMarketWorkerContext): void {
+  const { db, identity, log } = ctx;
+  const orphans = db
+    .prepare(
+      `SELECT f.* FROM tclk_market_frames f
+       LEFT JOIN tclk_market_contracts c ON c.contract_id = f.contract_id
+       WHERE f.frame_type = 'accept' AND f.from_did = ? AND c.contract_id IS NULL`,
+    )
+    .all(identity.did) as StoredFrame[];
+
+  for (const row of orphans) {
+    const accept = JSON.parse(row.frame_json) as AcceptFrame;
+    const offerRow = offerFrameById(db, accept.ref);
+    if (offerRow === undefined) continue; // shouldn't happen -- we saw the offer before we could have accepted it
+    const offer = JSON.parse(offerRow.frame_json) as OfferFrame;
+    try {
+      persistAcceptedContract(db, offer, accept, null); // secret fingerprint unknown here -- purely informational, never re-derived from the secret itself
+      log.info("[ACCEPT][RECOVERED]", { offer: accept.ref, contract: accept.contract });
+    } catch (err) {
+      log.info("[ERROR]", { stage: "reconcile_accept", contract: accept.contract, error: err instanceof Error ? err.message : String(err) });
+      incrementErrorCounter(db);
+    }
+  }
+}
+
+/** The local bookkeeping half of accepting an offer (recordOfferDecision +
+ * insertContract), as one atomic transaction -- either both land or neither
+ * does, so a mid-write failure can never leave an ACCEPT decision recorded
+ * with no matching contract row (or vice versa). Shared between the live
+ * accept path (acceptOffer, right after posting) and reconcileOrphanedAccepts
+ * (recovering a past one). Does NOT storeFrame the accept itself -- callers
+ * are responsible for that (acceptOffer does it immediately; the reconcile
+ * path finds a frame already stored). */
+function persistAcceptedContract(db: TclkMarketDb, offer: OfferFrame, accept: AcceptFrame, secretFingerprint: string | null): void {
+  const room = dealRoom(accept.contract);
+  const run = db.transaction(() => {
+    recordOfferDecision(db, { offerId: offer.id, fromDid: offer.from, decision: "ACCEPT", reason: "supported_offer", contractId: accept.contract, amount: offer.amount, asset: offer.asset });
+    insertContract(db, {
+      contract_id: accept.contract,
+      offer_id: offer.id,
+      role: "payee",
+      payer_did: offer.from,
+      payee_did: accept.from,
+      asset: offer.asset,
+      amount: offer.amount,
+      rail: null,
+      job_proto: offer.job?.proto ?? null,
+      job_id: offer.job?.id ?? null,
+      deal_room: room,
+      cached_status: "accepted",
+      claim_by_ms: offer.claimByMs,
+      refund_after_ms: offer.refundAfterMs,
+      expires_ms: offer.expiresMs,
+      secret_fingerprint: secretFingerprint,
+    });
+  });
+  run();
 }
 
 async function handleOfferFrame(ctx: TclkMarketWorkerContext, offer: OfferFrame, from: string, summary: TickSummary): Promise<void> {
@@ -241,29 +334,22 @@ async function acceptOffer(ctx: TclkMarketWorkerContext, offer: OfferFrame, summ
   }
 
   storeFrame(db, { room: config.offerRoom, seq: posted.seq, from_did: identity.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept) });
-  recordOfferDecision(db, { offerId: offer.id, fromDid: offer.from, decision: "ACCEPT", reason: "supported_offer", contractId: accept.contract, amount: offer.amount, asset: offer.asset });
 
-  const room = dealRoom(accept.contract);
-  insertContract(db, {
-    contract_id: accept.contract,
-    offer_id: offer.id,
-    role: "payee",
-    payer_did: offer.from,
-    payee_did: identity.did,
-    asset: offer.asset,
-    amount: offer.amount,
-    rail: null,
-    job_proto: offer.job?.proto ?? null,
-    job_id: offer.job?.id ?? null,
-    deal_room: room,
-    cached_status: "accepted",
-    claim_by_ms: offer.claimByMs,
-    refund_after_ms: offer.refundAfterMs,
-    expires_ms: offer.expiresMs,
-    secret_fingerprint: fingerprintSecret(lock.preimage),
-  });
+  try {
+    persistAcceptedContract(db, offer, accept, fingerprintSecret(lock.preimage));
+  } catch (err) {
+    // The accept is already public and irreversible at this point -- local
+    // bookkeeping failing here must NOT propagate out of this function (that
+    // would abort the rest of this tick's message batch AND block cursor
+    // advancement in scanOffersRoom, see its own header comment). The frame
+    // is already stored above, so reconcileOrphanedAccepts will pick this
+    // exact contract up and finish the bookkeeping on the very next tick.
+    log.info("[ERROR]", { stage: "accept_bookkeeping", offer: offer.id, contract: accept.contract, error: err instanceof Error ? err.message : String(err), note: "accept already posted -- will self-heal next tick" });
+    incrementErrorCounter(db);
+    return;
+  }
 
-  log.info("[ACCEPT][POSTED]", { offer: offer.id, contract: accept.contract, room: config.offerRoom, seq: posted.seq, deal_room: room });
+  log.info("[ACCEPT][POSTED]", { offer: offer.id, contract: accept.contract, room: config.offerRoom, seq: posted.seq, deal_room: dealRoom(accept.contract) });
   summary.offersAccepted++;
 }
 

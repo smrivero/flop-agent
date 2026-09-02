@@ -274,3 +274,62 @@ test("no duplicate accept: the same offer is only ever accepted once, even acros
   dbB.close();
   secretDbB.close();
 });
+
+// Regression: a real deployment hit exactly this -- a DB write failing right
+// after an accept was already posted (irreversible) propagated out of
+// scanOffersRoom's per-message loop, which (a) skipped every remaining
+// message in that batch and (b) never reached setRoomCursor, so the next
+// tick re-read the SAME batch from scratch. Fixed by isolating each message,
+// making the post-accept bookkeeping one atomic transaction, and adding
+// reconcileOrphanedAccepts to heal a contract whose bookkeeping didn't land.
+test("regression: a bookkeeping failure right after posting an accept does not abort the rest of the batch, and self-heals on the next tick", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const agentA = makeTestIdentity();
+  const agentB = makeTestIdentity();
+
+  const configA = baseConfig({ dbPath: tempPath("a.sqlite3") });
+  const dbA = openTclkMarketDatabase(configA.dbPath);
+  await publishOffer(dbA, client, configA, agentA, { jobType: "echo", jobId: "job-x" }, noopLog);
+  await publishOffer(dbA, client, configA, agentA, { jobType: "echo", jobId: "job-y" }, noopLog);
+  dbA.close();
+
+  const dbPathB = tempPath("b.sqlite3");
+  const dbB = openTclkMarketDatabase(dbPathB);
+  const secretDbB = openSecretStore(tempPath("secrets-b.sqlite3"));
+  const configB = baseConfig({ dbPath: dbPathB });
+
+  // Force the FIRST attempt to persist a contract row to throw -- simulating
+  // a transient DB error (e.g. SQLITE_BUSY) landing exactly after the accept
+  // for the first offer has already gone out over the (fake) network.
+  let insertAttempts = 0;
+  const realPrepare = dbB.prepare.bind(dbB);
+  (dbB as unknown as { prepare: typeof dbB.prepare }).prepare = ((sql: string) => {
+    if (sql.includes("INSERT OR IGNORE INTO tclk_market_contracts") && insertAttempts++ === 0) {
+      throw new Error("simulated SQLITE_BUSY: database is locked");
+    }
+    return realPrepare(sql);
+  }) as typeof dbB.prepare;
+
+  const first = await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  assert.equal(first.offersFound, 2); // both offers were seen and evaluated
+  assert.equal(first.offersAccepted, 1); // only the second one's bookkeeping fully landed this tick
+  assert.equal(listOpenContracts(dbB).length, 1); // the first one's contract row is still missing...
+
+  const roomMidway = await client.readRoom(OFFER_ROOM);
+  const acceptCountMidway = roomMidway.messages.filter((m) => m.from === agentB.did && m.text.includes('"type":"accept"')).length;
+  assert.equal(acceptCountMidway, 2); // ...even though BOTH accepts were already posted (irreversible)
+
+  // Restore normal behavior -- the simulated failure was one-shot.
+  (dbB as unknown as { prepare: typeof dbB.prepare }).prepare = realPrepare;
+
+  const second = await runTick({ db: dbB, secretDb: secretDbB, client, config: configB, identity: agentB });
+  assert.equal(listOpenContracts(dbB).length, 2); // self-healed via reconcileOrphanedAccepts
+
+  const roomAfter = await client.readRoom(OFFER_ROOM);
+  const acceptCountAfter = roomAfter.messages.filter((m) => m.from === agentB.did && m.text.includes('"type":"accept"')).length;
+  assert.equal(acceptCountAfter, 2); // still exactly one accept per offer -- healing never re-posts
+
+  dbB.close();
+  secretDbB.close();
+});

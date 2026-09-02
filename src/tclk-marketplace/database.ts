@@ -36,6 +36,11 @@ export function openTclkMarketDatabase(path: string): TclkMarketDb {
   mkdirSync(dirname(path), { recursive: true });
   const db = new Database(path);
   db.pragma("journal_mode = WAL");
+  // The worker's own long-lived connection competes with short-lived readers
+  // against the SAME file (tclk:status, a manual `--once` run, etc) -- WAL
+  // lets concurrent reads through, but a write racing another write still
+  // needs to wait rather than throw SQLITE_BUSY immediately.
+  db.pragma("busy_timeout = 5000");
   migrate(db);
   return db;
 }
