@@ -6,16 +6,22 @@
  * Agent B and persist the result.
  *
  * Retry semantics (see database.ts):
- * - `verification_failed` (fetch or OpenAI failed) -> redo fetch + analysis
- *   from scratch next run; nothing usable was cached.
+ * - `verification_failed` (fetch or OpenAI failed for a reason that might not
+ *   recur, e.g. a timeout) -> redo fetch + analysis from scratch next run;
+ *   nothing usable was cached.
+ * - A fetch blocked on purpose (HTTP 403/429) is different: retrying won't
+ *   help, so instead of `verification_failed` this is published as an
+ *   UNVERIFIABLE verdict (same path as VERIFIED/REJECTED) explaining the
+ *   block, and becomes terminal -- it will not be retried.
  * - `publish_failed` (analysis succeeded, the Technocore write didn't) ->
  *   skip fetch + OpenAI entirely and just retry the publish, using the
  *   result/reason/hash already stored -- never re-spend an OpenAI call for a
- *   verdict that was already reached.
+ *   verdict that was already reached. This also covers a publish that failed
+ *   for an UNVERIFIABLE verdict.
  */
 
 import { extractContent } from "../mentions/content/extractContent.js";
-import { fetchArticle } from "../mentions/content/fetchArticle.js";
+import { fetchArticleClassified } from "../mentions/content/fetchArticle.js";
 import { hashContent } from "../mentions/finding.js";
 import type { MentionRow } from "../mentions/types.js";
 import {
@@ -48,7 +54,7 @@ export interface RunVerifierOptions {
   log: (event: string, fields: Record<string, unknown>) => void;
   /** Injectable for tests -- default to the real implementations. Mirrors
    * mentions/run.ts's RunDeps pattern so tests never need to stub global fetch. */
-  fetchArticleFn?: typeof fetchArticle;
+  fetchArticleFn?: typeof fetchArticleClassified;
   analyzeFn?: typeof verifyAnalysis;
 }
 
@@ -56,6 +62,7 @@ export interface VerifierRunSummary {
   candidates: number;
   verified: number;
   rejected: number;
+  unverifiable: number;
   verificationFailed: number;
   publishFailed: number;
   skippedDryRun: number;
@@ -68,9 +75,9 @@ function pickSample(findings: MentionRow[], sampleRate: number): MentionRow[] {
 
 export async function runVerifier(options: RunVerifierOptions): Promise<VerifierRunSummary> {
   const { config, db, identities, send, log } = options;
-  const fetchArticleFn = options.fetchArticleFn ?? fetchArticle;
+  const fetchArticleFn = options.fetchArticleFn ?? fetchArticleClassified;
   const analyzeFn = options.analyzeFn ?? verifyAnalysis;
-  const summary: VerifierRunSummary = { candidates: 0, verified: 0, rejected: 0, verificationFailed: 0, publishFailed: 0, skippedDryRun: 0 };
+  const summary: VerifierRunSummary = { candidates: 0, verified: 0, rejected: 0, unverifiable: 0, verificationFailed: 0, publishFailed: 0, skippedDryRun: 0 };
 
   let findings: MentionRow[];
   if (options.onlyFindingId) {
@@ -98,13 +105,25 @@ export async function runVerifier(options: RunVerifierOptions): Promise<Verifier
     }
 
     try {
-      const html = await fetchArticleFn(finding.canonical_url, { timeoutMs: config.httpTimeoutMs, maxRetries: config.maxRetries });
-      if (!html) {
+      const fetchResult = await fetchArticleFn(finding.canonical_url, { timeoutMs: config.httpTimeoutMs, maxRetries: config.maxRetries });
+      if (fetchResult.kind === "blocked") {
+        // The source itself refused automated access -- not a transient
+        // error, so don't leave this to retry forever in silence. Publish
+        // an UNVERIFIABLE verdict explaining why, same as a real verdict,
+        // and treat it as terminal (see database.ts's statusForResult).
+        const reason = `Independent verification could not be completed: the source blocked automated access (HTTP ${fetchResult.status}).`;
+        markAnalyzed(db, findingId, "UNVERIFIABLE", reason, identities.verifier.did, finding.content_hash, null);
+        log("blocked", { finding: findingId, status: fetchResult.status });
+        await publishVerdict(finding, "UNVERIFIABLE", reason, options, summary);
+        continue;
+      }
+      if (fetchResult.kind === "error") {
         markVerificationFailed(db, findingId, "independent fetch failed (no content / non-HTML / request error)");
         summary.verificationFailed++;
         log("verification_failed", { finding: findingId, reason: "fetch_failed" });
         continue;
       }
+      const html = fetchResult.html;
       const sourceContent = extractContent(html, options.maxContentChars);
       const verificationContentHash = hashContent(sourceContent);
 
@@ -137,6 +156,12 @@ export async function runVerifier(options: RunVerifierOptions): Promise<Verifier
   return summary;
 }
 
+function bumpResultCounter(summary: VerifierRunSummary, result: VerificationResult): void {
+  if (result === "VERIFIED") summary.verified++;
+  else if (result === "REJECTED") summary.rejected++;
+  else summary.unverifiable++;
+}
+
 async function publishVerdict(
   finding: MentionRow,
   result: VerificationResult,
@@ -162,8 +187,7 @@ async function publishVerdict(
 
   if (dryRun) {
     summary.skippedDryRun++;
-    if (result === "VERIFIED") summary.verified++;
-    else summary.rejected++;
+    bumpResultCounter(summary, result);
     log("dry-run-publish", { finding: findingId, room, result, text });
     return;
   }
@@ -171,8 +195,7 @@ async function publishVerdict(
   try {
     const posted = await send(room, text);
     markPublished(db, findingId, result, room, String(posted.seq));
-    if (result === "VERIFIED") summary.verified++;
-    else summary.rejected++;
+    bumpResultCounter(summary, result);
     log("publish", { finding: findingId, room, result, message_id: posted.seq });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);

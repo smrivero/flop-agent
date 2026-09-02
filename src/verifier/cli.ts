@@ -16,6 +16,7 @@ import { loadVerifierIdentities, SameDidError } from "./identity.js";
 import { openDatabase } from "./database.js";
 import { runVerifier } from "./run.js";
 import { createTechnocoreVerifierSender, type SendVerificationFn } from "./publisher.js";
+import type { FetchArticleClassifiedResult } from "../mentions/content/fetchArticle.js";
 
 try {
   process.loadEnvFile();
@@ -78,10 +79,11 @@ function createMockSender(): SendVerificationFn {
  * deterministic verdict. As documented ("--mock: full pipeline test, zero
  * real Tavily/OpenAI/Technocore"), --mock replaces all three network-facing
  * dependencies, not just the Technocore sender. */
-function mockFetchArticle(): Promise<string | null> {
-  return Promise.resolve(
-    "<html><body>Mock article content: autonomous agents coordinate over the Technocore protocol.</body></html>",
-  );
+function mockFetchArticle(): Promise<FetchArticleClassifiedResult> {
+  return Promise.resolve({
+    kind: "ok",
+    html: "<html><body>Mock article content: autonomous agents coordinate over the Technocore protocol.</body></html>",
+  });
 }
 
 function mockAnalyze(): Promise<{ result: "VERIFIED"; reason: string }> {

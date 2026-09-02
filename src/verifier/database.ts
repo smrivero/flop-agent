@@ -44,8 +44,9 @@ function migrateVerifications(db: VerifierDb): void {
  * Findings ready for the Verifier: `published` in `mentions`, and either never
  * verified at all, or stuck in a non-terminal verification state (`pending`,
  * `verification_failed`, `publish_failed`) -- so a retry picks the exact same
- * row back up. Already-`verified`/`rejected` findings are excluded, which is
- * what makes re-running this safe without `--force`. Oldest published first.
+ * row back up. Already-`verified`/`rejected`/`unverifiable` findings are
+ * excluded, which is what makes re-running this safe without `--force`.
+ * Oldest published first.
  */
 export function getPendingFindingsToVerify(db: VerifierDb, limit: number): MentionRow[] {
   return db
@@ -101,7 +102,9 @@ function setVerificationStatus(db: VerifierDb, findingId: string, status: Verifi
 
 /** Analysis succeeded and the result is stored, but the Technocore write
  * hasn't happened (or failed) yet -- kept separate from markPublishFailed so a
- * retry can tell "never analyzed" apart from "analyzed, just needs a repost". */
+ * retry can tell "never analyzed" apart from "analyzed, just needs a repost".
+ * `verificationContentHash` is null for UNVERIFIABLE: a blocked fetch never
+ * produced content to hash. */
 export function markAnalyzed(
   db: VerifierDb,
   findingId: string,
@@ -109,7 +112,7 @@ export function markAnalyzed(
   reason: string,
   verifierDid: string,
   originalContentHash: string | null,
-  verificationContentHash: string,
+  verificationContentHash: string | null,
 ): void {
   setVerificationStatus(db, findingId, "publish_failed", {
     result,
@@ -121,8 +124,14 @@ export function markAnalyzed(
   });
 }
 
+function statusForResult(result: VerificationResult): "verified" | "rejected" | "unverifiable" {
+  if (result === "VERIFIED") return "verified";
+  if (result === "REJECTED") return "rejected";
+  return "unverifiable";
+}
+
 export function markPublished(db: VerifierDb, findingId: string, result: VerificationResult, room: string, messageId: string): void {
-  setVerificationStatus(db, findingId, result === "VERIFIED" ? "verified" : "rejected", {
+  setVerificationStatus(db, findingId, statusForResult(result), {
     technocore_room: room,
     technocore_message_id: messageId,
     verified_at: new Date().toISOString(),

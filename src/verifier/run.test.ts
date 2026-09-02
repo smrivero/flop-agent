@@ -81,7 +81,7 @@ test("run: a published finding with no verification is selected, fetched, analyz
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>Agents coordinate over Technocore protocol here.</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>Agents coordinate over Technocore protocol here.</body></html>" }),
     analyzeFn: async () => ({ result: "VERIFIED", reason: "The fetched content confirms agents coordinating over Technocore." }),
   });
 
@@ -114,7 +114,7 @@ test("run: REJECTED verdict is published and persisted distinctly from VERIFIED"
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>Technocore uses Ed25519 signatures, nothing about quantum.</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>Technocore uses Ed25519 signatures, nothing about quantum.</body></html>" }),
     analyzeFn: async () => ({ result: "REJECTED", reason: "The content describes Ed25519 signatures, not quantum signatures." }),
   });
 
@@ -136,7 +136,7 @@ test("run: an already-VERIFIED finding is not re-selected on a later run", async
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => ({ result: "VERIFIED" as const, reason: "ok" }),
   };
 
@@ -164,7 +164,7 @@ test("run: VERIFIER_MAX_PER_RUN caps how many findings are processed in one pass
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => ({ result: "VERIFIED", reason: "ok" }),
   });
 
@@ -186,7 +186,7 @@ test("run: VERIFIER_SAMPLE_RATE=0 selects nothing", async () => {
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => ({ result: "VERIFIED", reason: "ok" }),
   });
 
@@ -209,7 +209,7 @@ test("run: independent fetch failure marks verification_failed and never reaches
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => null, // simulates a failed independent fetch
+    fetchArticleFn: async () => ({ kind: "error" as const }), // simulates a failed independent fetch
     analyzeFn: async () => { analyzeCalls++; return { result: "VERIFIED", reason: "should never be called" }; },
   });
 
@@ -221,6 +221,57 @@ test("run: independent fetch failure marks verification_failed and never reaches
   const row = getVerification(db, findingId)!;
   assert.equal(row.status, "verification_failed");
   assert.equal(row.result, null);
+  db.close();
+});
+
+test("run: a blocked fetch (403/429) is published as UNVERIFIABLE, not retried forever", async () => {
+  const dbPath = tempDbPath();
+  const findingId = seedPublishedMention(dbPath, "A finding.");
+  const db = openDatabase(dbPath);
+  let analyzeCalls = 0;
+  const sent: string[] = [];
+
+  const summary = await runVerifier({
+    config: baseConfig(dbPath),
+    db,
+    identities: fakeIdentities,
+    send: async (_room, text) => { sent.push(text); return { seq: 42 }; },
+    dryRun: false,
+    force: false,
+    maxContentChars: 12000,
+    log: noopLog,
+    fetchArticleFn: async () => ({ kind: "blocked" as const, status: 403 }),
+    analyzeFn: async () => { analyzeCalls++; return { result: "VERIFIED", reason: "should never be called" }; },
+  });
+
+  assert.equal(analyzeCalls, 0); // OpenAI is never spent when there's nothing to analyze
+  assert.equal(summary.unverifiable, 1);
+  assert.equal(summary.verified, 0);
+  assert.equal(summary.rejected, 0);
+  assert.equal(summary.verificationFailed, 0);
+  assert.equal(sent.length, 1);
+  assert.match(sent[0], /Result: UNVERIFIABLE/);
+  assert.match(sent[0], /blocked automated access \(HTTP 403\)/);
+
+  const row = getVerification(db, findingId)!;
+  assert.equal(row.status, "unverifiable");
+  assert.equal(row.result, "UNVERIFIABLE");
+  assert.equal(row.technocore_message_id, "42");
+
+  // A terminal `unverifiable` row is not picked up again on a later run.
+  const second = await runVerifier({
+    config: baseConfig(dbPath),
+    db,
+    identities: fakeIdentities,
+    send: async () => ({ seq: 1 }),
+    dryRun: false,
+    force: false,
+    maxContentChars: 12000,
+    log: noopLog,
+    fetchArticleFn: async () => ({ kind: "blocked" as const, status: 403 }),
+    analyzeFn: async () => ({ result: "VERIFIED", reason: "unused" }),
+  });
+  assert.equal(second.candidates, 0);
   db.close();
 });
 
@@ -238,7 +289,7 @@ test("run: an OpenAI analysis failure marks verification_failed, not REJECTED", 
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => { throw new Error("OpenAI request failed: HTTP 500"); },
   });
 
@@ -257,7 +308,7 @@ test("retry: a publish_failed finding retries only the publish -- OpenAI is neve
 
   const failingConfig = baseConfig(dbPath);
   const analyzeFn = async () => { analyzeCalls++; return { result: "VERIFIED" as const, reason: "matches" }; };
-  const fetchArticleFn = async () => "<html><body>content</body></html>";
+  const fetchArticleFn = async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" });
 
   // First run: analysis succeeds, but the "publish" fails.
   await runVerifier({
@@ -317,7 +368,7 @@ test("content hash: both original and freshly-fetched hashes are recorded, misma
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>completely different content now, page changed</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>completely different content now, page changed</body></html>" }),
     // The LLM's judgment is what decides, independent of whether hashes match.
     analyzeFn: async () => ({ result: "VERIFIED", reason: "still supports the claim despite a reworded page" }),
   });
@@ -345,7 +396,7 @@ test("dry-run: never calls send and never persists a terminal status", async () 
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => ({ result: "VERIFIED", reason: "ok" }),
   });
 
@@ -375,7 +426,7 @@ test("manual --finding: verifies exactly the requested finding_id, ignoring VERI
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => ({ result: "VERIFIED", reason: "ok" }),
   });
 
@@ -400,7 +451,7 @@ test("--force: re-verifies a finding whose verification is already finalized", a
     dryRun: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>content</body></html>",
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>content</body></html>" }),
     analyzeFn: async () => { analyzeCalls++; return { result: "VERIFIED" as const, reason: "ok" }; },
   };
 
@@ -429,7 +480,7 @@ test("mock: an in-memory sender lets the whole pipeline run with zero real netwo
     force: false,
     maxContentChars: 12000,
     log: noopLog,
-    fetchArticleFn: async () => "<html><body>mock content</body></html>", // stands in for a real fetch
+    fetchArticleFn: async () => ({ kind: "ok" as const, html: "<html><body>mock content</body></html>" }), // stands in for a real fetch
     analyzeFn: async () => ({ result: "VERIFIED", reason: "mock reason" }), // stands in for a real OpenAI call
   });
 

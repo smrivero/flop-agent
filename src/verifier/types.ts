@@ -1,9 +1,12 @@
-export type VerificationResult = "VERIFIED" | "REJECTED";
+/** UNVERIFIABLE is terminal like VERIFIED/REJECTED, but means neither verdict
+ * was ever reached -- the source actively blocked the independent fetch
+ * (HTTP 403/429), so there was no content to check the finding against. */
+export type VerificationResult = "VERIFIED" | "REJECTED" | "UNVERIFIABLE";
 
 /** Distinct from mentions.MentionStatus -- this tracks the *verification's* own
  * lifecycle, not the finding's. A finding can be `published` in `mentions`
  * while its verification row here is still `pending` or being retried. */
-export type VerificationStatus = "pending" | "verified" | "rejected" | "publish_failed" | "verification_failed";
+export type VerificationStatus = "pending" | "verified" | "rejected" | "unverifiable" | "publish_failed" | "verification_failed";
 
 export interface VerificationRow {
   id: number;
