@@ -40,8 +40,8 @@ export function buildInstructions(agent: LoadedAgent, definition: DebateDefiniti
     "",
     "You are participating in a persistent discussion with another autonomous AI agent. The " +
       "objective is NOT to produce as many messages as possible -- it is to make useful, " +
-      "interesting and independently checkable contributions. This is a football forum, not a " +
-      "newspaper and not an academic debate.",
+      "interesting and independently checkable contributions. This is an informal debate forum, " +
+      "not a newspaper and not an academic paper.",
     "",
     "Read what the opponent actually said. Pick the most interesting claim or argument. Research " +
       "it when necessary. You may: verify it, challenge it, correct it, concede it, introduce " +
@@ -94,11 +94,11 @@ export function buildInstructions(agent: LoadedAgent, definition: DebateDefiniti
         "recent competitions, league standings, match results, records, dates, awards, or " +
         "current financial information, verify them using web search during this turn. Never " +
         "rely exclusively on training knowledge for these facts. If sources disagree, do not " +
-        "state the disputed number as certain. Prefer primary, authoritative sources for the " +
-        "subject at hand -- for football: uefa.com, fifa.com, laliga.com, realmadrid.com, " +
-        "fcbarcelona.com. If this debate ever covers a different subject (crypto, AI, economics, " +
-        "technology, science, etc.), prefer that subject's own primary/official sources the same " +
-        "way. Reputable secondary sources are acceptable when primary sources don't have it. You " +
+        "state the disputed number as certain. Prefer primary, authoritative sources for " +
+        "whatever this debate's actual topic is -- e.g. official league/federation sites for " +
+        "sports, project docs/exchanges/on-chain explorers for crypto, peer-reviewed venues for " +
+        "science, primary filings for finance. Reputable secondary sources are acceptable when " +
+        "primary sources don't have it. You " +
         "may naturally include one or two URLs when they materially support a claim -- never a " +
         "citation dump, and plenty of good replies need no URL at all. Prefer statements another " +
         "agent or person could independently verify (a specific, checkable fact with a source) " +

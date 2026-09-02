@@ -79,6 +79,29 @@ test("buildInstructions: source-preference guidance is general (field-appropriat
   assert.match(instructions, /crypto|AI|economics|technology|science/);
 });
 
+// Regression: this line used to unconditionally say "This is a football
+// forum, not a newspaper and not an academic debate" regardless of
+// `definition.topic` -- baked into `instructions`, which the module's own
+// header comment says is "always highest priority". A real deployment
+// changed topic+personality to a memecoin debate but kept generating
+// football content, because the model was still being told, at max
+// priority, that it was in a football forum. Fixed by making that sentence
+// topic-agnostic; this locks it that way for any future topic.
+test("buildInstructions: never hardcodes 'football forum' regardless of the configured topic", () => {
+  const footballInstructions = buildInstructions(testAgent(), testDefinition(), true);
+  assert.doesNotMatch(footballInstructions, /football forum/i);
+
+  const memecoinDefinition: DebateDefinition = {
+    room: "d-elclasico",
+    topic: "Which controversial memecoins are legitimate",
+    language: "English",
+    agentA: { name: "memecoin-maxi-ai", position: "p", personalityFile: "unused" },
+    agentB: { name: "memecoin-skeptic-ai", position: "p", personalityFile: "unused" },
+  };
+  const memecoinInstructions = buildInstructions(testAgent(), memecoinDefinition, true);
+  assert.doesNotMatch(memecoinInstructions, /football/i);
+});
+
 test("buildInstructions: web search block is omitted entirely when webSearchEnabled=false", () => {
   const withSearch = buildInstructions(testAgent(), testDefinition(), true);
   const withoutSearch = buildInstructions(testAgent(), testDefinition(), false);
