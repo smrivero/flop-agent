@@ -185,6 +185,13 @@ export async function runTclkVerifier(options: RunTclkVerifierOptions): Promise<
     storePreimage(secretDb, accept.contract, lock.preimage);
     const posted = await postFrame(client, config.room, accept, identity);
     recordAccepted(db, { findingId, contractId: accept.contract, offerId: offer.id, acceptMessageId: String(posted.seq) });
+    // Fold this accept into the in-memory transcript immediately -- `frames`
+    // was read once, before this loop started, so without this Phase 2 below
+    // would re-derive state for this SAME contract against a snapshot that
+    // predates the accept it just posted, and wrongly report it as still
+    // "proposed". Appending at the end keeps `frames` seq-ordered, since
+    // `posted.seq` is necessarily the highest seq seen so far.
+    frames.push({ seq: posted.seq, from: identity.did, frame: accept });
     acceptedCount++;
     log("accept", { finding: findingId, contract: accept.contract, message_id: posted.seq });
     report.push({ findingId, contractId: accept.contract, status: "accepted", action: { kind: "accept" }, posted: { kind: "accept", messageId: posted.seq } });

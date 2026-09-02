@@ -384,3 +384,51 @@ test("e2e refund: no reveal before refundAfterMs -> no refund (test #14); after 
 
   secretDb.close();
 });
+
+// Regression: a real run once logged "not accepted yet" for a finding it had
+// JUST accepted moments earlier in the very same run. Root cause: phase 2 (advance
+// already-accepted contracts) folded state against the `frames` snapshot read
+// at the TOP of the run, taken before phase 1 (accept new offers) had posted
+// anything -- so a contract accepted in phase 1 still looked "proposed" to
+// phase 2 within that same run. Fixed by folding each freshly-posted accept
+// into the in-memory `frames` array immediately (verifierWorker.ts).
+test("e2e regression: accepting an offer and advancing it happen correctly within the SAME run (no stale 'not accepted yet')", async () => {
+  const server = new FakeTechnocore();
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+  const dbPath = tempPath("mentions.sqlite3");
+  const findingId = "radar-20260902-samerun";
+  seedFinding(dbPath, findingId);
+
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const config = baseConfig({ dbPath, allowedPayerDid: payer.did });
+
+  const db0 = openTclkDatabase(dbPath);
+  await ensureTclkOffer(db0, client, config, payer, { findingId }, noopLog);
+  db0.close();
+
+  const secretDb = openSecretStore(tempPath("secrets.sqlite3"));
+  const db1 = openTclkDatabase(dbPath);
+  const summary = await runTclkVerifier({
+    db: db1, secretDb, client, config, identity: payee, openAiApiKey: "k", verifierModel: "m",
+    dryRun: false, log: noopLog, fetchArticleFn: mockFetchOk, analyzeFn: mockAnalyzeVerified,
+  });
+  db1.close();
+  secretDb.close();
+
+  assert.equal(summary.acceptedCount, 1);
+  const entriesForFinding = summary.contracts.filter((c) => c.findingId === findingId);
+  // Phase 1 (accept) and phase 2 (advance) each report their own entry for
+  // this finding -- that's expected. What must NOT happen is phase 2 folding
+  // against a stale pre-accept snapshot: every entry must show "accepted"
+  // (never "proposed"), and none may carry the stale reason.
+  assert.ok(entriesForFinding.length >= 1);
+  for (const entry of entriesForFinding) {
+    assert.equal(entry.status, "accepted");
+    assert.notEqual("reason" in entry.action ? entry.action.reason : undefined, "not accepted yet");
+  }
+  // And phase 2 specifically must now see it as "accepted, waiting for lock" --
+  // not "proposed, not accepted yet".
+  const phase2Entry = entriesForFinding.find((e) => e.action.kind === "none");
+  assert.equal(phase2Entry?.action.kind === "none" ? phase2Entry.action.reason : undefined, "waiting for the payer to lock");
+});
