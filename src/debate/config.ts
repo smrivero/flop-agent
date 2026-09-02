@@ -170,7 +170,21 @@ export function loadDebateDefinition(path: string): DebateDefinition {
   agentA.personalityFile = resolve(configDir, agentA.personalityFile);
   agentB.personalityFile = resolve(configDir, agentB.personalityFile);
 
-  return { room: room.trim(), topic: topic.trim(), language: language.trim(), agentA, agentB };
+  let topicStartedAt: string | undefined;
+  if (obj.topicStartedAt !== undefined) {
+    const raw = obj.topicStartedAt;
+    // This project's `yaml` parser keeps an ISO-looking scalar as a plain
+    // string either way, but accept a native Date too (defensive -- some YAML
+    // parsers auto-convert unquoted date-like scalars) so an unquoted
+    // `topicStartedAt: 2026-09-02T20:00:00Z` never surprises whoever edits it.
+    const value = raw instanceof Date ? raw.toISOString() : raw;
+    if (typeof value !== "string" || Number.isNaN(Date.parse(value))) {
+      throw new DebateConfigError(`${path}: topicStartedAt must be a valid ISO timestamp, got ${JSON.stringify(raw)}`);
+    }
+    topicStartedAt = value;
+  }
+
+  return { room: room.trim(), topic: topic.trim(), language: language.trim(), agentA, agentB, topicStartedAt };
 }
 
 export function loadPersonality(path: string): string {

@@ -15,9 +15,15 @@ try {
 async function main(): Promise<void> {
   const runtime = initializeRuntime();
   const snapshot = await readDebateHistory(runtime.client, runtime.definition.room, runtime.agentA.did, runtime.agentB.did);
-  const nextSpeakerId = determineNextSpeaker(snapshot.turns);
+  // Same cutoff loop.ts applies -- otherwise "next speaker"/"last speaker"
+  // here would reflect whatever was debated in this room before a topic
+  // change, not the current one.
+  const turns = runtime.definition.topicStartedAt
+    ? snapshot.turns.filter((t) => t.ts >= runtime.definition.topicStartedAt!)
+    : snapshot.turns;
+  const nextSpeakerId = determineNextSpeaker(turns);
   const nextSpeaker = nextSpeakerId === "A" ? runtime.agentA : runtime.agentB;
-  const lastTurn = snapshot.turns[snapshot.turns.length - 1];
+  const lastTurn = turns[turns.length - 1];
   const state = loadState(runtime.config.statePath, runtime.definition.room);
 
   const lines = [

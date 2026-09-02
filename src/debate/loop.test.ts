@@ -370,6 +370,62 @@ test("repetition: a candidate too similar to recent own messages triggers exactl
   assert.equal(view.count, 2); // only the two seeded messages -- nothing new published
 });
 
+// Regression: a real deployment reused an existing room for a brand-new topic
+// (couldn't create a new one). The model kept anchoring on the OLD topic's
+// history, and the repetition check kept comparing fresh replies against it
+// too -- flagging every single attempt as a duplicate of a debate about
+// something else entirely, forever. Fixed via `topicStartedAt`: turns before
+// the cutoff are excluded from turn order, conversation context, AND the
+// repetition check. This test is the SAME near-identical-content setup as the
+// "repetition" test above (which correctly still skips without a cutoff) --
+// the only difference is topicStartedAt, and here it must NOT skip.
+test("topicStartedAt: a candidate matching pre-cutoff history is NOT flagged as repetitive once topicStartedAt excludes that history", async () => {
+  const server = new FakeTechnocoreServer();
+  const runtime = buildTestRuntime({ server });
+
+  server.seedMessage("d-testroom", runtime.agentA.did, "Real Madrid have won fifteen European Cups and that settles the entire argument completely.", 1);
+  server.seedMessage("d-testroom", runtime.agentB.did, "Sure, but trophies alone don't decide greatest club.", 2);
+
+  await sleep(5); // ensure a strictly-later timestamp than the seeded messages
+  runtime.definition.topicStartedAt = new Date().toISOString();
+
+  let generateCalls = 0;
+  const result = await runOneTurn(runtime, {
+    generate: async () => {
+      generateCalls++;
+      // Same near-identical text as the un-cut-off test above -- would be
+      // flagged as repetitive if the old messages were still visible.
+      return textResult("Real Madrid have won fifteen European Cups and that settles the entire argument completely, again.");
+    },
+  });
+
+  assert.equal(generateCalls, 1); // no regeneration needed -- passed on the first attempt
+  assert.equal(result.outcome, "published");
+
+  const view = await runtime.client.readRoom("d-testroom");
+  assert.equal(view.count, 3); // the two old (untouched) messages plus the new one
+});
+
+test("topicStartedAt: turn order and conversation context ignore everything posted before the cutoff", async () => {
+  const server = new FakeTechnocoreServer();
+  const runtime = buildTestRuntime({ server });
+
+  // Agent A spoke last before the cutoff -- without topicStartedAt, Agent B
+  // would go next. With it, the room looks empty past the cutoff, so Agent A
+  // (whose own old message this even is) speaks first, exactly like an
+  // actually-empty room.
+  server.seedMessage("d-testroom", runtime.agentA.did, "OLD TOPIC: FC Barcelona's tiki-taka changed football forever.", 1);
+  await sleep(5);
+  runtime.definition.topicStartedAt = new Date().toISOString();
+
+  const result = await runOneTurn(runtime, { generate: async () => textResult("NEW TOPIC: opening argument about memecoins.") });
+
+  assert.equal(result.speakerId, "A"); // NOT "B" -- the pre-cutoff message doesn't count
+  const view = await runtime.client.readRoom("d-testroom");
+  assert.equal(view.count, 2);
+  assert.equal(view.messages[1].text, "NEW TOPIC: opening argument about memecoins.");
+});
+
 test("repetition: a regeneration that comes back sufficiently different DOES get published", async () => {
   const server = new FakeTechnocoreServer();
   const runtime = buildTestRuntime({ server });

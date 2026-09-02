@@ -92,6 +92,65 @@ test("debate definition: missing required fields fail clearly", () => {
   assert.throws(() => loadDebateDefinition(path), DebateConfigError);
 });
 
+test("debate definition: topicStartedAt is optional -- absent by default", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topic: Bitcoin vs Gold",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  const definition = loadDebateDefinition(join(dir, "debate.yaml"));
+  assert.equal(definition.topicStartedAt, undefined);
+});
+
+test("debate definition: topicStartedAt is parsed whether quoted or a bare YAML date", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      'topicStartedAt: "2026-09-02T00:00:00Z"',
+      "topic: Bitcoin vs Gold",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  const definition = loadDebateDefinition(join(dir, "debate.yaml"));
+  assert.equal(definition.topicStartedAt, "2026-09-02T00:00:00Z");
+
+  writeFileSync(
+    join(dir, "bare.yaml"),
+    [
+      "room: d-testroom",
+      "topicStartedAt: 2026-09-02T00:00:00Z", // unquoted -- YAML parses this as a Date
+      "topic: Bitcoin vs Gold",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  const bareDefinition = loadDebateDefinition(join(dir, "bare.yaml"));
+  assert.equal(bareDefinition.topicStartedAt, "2026-09-02T00:00:00Z");
+});
+
+test("debate definition: an invalid topicStartedAt fails clearly", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topicStartedAt: not-a-date",
+      "topic: Bitcoin vs Gold",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  assert.throws(() => loadDebateDefinition(join(dir, "debate.yaml")), DebateConfigError);
+});
+
 test("debate definition: missing file fails clearly", () => {
   assert.throws(() => loadDebateDefinition("/nonexistent/debate.yaml"), DebateConfigError);
 });

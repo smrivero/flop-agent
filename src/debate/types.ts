@@ -10,6 +10,14 @@ export interface DebateDefinition {
   language: string;
   agentA: AgentSpec;
   agentB: AgentSpec;
+  /** ISO timestamp (optional). When set, every turn posted to `room` BEFORE
+   * this moment is invisible to the loop -- excluded from turn-order,
+   * conversation context, and the repetition check alike. Lets a topic
+   * change reuse an existing room (some deployments can't create new ones)
+   * without the model anchoring on stale pre-change history, and without the
+   * repetition check permanently flagging fresh replies as duplicates of an
+   * old debate about something else entirely. */
+  topicStartedAt?: string;
 }
 
 /** Only "openai" is implemented today. The type is a union of one so adding a

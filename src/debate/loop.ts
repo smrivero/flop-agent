@@ -150,13 +150,6 @@ async function generateValidatedCandidate(
     const shape = checkShape(sanitized);
     const repetition = checkRepetition(sanitized, ownRecentMessages, repetitionThreshold);
 
-    // TEMP DEBUG -- remove after diagnosing the persistent repetition=1.00.
-    console.log("=== DEBUG sanitized candidate ===\n" + sanitized);
-    console.log("=== DEBUG ownRecentMessages.length ===", ownRecentMessages.length);
-    if (repetition.matchedIndex !== undefined) {
-      console.log("=== DEBUG matched recent message [" + repetition.matchedIndex + "] ===\n" + ownRecentMessages[repetition.matchedIndex]);
-    }
-
     logEvent("quality", { repetition: repetition.maxScore.toFixed(2) });
     for (const reason of shape.reasons) logEvent("quality", { issue: reason });
 
@@ -182,7 +175,13 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
   const { client, definition, config } = runtime;
 
   const snapshot = await readDebateHistory(client, definition.room, runtime.agentA.did, runtime.agentB.did);
-  const speakerId = determineNextSpeaker(snapshot.turns);
+  // A topic change reusing an existing room (definition.topicStartedAt set)
+  // must not let the model anchor on -- or the repetition check compare
+  // against -- turns from whatever was debated in this room before. Turns
+  // before the cutoff are simply invisible from here on: turn order,
+  // context, and repetition all see this as a fresh room with no history.
+  const turns = definition.topicStartedAt ? snapshot.turns.filter((t) => t.ts >= definition.topicStartedAt!) : snapshot.turns;
+  const speakerId = determineNextSpeaker(turns);
   const speaker = agentFor(runtime, speakerId);
   logEvent("turn", { next: agentLabel(speakerId) });
 
@@ -193,8 +192,8 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
     return { outcome: "daily-limit", speakerId, speakerName: speaker.name };
   }
 
-  const recent = mostRecentTurns(snapshot.turns, config.historyMessages);
-  const ownRecentMessages = snapshot.turns
+  const recent = mostRecentTurns(turns, config.historyMessages);
+  const ownRecentMessages = turns
     .filter((t) => t.agentId === speakerId)
     .slice(-config.recentMessagesForSimilarity)
     .map((t) => t.text);

@@ -1,4 +1,10 @@
 room: d-elclasico
+# Room reused from the old FC Barcelona vs Real Madrid debate -- everything
+# posted before this cutoff (the old football debate) is invisible to turn
+# order, conversation context, and the repetition check alike. Without this,
+# the model anchors on the old history and the repetition check permanently
+# flags fresh replies as duplicates of a debate about something else entirely.
+topicStartedAt: "2026-09-02T00:00:00Z"
 topic: >
   Two autonomous crypto-native agents debate the most controversial memecoins:
   one champions them, the other refutes them, coin by coin.
