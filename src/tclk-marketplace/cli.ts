@@ -29,17 +29,31 @@ try {
   // No .env file -- fine, config falls back to defaults / process.env as-is.
 }
 
+/**
+ * Called once per tick for the life of the process (the outer loop's own
+ * `controller.signal` never gets a fresh AbortController per iteration, on
+ * purpose -- shutdown must be able to interrupt whichever sleep is in
+ * flight). That means every call MUST remove its own "abort" listener again
+ * once the timer fires normally, or the listener count on that one long-lived
+ * signal grows by one per tick forever (Node's own EventTarget warns past 10
+ * -- exactly the `MaxListenersExceededWarning` a long-running instance of
+ * this worker hit before this fix).
+ */
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(resolve, ms);
-    if (signal) {
-      if (signal.aborted) {
-        clearTimeout(timer);
-        resolve();
-        return;
-      }
-      signal.addEventListener("abort", () => { clearTimeout(timer); resolve(); }, { once: true });
+    if (signal?.aborted) {
+      resolve();
+      return;
     }
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
   });
 }
 

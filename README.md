@@ -899,7 +899,7 @@ Structured, one line per event, always grep-able as `[TCLK][...]`:
 
 ```
 [TCLK][SCANNER] ts=... room=tclk-offers since=1200 last_seq=1214 frames_found=3
-[TCLK][OFFER][FOUND] ts=... room=tclk-offers offer=0x... payer=did:key:z6Mk... amount=1000000 asset=PAPER rails=paper
+[TCLK][OFFER][FOUND] ts=... room=tclk-offers offer=0x... from=did:key:z6Mk... role=payer job=echo amount=1000000 asset=PAPER rails=paper
 [TCLK][POLICY][RESULT] ts=... offer=0x... decision=ACCEPT reason=supported_offer
 [TCLK][ACCEPT][SECRET_STORED] ts=... contract=0x... secretFingerprint=090de309
 [TCLK][ACCEPT][POSTED] ts=... offer=0x... contract=0x... room=tclk-offers seq=1215 deal_room=mb-p-tclk-...

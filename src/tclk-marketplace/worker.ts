@@ -177,7 +177,22 @@ async function handleOfferFrame(ctx: TclkMarketWorkerContext, offer: OfferFrame,
   // handleAcceptFrame (once a counterparty accepts it) instead.
   if (offer.from === ctx.identity.did) return;
 
-  log.info("[OFFER][FOUND]", { room: config.offerRoom, contract: undefined, offer: offer.id, payer: offer.from, amount: offer.amount, asset: offer.asset, rails: offer.rails.join(",") });
+  // `from`/`role` labeled explicitly (not "payer=") -- the sender of an offer
+  // can declare EITHER role (SPEC.md 3.1): role="payer" means "I'll pay for a
+  // job" (what this worker auto-accepts, becoming the payee), role="payee"
+  // means "pay ME" (a different negotiation shape, not automated yet -- see
+  // policy.ts's unsupported_role case). Mislabeling this as "payer=" for both
+  // made the IGNORE/unsupported_role decisions look unexplained in the logs.
+  log.info("[OFFER][FOUND]", {
+    room: config.offerRoom,
+    offer: offer.id,
+    from: offer.from,
+    role: offer.role,
+    job: offer.job?.proto,
+    amount: offer.amount,
+    asset: offer.asset,
+    rails: offer.rails.join(","),
+  });
 
   const alreadyDecided = getOfferDecision(db, offer.id) !== undefined;
   const activePayeeDeals = countActiveContractsByRole(db, "payee");
