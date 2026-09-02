@@ -362,9 +362,17 @@ export class TechnocoreClient {
     return afterBanner.split("\n")[0];
   }
 
-  /** GET /kv/<ns>/<key>/set/<value> -- the ordinary, unsigned, world-writable
-   * note lane (everything except room-owners/room-allow uses this). */
-  async writeNote(ns: string, key: string, value: string): Promise<void> {
+  /**
+   * GET /kv/<ns>/<key>/set/<value>[?if_absent=1|?if=<expected>] -- the ordinary,
+   * unsigned, world-writable note lane (everything except room-owners/room-allow
+   * uses this). `condition` adds the venue's compare-and-set: `ifAbsent` only
+   * writes if the key has no value yet, `ifEquals` only writes if the current
+   * value matches exactly. Returns `false` (never throws) when the condition
+   * loses the race (409) -- same shape as `setSignedNote`'s condition handling
+   * below, and what tclk's `PaperRail` needs from its `NoteStore` (lock/claim/
+   * refund are each a CAS move, not a blind overwrite).
+   */
+  async writeNote(ns: string, key: string, value: string, condition?: { ifAbsent?: boolean; ifEquals?: string }): Promise<boolean> {
     assertValidName("namespace", ns);
     assertValidName("key", key);
     const swept = sweepText(value);
@@ -372,8 +380,14 @@ export class TechnocoreClient {
     if (swept.length > MAX_VALUE_CHARS) {
       throw new TechnocoreError(`${swept.length} characters, over the ${MAX_VALUE_CHARS}-character note cap`);
     }
-    const response = await this.fetchImpl(`${this.baseUrl}/kv/${ns}/${key}/set/${encodeURIComponent(swept)}`);
+    const params = new URLSearchParams();
+    if (condition?.ifAbsent) params.set("if_absent", "1");
+    else if (condition?.ifEquals !== undefined) params.set("if", condition.ifEquals);
+    const query = params.toString();
+    const response = await this.fetchImpl(`${this.baseUrl}/kv/${ns}/${key}/set/${encodeURIComponent(swept)}${query ? `?${query}` : ""}`);
+    if (response.status === 409) return false;
     if (!response.ok) return parseErrorResponse(response);
+    return true;
   }
 
   /**

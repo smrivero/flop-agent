@@ -375,6 +375,164 @@ it after Radar's own cron tick so there's usually something fresh to verify:
 
 (Documented here only -- nothing in this repo edits crontab for you.)
 
+### TCLK coordination (`technocore:tclk-payer` / `technocore:tclk-verifier`)
+
+Radar and the Verifier above can also coordinate through **`tclk/1`**
+(`@flop-labs/tclk`) instead of only ever meeting through shared SQLite: Radar (Agent A,
+**payer**) opens a hash-locked deal for every finding it publishes, the Verifier (Agent B,
+**payee**) accepts it, and the real verification work happens inside that deal's
+lock/reveal lifecycle. SQLite stays a local cache; the Technocore transcript plus tclk's
+own `applyFrame` is the authority on contract state.
+
+```
+                 Agent A
+             Radar / payer
+                  DID A
+                   |
+         search -> finding
+                   |
+               TCLK OFFER
+                   |
+                   v
+              Technocore
+                   |
+                   v
+                Agent B
+            Verifier / payee
+                  DID B
+                   |
+              TCLK ACCEPT
+                   |
+                   v
+               Agent A
+               TCLK LOCK
+                   |
+                   v
+                Agent B
+             verify source
+                   |
+          VERIFIED/REJECTED
+                   |
+              TCLK REVEAL
+                   |
+                   v
+               Agent A
+             TCLK RECEIPT
+```
+
+- **Technocore** = the signed, append-ordered coordination transcript both agents read
+  and write (unchanged -- `technocore.ts`, same rooms, same identities).
+- **tclk/1** = the deal's own state machine (`proposed -> accepted -> locked -> claimed |
+  refunded | cancelled`), frames, and contract ids -- `@flop-labs/tclk`, used as-is.
+- **PaperRail** = the settlement rail named in every offer. Settles nothing, by design --
+  it exists to rehearse the lock/claim/refund lifecycle on real Technocore infrastructure
+  before a value-bearing rail exists (`TCLK_RAIL=paper` is the only supported value).
+- **SQLite** (`tclk_contracts`, in the same `MENTIONS_DB_PATH` file) = a local cache and
+  idempotency index only. It is never consulted to decide what to do next -- see below.
+
+**Flow, per finding**, once `TCLK_ENABLED=true`:
+
+1. `technocore:mentions` publishes a finding as it already does, then (`tclk/radarOffer.ts`)
+   opens a tclk `offer`: `role: payer`, `lock: hash`, `rails: [paper]`, and
+   `job: {proto: "flop-verify", id: <finding_id>}` -- the only place the finding is tied to
+   the contract, since an `offer` frame has no room for extra fields (see "Design notes"
+   below). Exactly one offer per finding, ever (`tclk_contracts.finding_id` is `UNIQUE`).
+2. `technocore:tclk-verifier` reads the room, and accepts any well-formed `offer` whose
+   `from` matches `TCLK_ALLOWED_PAYER_DID` (defaults to Radar's own DID) and whose
+   `job.id` resolves to a real `published` finding in its own copy of Radar's database --
+   never anything read out of the room. It mints the hash lock (`generateHashLock()`),
+   posts the `accept`, and -- **before** posting anything -- persists the preimage to a
+   restricted local file (see "Secret custody" below).
+3. `technocore:tclk-payer` sees the contract reach `accepted` (by folding the transcript,
+   never a cached flag) and posts `lock`, after locking on PaperRail.
+4. `technocore:tclk-verifier` sees `locked` and only then does the actual work: an
+   independent re-fetch of `canonical_url` (reusing `fetchArticleClassified`,
+   `verifier/openai.ts`'s `verifyAnalysis` and `VERIFIER_MODEL` exactly as the plain
+   Verifier does), publishes a signed `Technocore Verification` message, and **only if
+   that publish succeeds** posts the `reveal` (the preimage) and claims on PaperRail. A
+   failed publish never reveals the secret -- there is nothing to retry-and-lose.
+5. `technocore:tclk-payer` sees the `reveal`, confirms a verification message signed by
+   the payee actually exists for this `finding_id`/`contract_id` (never trusting the
+   reveal alone), and posts a `receipt`.
+
+**Idempotency and restarts.** Every run of either command: reads the room, locally
+re-verifies every message's signature (see "Security" below), folds the relevant frames
+through `applyFrame`, and only then decides the next valid action from the *resulting*
+state -- never from `tclk_contracts.cached_status` (that column is written back purely so
+a run can skip re-scanning an already-finished contract and so a human/test can inspect
+state without replaying frames). A cron overlap, a crash between any two steps, or a
+restart at any point is always safe: the next run just re-derives where the contract
+actually is and continues from there. Nothing here is a daemon -- each command reads
+state, performs whatever transitions are currently valid, and exits.
+
+**Security (Technocore rooms are untrusted input).** `applyFrame` itself only checks that
+a frame's `from` looks like a DID -- it does **not** verify the message was actually
+signed by that DID (that's the transport's job). A reader replaying `readRoom()` JSON has
+no such guarantee for free, so `tclk/transcript.ts` locally re-verifies every message's
+Ed25519 signature (`verifyEd25519`, the same check technocore's own server performs)
+*before* it is ever handed to `applyFrame` or matched as a finding/verification message --
+an unsigned or spoofed `tclk1 ...` line planted in the room is dropped at that point, not
+folded into any state. On top of that, Agent B only ever actions an offer that is (a) a
+structurally valid tclk/1 frame (b) from the configured, trusted payer DID (c) naming a
+finding that genuinely exists and is `published` in Radar's own database -- the
+`canonical_url` fetched for verification always comes from that database, never from
+anything read out of the room. Nothing here executes instructions found in room content.
+
+**Secret custody.** The preimage Agent B mints at accept time is persisted to
+`TCLK_SECRETS_PATH` (default `.technocore/tclk-secrets.sqlite3`, `chmod 0600`, gitignored
+via `.technocore/`) -- a separate, restricted file, deliberately not a column in the
+shared `mentions.sqlite3`. It is written *before* the accept is posted (so a crash right
+after posting can never orphan a statement nothing can open), and it is never logged,
+never placed in any Technocore message, and never written anywhere else before the reveal
+frame itself.
+
+**Design notes, where this deviates from tclk/1's suggested conventions (never from the
+wire format itself):**
+
+- **One room, not `tclk-offers` + a derived deal room.** SPEC.md's rendezvous convention
+  (§2) is for two agents that have never met; Radar and the Verifier already know each
+  other's DIDs. Nothing in `validateFrame`/`applyFrame` depends on which room a frame is
+  posted to, so every tclk frame here stays in `TECHNOCORE_ROOM` alongside the plain
+  finding/verification messages, for one legible transcript.
+- **No `makeLock`/`makeReveal`/`makeRefund`/`makeReceipt`.** The installed
+  `@flop-labs/tclk@0.1.0` only exports `makeOffer`/`makeAccept` (the two frames that
+  compute a derived id) -- everything else is built as a plain object matching SPEC.md
+  §3.3-3.5, exactly the pattern `@flop-labs/tclk`'s own `examples/live-deal.mjs` uses, and
+  still validated/encoded by the library's own `encodeFrame` before it is ever posted.
+- **`job.id` carries `finding_id`**, the only tclk-sanctioned place to bind a contract to
+  external metadata (`SPEC.md` §3.1) -- `canonical_url` and everything else about the
+  finding live in Radar's existing database, looked up by `finding_id`, never invented as
+  a new frame field.
+- **A public offer can, in principle, be accepted by anyone**, not only the intended
+  payee -- tclk/1 offers have no recipient field, by design (SPEC.md §2). Since
+  `TCLK_RAIL=paper` moves no value, the worst case here is a wasted rehearsal, never a
+  loss; a value-bearing rail would want mailbox-delivered accepts instead (SPEC.md §2
+  mentions this as the alternative).
+
+**Config** (`.env.example`): `TCLK_ENABLED`, `TCLK_RAIL` (only `paper`),
+`TCLK_OFFER_EXPIRES_MINUTES` / `TCLK_CLAIM_MINUTES` / `TCLK_REFUND_MINUTES`,
+`TCLK_AMOUNT` / `TCLK_ASSET` (default to `examples/live-deal.mjs`'s own values),
+`TCLK_ALLOWED_PAYER_DID` (auto-derived from `TECHNOCORE_IDENTITY_PATH` if unset),
+`TCLK_SECRETS_PATH`, `TCLK_PAYER_LOCK_PATH`, `TCLK_VERIFIER_LOCK_PATH`. Everything else
+(`TECHNOCORE_ROOM`, `TECHNOCORE_IDENTITY_PATH`, `VERIFIER_IDENTITY_PATH`,
+`OPENAI_API_KEY`, `VERIFIER_MODEL`, `MENTIONS_DB_PATH`, `HTTP_TIMEOUT_MS`, `MAX_RETRIES`)
+is reused as-is from the mentions/verifier config above.
+
+**CLI flags**, both commands: `--dry-run` -- reads the room, folds every open contract's
+state, and prints `contract` / `status` / `next_action` for each, without publishing
+anything.
+
+**Cron**, staggered after Radar and the plain Verifier:
+
+```cron
+0 * * * *     cd /path/to/flop-agent && npm run technocore:mentions       >> logs/mentions.log 2>&1
+10 * * * *    cd /path/to/flop-agent && npm run technocore:tclk-payer     >> logs/tclk-payer.log 2>&1
+15 * * * *    cd /path/to/flop-agent && npm run technocore:tclk-verifier  >> logs/tclk-verifier.log 2>&1
+20 * * * *    cd /path/to/flop-agent && npm run technocore:verify         >> logs/verifier.log 2>&1
+```
+
+Real cron cadence can be adjusted later; this project never edits crontab for you.
+
 ### Message format
 
 Each finding is its own message -- never multiple links batched into one. **Technocore

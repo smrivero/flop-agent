@@ -50,8 +50,12 @@ import { extractContent } from "./content/extractContent.js";
 import { analyzeMention } from "./ai/analyzeMention.js";
 import { createTechnocoreSender, formatDailyStatusMessage, formatMessage, type SendMessageFn } from "./publisher/publishMention.js";
 import { TechnocoreClient } from "../technocore.js";
+import { loadIdentity, type TechnocoreIdentity } from "../identity.js";
 import { fetchWithTimeout } from "./http.js";
 import type { AnalysisResult, Candidate, MentionRow, RunSummary, SearchProvider } from "./types.js";
+import { loadTclkConfig, type TclkConfig } from "../tclk/config.js";
+import { migrateTclkTables } from "../tclk/database.js";
+import { ensureTclkOffer } from "../tclk/radarOffer.js";
 
 export interface RunOptions {
   dryRun: boolean;
@@ -235,6 +239,23 @@ async function runOnce(db: MentionsDb, config: MentionsConfig, options: RunOptio
   const sendMessage = deps.sendMessage ?? createTechnocoreSender(config);
   const useOpenAi = shouldUseOpenAi(config);
 
+  // TCLK coordination is opt-in and additive: when enabled, every finding that
+  // gets published below also gets a TCLK offer opened for it (radarOffer.ts).
+  // Never set up (and never attempted) in dry-run, matching the rest of this
+  // pipeline's dry-run contract of "no writes to Technocore or the database".
+  let tclk: { config: TclkConfig; identity: TechnocoreIdentity; client: TechnocoreClient } | undefined;
+  if (!options.dryRun) {
+    const tclkConfig = loadTclkConfig();
+    if (tclkConfig.tclkEnabled) {
+      migrateTclkTables(db);
+      tclk = {
+        config: tclkConfig,
+        identity: loadIdentity({ path: tclkConfig.identityPath }),
+        client: new TechnocoreClient({ fetchImpl: (input, init) => fetchWithTimeout(String(input), init ?? {}, tclkConfig.httpTimeoutMs) }),
+      };
+    }
+  }
+
   for (const item of queue) {
     let analysis: AnalysisResult = { related: true, finding: "" };
     let contentHash: string | null = null;
@@ -300,6 +321,17 @@ async function runOnce(db: MentionsDb, config: MentionsConfig, options: RunOptio
       markPublished(db, item.id!, config.technocoreRoom, String(posted.seq), findingText ?? null, contentHash);
       logEvent("publish", { finding: item.findingId, signed: true, message_id: posted.seq });
       summary.published++;
+
+      if (tclk) {
+        // Isolated failure domain, same discipline as publishRadarState below:
+        // a TCLK problem must never turn an already-successful finding publish
+        // into a reported failure.
+        try {
+          await ensureTclkOffer(db, tclk.client, tclk.config, tclk.identity, { findingId: item.findingId }, logEvent);
+        } catch (err) {
+          logEvent("tclk-offer", { finding: item.findingId, error: (err as Error).message ?? String(err) });
+        }
+      }
     } catch (err) {
       // Safe to log: TechnocoreError.message is a short "status + reason" string,
       // never headers, keys, or private key material.
