@@ -17,11 +17,21 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer, type LockFrame, type RevealFrame } from "@flop-labs/tclk";
 import { TechnocoreClient } from "../technocore.js";
 import { FakeTechnocore, makeTestIdentity } from "../tclk/testUtils.js";
 import { openSecretStore } from "../tclk/secretStore.js";
 import type { TclkMarketConfig } from "./config.js";
-import { getContract, getOfferDecision, listOpenContracts, openTclkMarketDatabase, type TclkMarketDb } from "./database.js";
+import {
+  getContract,
+  getOfferDecision,
+  insertContract,
+  listOpenContracts,
+  openTclkMarketDatabase,
+  setRoomCursor,
+  storeFrame,
+  type TclkMarketDb,
+} from "./database.js";
 import { createLogger } from "./logger.js";
 import { publishOffer } from "./publisher.js";
 import { runTclkMarketTick, type TickSummary } from "./worker.js";
@@ -332,4 +342,72 @@ test("regression: a bookkeeping failure right after posting an accept does not a
 
   dbB.close();
   secretDbB.close();
+});
+
+// Regression: a real production worker, re-folding a long-since-completed
+// contract hours after the fact, collapsed it back to "proposed" -- because
+// the fold evaluated the (long-ago, perfectly valid) accept/reveal frames
+// against Date.now() instead of the time they actually happened, and
+// applyFrame's own expiresMs/refundAfterMs guards correctly reject an accept
+// or reveal evaluated long after those deadlines. Fixed by persisting each
+// frame's own posted-at time (database.ts `posted_at`) and folding with THAT,
+// never the current clock. This test fabricates a contract whose offer
+// expired and whose refund window opened long before "now" (real Date.now(),
+// not injected) -- exactly the shape that broke in production -- and confirms
+// re-folding it still correctly reaches "claimed", not "proposed".
+test("regression: a contract folds correctly even long after its offer's expiresMs/refundAfterMs have passed in real time", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+
+  const longAgo = Date.now() - 6 * 60 * 60 * 1000; // 6 hours ago
+  const offer = makeOffer({
+    from: payer.did, role: "payer", lock: "hash", amount: "1", asset: "PAPER", rails: ["paper"],
+    claimByMs: longAgo + 60_000, refundAfterMs: longAgo + 120_000, expiresMs: longAgo + 30_000,
+    job: { proto: "echo", id: "job-old" },
+  });
+  const lock = generateHashLock();
+  const accept = makeAccept(offer, { from: payee.did, statement: lock.hash });
+  const lockFrame: LockFrame = { type: "lock", from: payer.did, contract: accept.contract, rail: "paper", ref: accept.contract };
+  const revealFrame: RevealFrame = { type: "reveal", from: payee.did, contract: accept.contract, secret: lock.preimage };
+
+  // Posted through the fake server so seq/room reads behave normally, but the
+  // LOCAL bookkeeping below back-dates `posted_at` to when these frames were
+  // actually valid (within the offer's real windows) -- reproducing "this
+  // deal really did complete, a long time ago" rather than injecting a fake
+  // clock into the worker itself.
+  const offerMsg = server.postSigned(OFFER_ROOM, payer, encodeFrame(offer));
+  const acceptMsg = server.postSigned(OFFER_ROOM, payee, encodeFrame(accept));
+  const roomName = dealRoom(accept.contract);
+  const lockMsg = server.postSigned(roomName, payer, encodeFrame(lockFrame));
+  const revealMsg = server.postSigned(roomName, payee, encodeFrame(revealFrame));
+
+  const dbPath = tempPath("expiry.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  const validAt = new Date(longAgo + 10_000).toISOString(); // inside every deadline above
+  storeFrame(db, { room: OFFER_ROOM, seq: offerMsg.seq, from_did: payer.did, frame_type: "offer", contract_id: null, offer_id: offer.id, frame_json: JSON.stringify(offer), posted_at: validAt });
+  storeFrame(db, { room: OFFER_ROOM, seq: acceptMsg.seq, from_did: payee.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: validAt });
+  storeFrame(db, { room: roomName, seq: lockMsg.seq, from_did: payer.did, frame_type: "lock", contract_id: accept.contract, offer_id: null, frame_json: JSON.stringify(lockFrame), posted_at: validAt });
+  storeFrame(db, { room: roomName, seq: revealMsg.seq, from_did: payee.did, frame_type: "reveal", contract_id: accept.contract, offer_id: null, frame_json: JSON.stringify(revealFrame), posted_at: validAt });
+  insertContract(db, {
+    contract_id: accept.contract, offer_id: offer.id, role: "payee", payer_did: payer.did, payee_did: payee.did,
+    asset: offer.asset, amount: offer.amount, rail: "paper", job_proto: "echo", job_id: "job-old",
+    deal_room: roomName, cached_status: "locked", claim_by_ms: offer.claimByMs, refund_after_ms: offer.refundAfterMs,
+    expires_ms: offer.expiresMs, secret_fingerprint: null,
+  });
+  setRoomCursor(db, OFFER_ROOM, acceptMsg.seq);
+  setRoomCursor(db, roomName, revealMsg.seq);
+
+  const secretDb = openSecretStore(tempPath("secrets-expiry.sqlite3"));
+  const config = baseConfig({ dbPath });
+
+  // Real Date.now() right now is hours past offer.expiresMs/refundAfterMs --
+  // the bug re-evaluated the accept/reveal transitions against THIS clock
+  // and rejected them, collapsing the fold back to "proposed".
+  await runTick({ db, secretDb, client, config, identity: payee });
+  assert.equal(getContract(db, accept.contract)?.cached_status, "claimed");
+
+  db.close();
+  secretDb.close();
 });

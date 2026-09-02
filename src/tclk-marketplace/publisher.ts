@@ -75,6 +75,7 @@ export async function publishOffer(
     contract_id: null,
     offer_id: offer.id,
     frame_json: JSON.stringify(offer),
+    posted_at: new Date().toISOString(),
   });
   log.info("[PUBLISHER][POSTED]", { offer_id: offer.id, room: config.offerRoom, seq: posted.seq });
   return { offer, messageId: posted.seq };

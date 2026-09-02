@@ -82,7 +82,7 @@ export interface TickSummary {
   autoPublished: boolean;
 }
 
-type StoredFrameEntry = { seq: number; from: string; frame: TclkFrame };
+type StoredFrameEntry = { seq: number; from: string; frame: TclkFrame; postedAtMs: number };
 
 function toFrameRow(room: string, m: VerifiedFrameMessage): Parameters<typeof storeFrame>[1] {
   const contractIdField = "contract" in m.frame ? (m.frame as { contract: string }).contract : null;
@@ -95,6 +95,7 @@ function toFrameRow(room: string, m: VerifiedFrameMessage): Parameters<typeof st
     contract_id: contractIdField,
     offer_id: offerIdField,
     frame_json: JSON.stringify(m.frame),
+    posted_at: m.raw.ts,
   };
 }
 
@@ -106,8 +107,17 @@ function loadContractFrames(db: TclkMarketDb, offerId: string, contractId: strin
     seq: number;
     from_did: string;
     frame_json: string;
+    posted_at: string | null;
   }[];
-  const frames: StoredFrameEntry[] = rows.map((r) => ({ seq: r.seq, from: r.from_did, frame: JSON.parse(r.frame_json) as TclkFrame }));
+  const frames: StoredFrameEntry[] = rows.map((r) => ({
+    seq: r.seq,
+    from: r.from_did,
+    frame: JSON.parse(r.frame_json) as TclkFrame,
+    // Rows written before the posted_at column existed have it NULL --
+    // Date.now() is the only fallback available for those, same as the old
+    // (buggy) behavior, but every frame stored from here on carries its own.
+    postedAtMs: r.posted_at !== null ? Date.parse(r.posted_at) : Date.now(),
+  }));
   return { offer, frames };
 }
 
@@ -121,14 +131,28 @@ function loadContractFrames(db: TclkMarketDb, offerId: string, contractId: strin
 // seq only to order same-stage frames within the one room they share.
 const FRAME_STAGE: Record<TclkFrame["type"], number> = { offer: 0, accept: 1, lock: 2, reveal: 3, refund: 3, cancel: 3, receipt: 4 };
 
+/**
+ * Re-derives contract state by folding every locally-cached frame -- but,
+ * CRITICALLY, evaluates each frame's `applyFrame` guard using the time IT was
+ * actually posted (`postedAtMs`), never `Date.now()`. `applyFrame`'s own
+ * transition guards are time-bound in one direction only (`accept` requires
+ * `nowMs < offer.expiresMs`, `reveal` requires `nowMs < offer.refundAfterMs`)
+ * -- correct when evaluated once, live, as tclk/payer.ts and verifierWorker.ts
+ * do. This module instead re-fold the ENTIRE history from scratch on every
+ * tick (that's what makes state self-healing / restart-safe), and re-checking
+ * an old, already-valid accept against TODAY's clock will find its offer
+ * "expired" purely because real time has since passed -- collapsing the fold
+ * back to `proposed` even though the deal genuinely completed. Using each
+ * frame's own posted time instead is what actually happened at that moment.
+ */
 function foldFromStore(db: TclkMarketDb, offerId: string, contractId: string): ContractState {
   const { offer, frames } = loadContractFrames(db, offerId, contractId);
   let state = openContract(offer);
   const ordered = [...frames].sort((a, b) => FRAME_STAGE[a.frame.type] - FRAME_STAGE[b.frame.type] || a.seq - b.seq);
-  for (const { frame } of ordered) {
+  for (const { frame, postedAtMs } of ordered) {
     if (frame.type === "offer") continue;
     if (!("contract" in frame) || frame.contract !== contractId) continue;
-    const step = applyFrame(state, frame, Date.now());
+    const step = applyFrame(state, frame, postedAtMs);
     if (step.ok) state = step.state;
   }
   return state;
@@ -333,7 +357,7 @@ async function acceptOffer(ctx: TclkMarketWorkerContext, offer: OfferFrame, summ
     return;
   }
 
-  storeFrame(db, { room: config.offerRoom, seq: posted.seq, from_did: identity.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept) });
+  storeFrame(db, { room: config.offerRoom, seq: posted.seq, from_did: identity.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: new Date().toISOString() });
 
   try {
     persistAcceptedContract(db, offer, accept, fingerprintSecret(lock.preimage));
@@ -459,7 +483,7 @@ async function doLock(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow, 
   }
   const frame = buildLockFrame({ from: identity.did, contract: row.contract_id, rail: config.rail, ref: row.contract_id });
   const posted = await postFrame(client, row.deal_room, frame, identity);
-  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "lock", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame) });
+  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "lock", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame), posted_at: new Date().toISOString() });
   updateContractCache(db, row.contract_id, { cachedStatus: "locked", rail: config.rail });
   log.info("[LOCK][POSTED]", { contract: row.contract_id, room: row.deal_room, seq: posted.seq });
 }
@@ -469,7 +493,7 @@ async function doRefund(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow
   await rail.refund(state.railRef ?? row.contract_id);
   const frame = buildRefundFrame({ from: identity.did, contract: row.contract_id, reason: `no reveal before refundAfterMs (${state.offer.refundAfterMs})` });
   const posted = await postFrame(client, row.deal_room, frame, identity);
-  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "refund", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame) });
+  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "refund", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame), posted_at: new Date().toISOString() });
   updateContractCache(db, row.contract_id, { cachedStatus: "refunded" });
   log.info("[REFUND][POSTED]", { contract: row.contract_id, room: row.deal_room, seq: posted.seq });
 }
@@ -500,7 +524,7 @@ async function doWorkAndReveal(ctx: TclkMarketWorkerContext, row: TclkMarketCont
   const revealFrame = buildRevealFrame({ from: identity.did, contract: row.contract_id, secret: preimage });
   log.info("[CLAIM][REVEAL_CREATED]", { contract: row.contract_id, secretFingerprint: fingerprintSecret(preimage) });
   const posted = await postFrame(client, row.deal_room, revealFrame, identity);
-  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "reveal", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(revealFrame) });
+  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "reveal", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(revealFrame), posted_at: new Date().toISOString() });
   log.info("[CLAIM][POSTED]", { contract: row.contract_id, room: row.deal_room, seq: posted.seq });
 
   await rail.claim(state.railRef ?? row.contract_id, preimage);
@@ -531,7 +555,7 @@ async function doReceipt(
   const frame = buildReceiptFrame({ from: identity.did, contract: row.contract_id, outcome, rail: config.rail, ref: state.railRef ?? row.contract_id });
   log.info("[RECEIPT][CREATED]", { contract: row.contract_id, outcome });
   const posted = await postFrame(client, row.deal_room, frame, identity);
-  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "receipt", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame) });
+  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "receipt", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame), posted_at: new Date().toISOString() });
   updateContractCache(db, row.contract_id, { receipted: true, cachedStatus: `${outcome}_receipted` });
   log.info("[RECEIPT][POSTED]", { contract: row.contract_id, room: row.deal_room, seq: posted.seq });
 }

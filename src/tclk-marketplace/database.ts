@@ -45,6 +45,11 @@ export function openTclkMarketDatabase(path: string): TclkMarketDb {
   return db;
 }
 
+function tableColumns(db: TclkMarketDb, table: string): Set<string> {
+  const rows = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  return new Set(rows.map((r) => r.name));
+}
+
 function migrate(db: TclkMarketDb): void {
   db.exec(`
     CREATE TABLE IF NOT EXISTS tclk_market_room_cursors (
@@ -62,6 +67,7 @@ function migrate(db: TclkMarketDb): void {
         offer_id TEXT,
         frame_json TEXT NOT NULL,
         received_at TEXT NOT NULL,
+        posted_at TEXT,
         PRIMARY KEY (room, seq)
     );
     CREATE INDEX IF NOT EXISTS idx_tclk_market_frames_contract ON tclk_market_frames(contract_id);
@@ -120,6 +126,16 @@ function migrate(db: TclkMarketDb): void {
     );
     INSERT OR IGNORE INTO tclk_market_counters (id, errors) VALUES (1, 0);
   `);
+
+  // Additive migration for a DB created before `posted_at` existed (the
+  // CREATE TABLE above only applies to a brand-new file). Needed so
+  // worker.ts's fold can evaluate each frame's time-bound guards
+  // (expiresMs/refundAfterMs) against the moment that frame actually landed,
+  // not against whatever "now" happens to be when the contract is re-folded
+  // later -- see foldFromStore's own comment for why that distinction matters.
+  if (!tableColumns(db, "tclk_market_frames").has("posted_at")) {
+    db.exec(`ALTER TABLE tclk_market_frames ADD COLUMN posted_at TEXT`);
+  }
 }
 
 // -- room cursors --------------------------------------------------------------
@@ -147,15 +163,22 @@ export interface StoredFrame {
   contract_id: string | null;
   offer_id: string | null;
   frame_json: string;
+  /** ISO timestamp of when the room message carrying this frame was actually
+   * posted (the room's own `ts`, or our own post time for a frame we just
+   * sent) -- what worker.ts's fold uses as `nowMs` for THIS frame's
+   * `applyFrame` guards, instead of the moment it happens to be re-folded.
+   * Null only for rows written before this column existed (see the additive
+   * migration in migrate()); those fall back to the current clock. */
+  posted_at: string | null;
 }
 
 /** Insert-or-ignore: a frame already stored for this (room, seq) is never
  * overwritten -- (room, seq) is a stable, unique identity for one message. */
 export function storeFrame(db: TclkMarketDb, frame: StoredFrame): void {
   db.prepare(
-    `INSERT OR IGNORE INTO tclk_market_frames (room, seq, from_did, frame_type, contract_id, offer_id, frame_json, received_at)
-     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-  ).run(frame.room, frame.seq, frame.from_did, frame.frame_type, frame.contract_id, frame.offer_id, frame.frame_json, new Date().toISOString());
+    `INSERT OR IGNORE INTO tclk_market_frames (room, seq, from_did, frame_type, contract_id, offer_id, frame_json, received_at, posted_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+  ).run(frame.room, frame.seq, frame.from_did, frame.frame_type, frame.contract_id, frame.offer_id, frame.frame_json, new Date().toISOString(), frame.posted_at);
 }
 
 export function framesForContract(db: TclkMarketDb, contractId: string): StoredFrame[] {
