@@ -150,6 +150,13 @@ async function generateValidatedCandidate(
     const shape = checkShape(sanitized);
     const repetition = checkRepetition(sanitized, ownRecentMessages, repetitionThreshold);
 
+    // TEMP DEBUG -- remove after diagnosing the persistent repetition=1.00.
+    console.log("=== DEBUG sanitized candidate ===\n" + sanitized);
+    console.log("=== DEBUG ownRecentMessages.length ===", ownRecentMessages.length);
+    if (repetition.matchedIndex !== undefined) {
+      console.log("=== DEBUG matched recent message [" + repetition.matchedIndex + "] ===\n" + ownRecentMessages[repetition.matchedIndex]);
+    }
+
     logEvent("quality", { repetition: repetition.maxScore.toFixed(2) });
     for (const reason of shape.reasons) logEvent("quality", { issue: reason });
 
