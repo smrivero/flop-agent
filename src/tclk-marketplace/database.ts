@@ -136,6 +136,14 @@ function migrate(db: TclkMarketDb): void {
   if (!tableColumns(db, "tclk_market_frames").has("posted_at")) {
     db.exec(`ALTER TABLE tclk_market_frames ADD COLUMN posted_at TEXT`);
   }
+  // Backfill rows written before the column existed: `posted_at IS NULL`
+  // would otherwise keep falling back to Date.now() in loadContractFrames
+  // forever, for exactly the frames this migration exists to fix.
+  // `received_at` (when THIS worker first stored the frame locally) is at
+  // worst a few seconds/minutes later than the frame's real room `ts` --
+  // close enough that it still falls safely inside any deadline that was
+  // only actually violated by hours of real time passing since.
+  db.exec(`UPDATE tclk_market_frames SET posted_at = received_at WHERE posted_at IS NULL`);
 }
 
 // -- room cursors --------------------------------------------------------------
