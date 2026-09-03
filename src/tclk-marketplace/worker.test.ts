@@ -17,10 +17,11 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { dealRoom, encodeFrame, generateHashLock, makeAccept, makeOffer, type LockFrame, type RevealFrame } from "@flop-labs/tclk";
+import { applyFrame, dealRoom, encodeFrame, generateHashLock, lockTerms, makeAccept, makeOffer, openContract, PaperRail, type LockFrame, type RevealFrame } from "@flop-labs/tclk";
 import { TechnocoreClient } from "../technocore.js";
 import { FakeTechnocore, makeTestIdentity } from "../tclk/testUtils.js";
 import { openSecretStore } from "../tclk/secretStore.js";
+import { technocoreNoteStore } from "../tclk/noteStore.js";
 import type { TclkMarketConfig } from "./config.js";
 import {
   closeExpiredPublishedOffers,
@@ -591,6 +592,76 @@ test("a contract accepted but never locked past refundAfterMs is cancelled, not 
   await runTick({ db, secretDb, client, config, identity: payer });
   const roomViewAfter = await client.readRoom(roomName);
   assert.equal(roomViewAfter.messages.filter((m) => m.text.includes('"type":"cancel"')).length, 1);
+
+  db.close();
+  secretDb.close();
+});
+
+// Regression, the actual production case: dozens of `locked` contracts past
+// their own refundAfterMs (payee never revealed) were STILL stuck, because
+// the "skip the read" fix above only covered `cancel` (accepted, never
+// locked) -- `refund` (locked, past the window) went through the same
+// deal-room read first and hit the exact same rate limit on every attempt.
+test("a contract locked but never revealed past refundAfterMs is refunded without re-reading the deal room first", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+
+  const longAgo = Date.now() - 6 * 60 * 60 * 1000; // 6 hours ago
+  const offer = makeOffer({
+    from: payer.did, role: "payer", lock: "hash", amount: "1", asset: "PAPER", rails: ["paper"],
+    claimByMs: longAgo + 60_000, refundAfterMs: longAgo + 120_000, expiresMs: longAgo + 30_000,
+    job: { proto: "echo", id: "job-locked-never-revealed" },
+  });
+  const lock = generateHashLock();
+  const accept = makeAccept(offer, { from: payee.did, statement: lock.hash });
+  const lockFrame: LockFrame = { type: "lock", from: payer.did, contract: accept.contract, rail: "paper", ref: accept.contract };
+
+  const offerMsg = server.postSigned(OFFER_ROOM, payer, encodeFrame(offer));
+  const acceptMsg = server.postSigned(OFFER_ROOM, payee, encodeFrame(accept));
+  const roomName = dealRoom(accept.contract);
+  const lockMsg = server.postSigned(roomName, payer, encodeFrame(lockFrame));
+
+  // Really lock via PaperRail (not just the frame) -- doRefund calls
+  // rail.refund(), which needs a real paper record to exist. Locked using a
+  // clock reading `longAgo` (when it actually happened, still inside the
+  // window) -- PaperRail itself refuses to lock into an already-open refund
+  // window, and real "now" is hours past this offer's refundAfterMs.
+  const acceptedState = applyFrame(openContract(offer), accept, longAgo).state;
+  const setupRail = new PaperRail(technocoreNoteStore(client), () => longAgo + 15_000);
+  await setupRail.lock(lockTerms(acceptedState));
+
+  const dbPath = tempPath("locked-never-revealed.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  const validAt = new Date(longAgo + 10_000).toISOString();
+  storeFrame(db, { room: OFFER_ROOM, seq: offerMsg.seq, from_did: payer.did, frame_type: "offer", contract_id: null, offer_id: offer.id, frame_json: JSON.stringify(offer), posted_at: validAt });
+  storeFrame(db, { room: OFFER_ROOM, seq: acceptMsg.seq, from_did: payee.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: validAt });
+  storeFrame(db, { room: roomName, seq: lockMsg.seq, from_did: payer.did, frame_type: "lock", contract_id: accept.contract, offer_id: null, frame_json: JSON.stringify(lockFrame), posted_at: validAt });
+  // NOTE: deliberately no reveal frame -- the payee never showed up.
+  insertContract(db, {
+    contract_id: accept.contract, offer_id: offer.id, role: "payer", payer_did: payer.did, payee_did: payee.did,
+    asset: offer.asset, amount: offer.amount, rail: "paper", job_proto: "echo", job_id: "job-locked-never-revealed",
+    deal_room: roomName, cached_status: "locked", claim_by_ms: offer.claimByMs, refund_after_ms: offer.refundAfterMs,
+    expires_ms: offer.expiresMs, secret_fingerprint: null,
+  });
+  setRoomCursor(db, OFFER_ROOM, acceptMsg.seq);
+  // Deliberately NOT setting the deal-room cursor -- if the fix regresses and
+  // this contract goes through the network-read path again, `since=0` there
+  // would still succeed against the fake server (it doesn't rate-limit), so
+  // this test wouldn't distinguish the two paths by pass/fail alone -- the
+  // `contractsAdvanced`/no-network-call intent is documented, not re-asserted
+  // here beyond the end state, which is the same either way for a well-behaved read.
+
+  const secretDb = openSecretStore(tempPath("secrets-locked-never-revealed.sqlite3"));
+  const config = baseConfig({ dbPath });
+
+  const summary = await runTick({ db, secretDb, client, config, identity: payer });
+  assert.equal(summary.errors, 0);
+  assert.equal(getContract(db, accept.contract)?.cached_status, "refunded");
+
+  const roomView = await client.readRoom(roomName);
+  assert.equal(roomView.messages.filter((m) => m.text.includes('"type":"refund"')).length, 1);
 
   db.close();
   secretDb.close();

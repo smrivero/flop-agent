@@ -492,24 +492,32 @@ async function advanceOneContract(ctx: TclkMarketWorkerContext, row: TclkMarketC
   const now = (ctx.now ?? Date.now)();
 
   // Check purely from what's ALREADY cached locally, before touching the
-  // network. If this alone already says "cancel" (accepted, past
-  // refundAfterMs, never locked), there's no need to re-read the deal room
-  // first: nothing fresh could make a lock retroactively valid, and a room
-  // that's been silent for hours doesn't need re-reading to find that out.
+  // network. `cancel` (accepted, past refundAfterMs, never locked) and
+  // `refund` (locked, past refundAfterMs) are both "the deadline has passed"
+  // decisions -- a fresh read only matters if the OTHER party revealed in
+  // the meantime, and both the rail (PaperRail's own "refund on a claimed
+  // record" guard) and the tclk state machine itself (any party's fold
+  // rejects a refund/cancel frame once a reveal made the real status
+  // "claimed") already protect against acting on stale data if that race
+  // happens -- worst case one wasted, harmlessly-rejected frame, same as any
+  // other duplicate/racing frame this codebase already tolerates. So neither
+  // action needs to wait on a fresh read first.
   // Regression: with dozens of contracts stuck exactly this way, the read
   // this skips was hitting the room's rate limit on every single attempt,
-  // which blocked `cancel` from ever running -- see dealManager.ts / the
-  // ADVANCE_CONTRACT_PACING_MS note above for the rest of that story.
+  // which blocked `cancel`/`refund` from ever running -- see dealManager.ts /
+  // the ADVANCE_CONTRACT_PACING_MS note above for the rest of that story.
   const localState = foldFromStore(db, row.offer_id, row.contract_id);
   const localAction = planContractAction(localState, row.role, now, row.receipted === 1);
-  if (localAction.kind === "cancel") {
+  if (localAction.kind === "cancel" || localAction.kind === "refund") {
     summary.contractsAdvanced++;
-    log.info("[DEAL][STATE]", { contract: row.contract_id, role: row.role, status: localState.status, action: "cancel", reason: "skipped deal-room re-read -- already determined locally" });
+    log.info("[DEAL][STATE]", { contract: row.contract_id, role: row.role, status: localState.status, action: localAction.kind, reason: "skipped deal-room re-read -- already determined locally" });
     if (ctx.config.dryRun) {
-      log.info("[DEAL][DRY_RUN]", { contract: row.contract_id, would: "cancel" });
+      log.info("[DEAL][DRY_RUN]", { contract: row.contract_id, would: localAction.kind });
       return;
     }
-    await doCancel(ctx, row, log);
+    const rail = ctx.rail ?? new PaperRail(technocoreNoteStore(client));
+    if (localAction.kind === "cancel") await doCancel(ctx, row, log);
+    else await doRefund(ctx, row, localState, rail, log);
     return;
   }
 
