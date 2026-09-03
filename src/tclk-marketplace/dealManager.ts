@@ -19,6 +19,7 @@ export type ContractAction =
   | { kind: "none"; reason: string }
   | { kind: "lock" }
   | { kind: "refund" }
+  | { kind: "cancel" }
   | { kind: "work_and_reveal" }
   | { kind: "receipt"; outcome: "claimed" | "refunded" | "cancelled" };
 
@@ -28,6 +29,14 @@ export function planContractAction(state: ContractState, role: "payer" | "payee"
       return { kind: "none", reason: role === "payer" ? "waiting for accept" : "not accepted yet" };
 
     case "accepted":
+      // Never locked before the deal's own refund window opened -- PaperRail
+      // (and any real rail) correctly REFUSES to lock into an already-open
+      // refund window, so retrying `lock` here forever produced nothing but
+      // an endless stream of identical errors for a contract that can never
+      // progress. tclk/1 allows `cancel` from `accepted` by either party
+      // (SPEC.md §4) -- that's the actual terminal state for "the payer
+      // never showed up in time", not an infinite retry loop.
+      if (nowMs >= state.offer.refundAfterMs) return { kind: "cancel" };
       if (role === "payer") return { kind: "lock" };
       return { kind: "none", reason: "waiting for the payer to lock" };
 

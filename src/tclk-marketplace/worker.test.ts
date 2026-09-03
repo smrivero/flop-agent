@@ -535,3 +535,63 @@ test("closeExpiredPublishedOffers: an offer past its own expiresMs stops countin
 
   db.close();
 });
+
+// Regression: a real deployment kept retrying `lock` every ~15s, forever, for
+// any contract that stayed "accepted" past its own refundAfterMs without
+// ever getting locked -- PaperRail correctly refuses to lock into an
+// already-open refund window, producing ~12,000 identical errors in a couple
+// hours and a permanently-growing backlog. This reproduces the exact shape
+// (accepted, refundAfterMs already passed, never locked) end to end through
+// runTclkMarketTick and confirms it now cancels instead of erroring forever.
+test("a contract accepted but never locked past refundAfterMs is cancelled, not retried as a failing lock forever", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+
+  const longAgo = Date.now() - 6 * 60 * 60 * 1000; // 6 hours ago
+  const offer = makeOffer({
+    from: payer.did, role: "payer", lock: "hash", amount: "1", asset: "PAPER", rails: ["paper"],
+    claimByMs: longAgo + 60_000, refundAfterMs: longAgo + 120_000, expiresMs: longAgo + 30_000,
+    job: { proto: "echo", id: "job-never-locked" },
+  });
+  const lock = generateHashLock();
+  const accept = makeAccept(offer, { from: payee.did, statement: lock.hash });
+
+  const offerMsg = server.postSigned(OFFER_ROOM, payer, encodeFrame(offer));
+  const acceptMsg = server.postSigned(OFFER_ROOM, payee, encodeFrame(accept));
+
+  const dbPath = tempPath("never-locked.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  const validAt = new Date(longAgo + 10_000).toISOString(); // inside every deadline above
+  storeFrame(db, { room: OFFER_ROOM, seq: offerMsg.seq, from_did: payer.did, frame_type: "offer", contract_id: null, offer_id: offer.id, frame_json: JSON.stringify(offer), posted_at: validAt });
+  storeFrame(db, { room: OFFER_ROOM, seq: acceptMsg.seq, from_did: payee.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: validAt });
+  // NOTE: deliberately no lock frame -- this is the "payer never showed up" case.
+  const roomName = dealRoom(accept.contract);
+  insertContract(db, {
+    contract_id: accept.contract, offer_id: offer.id, role: "payer", payer_did: payer.did, payee_did: payee.did,
+    asset: offer.asset, amount: offer.amount, rail: null, job_proto: "echo", job_id: "job-never-locked",
+    deal_room: roomName, cached_status: "accepted", claim_by_ms: offer.claimByMs, refund_after_ms: offer.refundAfterMs,
+    expires_ms: offer.expiresMs, secret_fingerprint: null,
+  });
+  setRoomCursor(db, OFFER_ROOM, acceptMsg.seq);
+
+  const secretDb = openSecretStore(tempPath("secrets-never-locked.sqlite3"));
+  const config = baseConfig({ dbPath });
+
+  const summary = await runTick({ db, secretDb, client, config, identity: payer });
+  assert.equal(summary.errors, 0); // no repeated "refusing to lock" failure
+  assert.equal(getContract(db, accept.contract)?.cached_status, "cancelled");
+
+  const roomView = await client.readRoom(roomName);
+  const cancelFrames = roomView.messages.filter((m) => m.text.includes('"type":"cancel"'));
+  assert.equal(cancelFrames.length, 1);
+
+  // A second tick must not post a second cancel -- the fold now sees "cancelled".
+  await runTick({ db, secretDb, client, config, identity: payer });
+  const roomViewAfter = await client.readRoom(roomName);
+  assert.equal(roomViewAfter.messages.filter((m) => m.text.includes('"type":"cancel"')).length, 1);
+
+  db.close();
+  secretDb.close();
+});

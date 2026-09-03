@@ -32,7 +32,7 @@ import {
 } from "@flop-labs/tclk";
 import type { TechnocoreClient } from "../technocore.js";
 import type { TechnocoreIdentity } from "../identity.js";
-import { buildLockFrame, buildReceiptFrame, buildRefundFrame, buildRevealFrame, postFrame } from "../tclk/frames.js";
+import { buildCancelFrame, buildLockFrame, buildReceiptFrame, buildRefundFrame, buildRevealFrame, postFrame } from "../tclk/frames.js";
 import { getPreimage, storePreimage, type SecretDb } from "../tclk/secretStore.js";
 import { technocoreNoteStore } from "../tclk/noteStore.js";
 import type { TclkMarketConfig } from "./config.js";
@@ -499,6 +499,8 @@ async function advanceOneContract(ctx: TclkMarketWorkerContext, row: TclkMarketC
     await doLock(ctx, row, state, rail, log);
   } else if (action.kind === "refund") {
     await doRefund(ctx, row, state, rail, log);
+  } else if (action.kind === "cancel") {
+    await doCancel(ctx, row, log);
   } else if (action.kind === "work_and_reveal") {
     await doWorkAndReveal(ctx, row, state, rail, log);
   } else if (action.kind === "receipt") {
@@ -520,6 +522,19 @@ async function doLock(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow, 
   storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "lock", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame), posted_at: new Date().toISOString() });
   updateContractCache(db, row.contract_id, { cachedStatus: "locked", rail: config.rail });
   log.info("[LOCK][POSTED]", { contract: row.contract_id, room: row.deal_room, seq: posted.seq });
+}
+
+/** Never locked before the deal's own refund window opened -- no rail
+ * interaction (nothing was ever locked, so there's nothing to reclaim), just
+ * the coordination frame. Either party may post it (SPEC.md §4); whichever
+ * side's tick gets there first does. */
+async function doCancel(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow, log: TclkMarketLogger): Promise<void> {
+  const { db, client, config, identity } = ctx;
+  const frame = buildCancelFrame({ from: identity.did, contract: row.contract_id, reason: "never locked before refundAfterMs" });
+  const posted = await postFrame(client, row.deal_room, frame, identity);
+  storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "cancel", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame), posted_at: new Date().toISOString() });
+  updateContractCache(db, row.contract_id, { cachedStatus: "cancelled" });
+  log.info("[CANCEL][POSTED]", { contract: row.contract_id, room: row.deal_room, seq: posted.seq });
 }
 
 async function doRefund(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow, state: ContractState, rail: PaperRail, log: TclkMarketLogger): Promise<void> {
