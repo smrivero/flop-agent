@@ -506,7 +506,24 @@ async function advanceOneContract(ctx: TclkMarketWorkerContext, row: TclkMarketC
   // this skips was hitting the room's rate limit on every single attempt,
   // which blocked `cancel`/`refund` from ever running -- see dealManager.ts /
   // the ADVANCE_CONTRACT_PACING_MS note above for the rest of that story.
-  const localState = foldFromStore(db, row.offer_id, row.contract_id);
+  //
+  // A SEPARATE regression this also guards: `foldFromStore` throws if this
+  // contract's own offer frame was never cached locally (a handful of rows
+  // from an earlier bug -- since fixed -- ended up missing it). That throw
+  // used to escape uncaught right here, which (for a contract this broken)
+  // meant falling through to the SAME network read below on every single
+  // tick forever, for a contract no read could ever fix (the missing piece
+  // isn't in the deal room, it's the ORIGINAL offer). Caught here instead:
+  // logged once as unrecoverable, zero network calls spent on it again.
+  let localState: ContractState;
+  try {
+    localState = foldFromStore(db, row.offer_id, row.contract_id);
+  } catch (err) {
+    log.info("[ERROR]", { stage: "fold_local", contract: row.contract_id, error: err instanceof Error ? err.message : String(err), note: "unrecoverable locally -- offer frame missing, no network read will fix this" });
+    incrementErrorCounter(db);
+    summary.errors++;
+    return;
+  }
   const localAction = planContractAction(localState, row.role, now, row.receipted === 1);
   if (localAction.kind === "cancel" || localAction.kind === "refund") {
     summary.contractsAdvanced++;

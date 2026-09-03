@@ -666,3 +666,52 @@ test("a contract locked but never revealed past refundAfterMs is refunded withou
   db.close();
   secretDb.close();
 });
+
+// Regression: a handful of real contracts ended up with an accept frame
+// cached but no matching offer frame (fallout from an earlier bug, since
+// fixed elsewhere). foldFromStore throws for these -- uncaught, that
+// exception used to escape straight past the local-only cancel/refund check
+// above and fall through to the SAME deal-room network read every contract
+// already hits, for a contract no read could ever fix (the missing piece
+// isn't in the deal room). This asserts it's caught, logged once, and costs
+// zero network calls -- not an infinite retry loop.
+test("a contract missing its own offer frame locally is logged as unrecoverable, without ever touching the network", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+
+  const offer = makeOffer({
+    from: payer.did, role: "payer", lock: "hash", amount: "1", asset: "PAPER", rails: ["paper"],
+    claimByMs: Date.now() + 60_000, refundAfterMs: Date.now() + 120_000, expiresMs: Date.now() + 30_000,
+    job: { proto: "echo", id: "job-missing-offer" },
+  });
+  const lock = generateHashLock();
+  const accept = makeAccept(offer, { from: payee.did, statement: lock.hash });
+  // NOTE: the offer itself is deliberately never posted/stored -- only the accept is.
+  const acceptMsg = server.postSigned(OFFER_ROOM, payee, encodeFrame(accept));
+
+  const dbPath = tempPath("missing-offer.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  storeFrame(db, { room: OFFER_ROOM, seq: acceptMsg.seq, from_did: payee.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: new Date().toISOString() });
+  const roomName = dealRoom(accept.contract);
+  insertContract(db, {
+    contract_id: accept.contract, offer_id: offer.id, role: "payer", payer_did: payer.did, payee_did: payee.did,
+    asset: offer.asset, amount: offer.amount, rail: null, job_proto: "echo", job_id: "job-missing-offer",
+    deal_room: roomName, cached_status: "accepted", claim_by_ms: offer.claimByMs, refund_after_ms: offer.refundAfterMs,
+    expires_ms: offer.expiresMs, secret_fingerprint: null,
+  });
+  setRoomCursor(db, OFFER_ROOM, acceptMsg.seq);
+
+  const secretDb = openSecretStore(tempPath("secrets-missing-offer.sqlite3"));
+  const config = baseConfig({ dbPath });
+
+  const summary = await runTick({ db, secretDb, client, config, identity: payer });
+  assert.equal(summary.errors, 1); // logged, not silently swallowed
+
+  const roomView = await client.readRoom(roomName);
+  assert.equal(roomView.count, 0); // never touched the deal room at all
+
+  db.close();
+  secretDb.close();
+});
