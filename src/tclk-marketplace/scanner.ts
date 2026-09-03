@@ -30,8 +30,23 @@ export interface VerifiedFrameMessage {
 }
 
 function isRetryable(err: unknown): boolean {
-  if (err instanceof TechnocoreError) return err.status !== undefined && err.status >= 500;
+  // 429 (rate limited) is deliberately retryable, same as a 5xx -- the server
+  // is telling us to slow down, not that the request itself is wrong.
+  // Regression: treating 429 as non-retryable meant every read behind a rate
+  // limit failed on the very first attempt, permanently blocking that
+  // contract's `planContractAction` (including the `cancel` fix for a stale
+  // deal -- see dealManager.ts) from ever running that tick.
+  if (err instanceof TechnocoreError) return err.status !== undefined && (err.status === 429 || err.status >= 500);
   return true;
+}
+
+/** `Retry-After` (seconds) when the server sent one (always true for a real
+ * 429), else the same exponential schedule already used for 5xx. */
+function backoffMs(err: unknown, attempt: number): number {
+  if (err instanceof TechnocoreError && err.retryAfterSeconds !== undefined) {
+    return err.retryAfterSeconds * 1000;
+  }
+  return 300 * 2 ** attempt;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -72,7 +87,7 @@ export async function scanRoomForFrames(
     } catch (err) {
       lastError = err;
       if (!isRetryable(err) || attempt >= options.maxRetries) throw err;
-      await sleep(300 * 2 ** attempt);
+      await sleep(backoffMs(err, attempt));
     }
   }
   throw lastError; // unreachable in practice
