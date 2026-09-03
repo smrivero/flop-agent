@@ -464,7 +464,7 @@ async function handleAcceptFrame(ctx: TclkMarketWorkerContext, accept: AcceptFra
  * makes it worse); spacing the requests out is the actual fix. Only pauses
  * BETWEEN contracts (never before the first, never after the last), so a
  * tick with few open contracts is unaffected. */
-const ADVANCE_CONTRACT_PACING_MS = 250;
+const ADVANCE_CONTRACT_PACING_MS = 2000;
 
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
