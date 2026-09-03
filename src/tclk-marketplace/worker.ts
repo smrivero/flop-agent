@@ -491,6 +491,28 @@ async function advanceOneContract(ctx: TclkMarketWorkerContext, row: TclkMarketC
   const { db, client, config, log } = ctx;
   const now = (ctx.now ?? Date.now)();
 
+  // Check purely from what's ALREADY cached locally, before touching the
+  // network. If this alone already says "cancel" (accepted, past
+  // refundAfterMs, never locked), there's no need to re-read the deal room
+  // first: nothing fresh could make a lock retroactively valid, and a room
+  // that's been silent for hours doesn't need re-reading to find that out.
+  // Regression: with dozens of contracts stuck exactly this way, the read
+  // this skips was hitting the room's rate limit on every single attempt,
+  // which blocked `cancel` from ever running -- see dealManager.ts / the
+  // ADVANCE_CONTRACT_PACING_MS note above for the rest of that story.
+  const localState = foldFromStore(db, row.offer_id, row.contract_id);
+  const localAction = planContractAction(localState, row.role, now, row.receipted === 1);
+  if (localAction.kind === "cancel") {
+    summary.contractsAdvanced++;
+    log.info("[DEAL][STATE]", { contract: row.contract_id, role: row.role, status: localState.status, action: "cancel", reason: "skipped deal-room re-read -- already determined locally" });
+    if (ctx.config.dryRun) {
+      log.info("[DEAL][DRY_RUN]", { contract: row.contract_id, would: "cancel" });
+      return;
+    }
+    await doCancel(ctx, row, log);
+    return;
+  }
+
   const since = getRoomCursor(db, row.deal_room);
   const result = await scanRoomForFrames(client, row.deal_room, since, { waitSeconds: 0, maxRetries: config.maxRetries });
   for (const m of result.frames) storeFrame(db, toFrameRow(row.deal_room, m));
