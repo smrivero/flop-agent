@@ -127,7 +127,7 @@ async function generateValidatedCandidate(
   generate: (params: GenerateTurnInput) => Promise<GenerateTurnOutput>,
   instructions: string,
   baseInput: string,
-  ownRecentMessages: string[],
+  recentMessagesForSimilarity: string[],
   repetitionThreshold: number,
   maxMessageChars: number,
   allowSkipTurn: boolean,
@@ -148,7 +148,7 @@ async function generateValidatedCandidate(
 
     const sanitized = sanitizeDebateMessage(split.message, maxMessageChars);
     const shape = checkShape(sanitized);
-    const repetition = checkRepetition(sanitized, ownRecentMessages, repetitionThreshold);
+    const repetition = checkRepetition(sanitized, recentMessagesForSimilarity, repetitionThreshold);
 
     logEvent("quality", { repetition: repetition.maxScore.toFixed(2) });
     for (const reason of shape.reasons) logEvent("quality", { issue: reason });
@@ -193,10 +193,14 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
   }
 
   const recent = mostRecentTurns(turns, config.historyMessages);
-  const ownRecentMessages = turns
-    .filter((t) => t.agentId === speakerId)
-    .slice(-config.recentMessagesForSimilarity)
-    .map((t) => t.text);
+  // Regression: this used to filter to `t.agentId === speakerId`, so the
+  // repetition check only ever compared a candidate against the SAME
+  // speaker's own history -- it could never catch one agent verbatim-copying
+  // whatever the OTHER agent just said (seq 585 duplicated seq 584 word for
+  // word). "Don't just restate what's already been said in this
+  // conversation" applies to either speaker's recent text, so the window is
+  // no longer filtered by agent.
+  const recentMessagesForSimilarity = mostRecentTurns(turns, config.recentMessagesForSimilarity).map((t) => t.text);
 
   const generate = deps.generate ?? ((params: GenerateTurnInput) => runtime.inferenceProvider.generateTurn(params));
 
@@ -231,7 +235,7 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
     generate,
     instructions,
     baseInput,
-    ownRecentMessages,
+    recentMessagesForSimilarity,
     config.repetitionThreshold,
     config.maxMessageChars,
     config.allowSkipTurn,

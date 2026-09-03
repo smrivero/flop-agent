@@ -370,6 +370,35 @@ test("repetition: a candidate too similar to recent own messages triggers exactl
   assert.equal(view.count, 2); // only the two seeded messages -- nothing new published
 });
 
+// Regression: a real deployment saw Agent B post a message byte-for-byte
+// identical to Agent A's immediately preceding message. The repetition check
+// only ever compared a candidate against the SAME speaker's own history
+// (`t.agentId === speakerId`), so Agent B copying Agent A verbatim was never
+// caught -- this is the cross-speaker case the single-speaker test above
+// doesn't cover.
+test("repetition: a candidate that verbatim-copies the OPPONENT's just-posted message is also flagged, not just self-repetition", async () => {
+  const server = new FakeTechnocoreServer();
+  const runtime = buildTestRuntime({ server });
+
+  const opponentsMessage = "The Melania coin scandal proves controversial memecoins are legitimate cultural events, not just hype.";
+  server.seedMessage("d-testroom", runtime.agentA.did, opponentsMessage, 1); // next speaker is B
+
+  let generateCalls = 0;
+  const result = await runOneTurn(runtime, {
+    generate: async () => {
+      generateCalls++;
+      // Agent B's "candidate" is an exact copy of what Agent A just said.
+      return textResult(opponentsMessage);
+    },
+  });
+
+  assert.equal(generateCalls, 2); // one regeneration attempt, no more
+  assert.equal(result.outcome, "skipped");
+
+  const view = await runtime.client.readRoom("d-testroom");
+  assert.equal(view.count, 1); // only Agent A's seeded message -- the copy never got published
+});
+
 // Regression: a real deployment reused an existing room for a brand-new topic
 // (couldn't create a new one). The model kept anchoring on the OLD topic's
 // history, and the repetition check kept comparing fresh replies against it
