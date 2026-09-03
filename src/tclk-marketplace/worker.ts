@@ -454,9 +454,28 @@ async function handleAcceptFrame(ctx: TclkMarketWorkerContext, accept: AcceptFra
 
 // -- phase 2: advance every open contract's deal room ----------------------------
 
+/** A short pause between each open contract's deal-room read within one tick.
+ * Regression: with dozens of open contracts, this loop fired that many GET
+ * requests at technocore.chat back-to-back with zero pacing -- easily
+ * tripping its rate limit (429), which fails the read before
+ * `planContractAction` ever runs for that contract this tick (including the
+ * `cancel` action meant to retire a stale one -- see dealManager.ts). 429 is
+ * deliberately NOT retried by scanRoomForFrames (retrying a rate limit just
+ * makes it worse); spacing the requests out is the actual fix. Only pauses
+ * BETWEEN contracts (never before the first, never after the last), so a
+ * tick with few open contracts is unaffected. */
+const ADVANCE_CONTRACT_PACING_MS = 250;
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 async function advanceContracts(ctx: TclkMarketWorkerContext, summary: TickSummary): Promise<void> {
   const { db, log } = ctx;
-  for (const row of listOpenContracts(db)) {
+  const rows = listOpenContracts(db);
+  for (let i = 0; i < rows.length; i++) {
+    if (i > 0) await sleep(ADVANCE_CONTRACT_PACING_MS);
+    const row = rows[i];
     try {
       await advanceOneContract(ctx, row, summary);
     } catch (err) {
