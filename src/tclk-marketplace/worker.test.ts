@@ -667,6 +667,93 @@ test("a contract locked but never revealed past refundAfterMs is refunded withou
   secretDb.close();
 });
 
+// Regression, the actual production case: the local-only shortcut above
+// deliberately skips re-reading the deal room once it decides "refund"
+// locally (see advanceOneContract's own comment). If the counterparty's
+// reveal lands in the deal room AFTER that point, this side never sees it --
+// its local fold stays "locked, past refundAfterMs" forever, so it calls
+// rail.refund() every single tick, which the rail correctly refuses because
+// it already recorded the counterparty's claim ("tclk: refund on a claimed
+// record"). A real deployment saw this same handful of contract IDs produce
+// this exact error every ~4 minutes indefinitely. This asserts the rail's
+// rejection triggers a real resync (not an infinite error loop): the deal
+// room gets re-read, the reveal is picked up, and cached_status heals to
+// "claimed" -- with zero errors counted, not one logged per tick forever.
+test("a contract the local fold thinks is refundable, but the counterparty already actually claimed, resyncs instead of erroring every tick", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+
+  // Real (not backdated) timestamps: refundAfterMs is a couple seconds in
+  // the future when the deal is set up. The reveal genuinely happens before
+  // it, exactly like a real on-time counterparty -- what's simulated below
+  // is not a bad reveal, but OUR side never having read it, discovered only
+  // once evaluated "now" (injected via ctx.now, not real wall-clock time)
+  // has moved past the deadline.
+  const base = Date.now();
+  const offer = makeOffer({
+    from: payer.did, role: "payer", lock: "hash", amount: "1", asset: "PAPER", rails: ["paper"],
+    claimByMs: base + 1_000, refundAfterMs: base + 1_500, expiresMs: base + 500,
+    job: { proto: "echo", id: "job-resync" },
+  });
+  const lock = generateHashLock();
+  const accept = makeAccept(offer, { from: payee.did, statement: lock.hash });
+  const lockFrame: LockFrame = { type: "lock", from: payer.did, contract: accept.contract, rail: "paper", ref: accept.contract };
+
+  const offerMsg = server.postSigned(OFFER_ROOM, payer, encodeFrame(offer));
+  const acceptMsg = server.postSigned(OFFER_ROOM, payee, encodeFrame(accept));
+  const roomName = dealRoom(accept.contract);
+  const lockMsg = server.postSigned(roomName, payer, encodeFrame(lockFrame));
+
+  // The counterparty genuinely reveals and claims on time (real clock, well
+  // before refundAfterMs) -- both a real reveal frame in the room and a
+  // real PaperRail claim. Crucially, this side's LOCAL cache never learns
+  // about the reveal (no storeFrame for it below), simulating exactly what
+  // the local-only shortcut produces: a fold that never advances past
+  // "locked" because it stopped reading the deal room.
+  const setupRail = new PaperRail(technocoreNoteStore(client));
+  await setupRail.lock(lockTerms(applyFrame(openContract(offer), accept, base).state));
+  const revealFrame: RevealFrame = { type: "reveal", from: payee.did, contract: accept.contract, secret: lock.preimage };
+  server.postSigned(roomName, payee, encodeFrame(revealFrame));
+  await setupRail.claim(accept.contract, lock.preimage);
+
+  const dbPath = tempPath("resync-refund.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  const validAt = new Date(base).toISOString();
+  storeFrame(db, { room: OFFER_ROOM, seq: offerMsg.seq, from_did: payer.did, frame_type: "offer", contract_id: null, offer_id: offer.id, frame_json: JSON.stringify(offer), posted_at: validAt });
+  storeFrame(db, { room: OFFER_ROOM, seq: acceptMsg.seq, from_did: payee.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: validAt });
+  storeFrame(db, { room: roomName, seq: lockMsg.seq, from_did: payer.did, frame_type: "lock", contract_id: accept.contract, offer_id: null, frame_json: JSON.stringify(lockFrame), posted_at: validAt });
+  // NOTE: deliberately no reveal frame cached locally -- see comment above.
+  insertContract(db, {
+    contract_id: accept.contract, offer_id: offer.id, role: "payer", payer_did: payer.did, payee_did: payee.did,
+    asset: offer.asset, amount: offer.amount, rail: "paper", job_proto: "echo", job_id: "job-resync",
+    deal_room: roomName, cached_status: "locked", claim_by_ms: offer.claimByMs, refund_after_ms: offer.refundAfterMs,
+    expires_ms: offer.expiresMs, secret_fingerprint: null,
+  });
+  setRoomCursor(db, OFFER_ROOM, acceptMsg.seq);
+  setRoomCursor(db, roomName, lockMsg.seq); // cursor stops right before the reveal -- a real resync must move it forward
+
+  const secretDb = openSecretStore(tempPath("secrets-resync-refund.sqlite3"));
+  const config = baseConfig({ dbPath });
+  const evaluatedNow = () => base + 5_000; // well past refundAfterMs -- what makes the LOCAL (incomplete) fold call for a refund
+
+  const summary = await runTclkMarketTick({ db, secretDb, client, config, identity: payer, log: noopLog, now: evaluatedNow });
+  assert.equal(summary.errors, 0); // healed, not logged as a failure
+  assert.equal(getContract(db, accept.contract)?.cached_status, "claimed");
+
+  // A second tick, now that the local cache is healed, moves on to the
+  // payer's real next step (receipt) instead of ever calling refund again.
+  const secondSummary = await runTclkMarketTick({ db, secretDb, client, config, identity: payer, log: noopLog, now: evaluatedNow });
+  assert.equal(secondSummary.errors, 0);
+  const roomView = await client.readRoom(roomName);
+  assert.equal(roomView.messages.filter((m) => m.text.includes('"type":"refund"')).length, 0);
+  assert.equal(roomView.messages.filter((m) => m.text.includes('"type":"receipt"')).length, 1);
+
+  db.close();
+  secretDb.close();
+});
+
 // Regression: a handful of real contracts ended up with an accept frame
 // cached but no matching offer frame (fallout from an earlier bug, since
 // fixed elsewhere). foldFromStore throws for these -- uncaught, that

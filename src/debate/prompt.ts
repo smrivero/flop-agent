@@ -160,12 +160,10 @@ export function buildInput(agent: LoadedAgent, turns: DebateTurn[], memory: Deba
     parts.push(memory.recentClaims.map((c) => `- ${c}`).join("\n"));
     parts.push(
       "Do not return to an overused topic unless you have (1) genuinely new evidence, or (2) a " +
-        "direct rebuttal to something the opponent just said. Otherwise introduce another angle -- " +
-        "domestic leagues, European competitions, head-to-head, historical eras, legendary squads, " +
-        "academy, transfers, financial management, stadiums, global fanbase, individual players, " +
-        "Ballon d'Or winners, managers, tactical influence, consistency, major collapses, " +
-        "comebacks, Club World Cup, international relevance, recent seasons, or anything else that " +
-        "fits -- these are suggestions, not a fixed rotation.",
+        "direct rebuttal to something the opponent just said. Otherwise move to a DIFFERENT " +
+        "specific example, case or angle within the debate's overall topic -- if the topic spans " +
+        "multiple instances (several coins, players, companies, events, etc.), pick one that " +
+        "hasn't been discussed yet rather than restating the same one with different wording.",
     );
   }
 

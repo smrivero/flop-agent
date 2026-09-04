@@ -115,6 +115,23 @@ test("buildInput: an empty room produces an opening-message instruction, no 'rec
   assert.doesNotMatch(input, /Recent conversation/);
 });
 
+// Regression: the "overused topic" steering (shown once memory.recentClaims
+// is non-empty) used to hardcode a list of FOOTBALL-specific angles
+// ("domestic leagues", "Ballon d'Or winners", "Club World Cup", ...) as the
+// suggested way to move on. A real deployment switched the debate to
+// memecoins and kept restating the same story turn after turn -- the model
+// had no usable steering once its one well-sourced story (the Melania coin
+// scandal) got flagged as overused, since every suggested alternative angle
+// was football-only and meaningless for this topic. Fixed by making the
+// steering topic-agnostic; this locks it that way for any future topic.
+test("buildInput: 'overused topic' steering never hardcodes football-specific angles, regardless of the configured topic", () => {
+  const state = testState();
+  state.recentClaims = ["Real Madrid have won fifteen European Cups"];
+  const input = buildInput(testAgent(), [], state, "SHORT", 3500);
+  assert.match(input, /RECENTLY OVERUSED TOPICS/);
+  assert.doesNotMatch(input, /Ballon d'Or|Club World Cup|domestic leagues/i);
+});
+
 test("buildInput: a non-empty room includes the opponent's latest message for direct reply", () => {
   const state = testState();
   const turns = [

@@ -605,7 +605,33 @@ async function doCancel(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow
 
 async function doRefund(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow, state: ContractState, rail: PaperRail, log: TclkMarketLogger): Promise<void> {
   const { db, client, config, identity } = ctx;
-  await rail.refund(state.railRef ?? row.contract_id);
+  try {
+    await rail.refund(state.railRef ?? row.contract_id);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    // Regression: the local-only shortcut in advanceOneContract deliberately
+    // skips re-reading the deal room once it decides "refund" locally (see
+    // its own comment) -- but that means once the counterparty's reveal
+    // lands AFTER we've made that call, we never see it: the local fold
+    // stays "locked, past refundAfterMs" forever, and every tick calls
+    // rail.refund() again, which the rail correctly refuses ("refund on a
+    // claimed record") since it already recorded the counterparty's claim.
+    // That's not a one-shot harmless race -- it's a permanent per-tick
+    // error for as long as the contract stays "open". The rail is the
+    // source of truth here; a real re-read + re-fold heals the local cache
+    // instead of retrying the same failing refund forever.
+    if (/^tclk: refund on a (claimed|refunded) record$/.test(message)) {
+      const since = getRoomCursor(db, row.deal_room);
+      const result = await scanRoomForFrames(client, row.deal_room, since, { waitSeconds: 0, maxRetries: config.maxRetries });
+      for (const m of result.frames) storeFrame(db, toFrameRow(row.deal_room, m));
+      setRoomCursor(db, row.deal_room, result.lastSeq);
+      const resynced = foldFromStore(db, row.offer_id, row.contract_id);
+      updateContractCache(db, row.contract_id, { cachedStatus: resynced.status });
+      log.info("[REFUND][RESYNCED]", { contract: row.contract_id, was: state.status, now: resynced.status, rail_error: message });
+      return;
+    }
+    throw err;
+  }
   const frame = buildRefundFrame({ from: identity.did, contract: row.contract_id, reason: `no reveal before refundAfterMs (${state.offer.refundAfterMs})` });
   const posted = await postFrame(client, row.deal_room, frame, identity);
   storeFrame(db, { room: row.deal_room, seq: posted.seq, from_did: identity.did, frame_type: "refund", contract_id: row.contract_id, offer_id: null, frame_json: JSON.stringify(frame), posted_at: new Date().toISOString() });
