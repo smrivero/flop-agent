@@ -314,7 +314,7 @@ export function getContract(db: TclkMarketDb, contractId: string): TclkMarketCon
   return db.prepare(`SELECT * FROM tclk_market_contracts WHERE contract_id = ?`).get(contractId) as TclkMarketContractRow | undefined;
 }
 
-const TERMINAL_DONE_STATUSES = new Set(["refunded_receipted", "cancelled_receipted"]);
+const TERMINAL_DONE_STATUSES = new Set(["refunded_receipted", "cancelled_receipted", "claimed_rail_override"]);
 
 /** Every contract this worker might still need to act on: not cached as a
  * fully-done terminal status. `claimed` and `refunded`/`cancelled` still need

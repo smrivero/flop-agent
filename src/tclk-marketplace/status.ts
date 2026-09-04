@@ -42,7 +42,10 @@ export function computeStatus(db: TclkMarketDb, config: TclkMarketConfig, identi
   }[];
   const byStatus = Object.fromEntries(statusCounts.map((r) => [r.cached_status, r.n]));
   const activeDeals = (byStatus["accepted"] ?? 0) + (byStatus["locked"] ?? 0);
-  const claimedDeals = (byStatus["claimed"] ?? 0) + (byStatus["claimed_receipted"] ?? 0);
+  // "claimed_rail_override": the rail recorded the counterparty's claim after
+  // this offer's own refundAfterMs had passed (see worker.ts's doRefund) --
+  // functionally a claimed deal, just one this side couldn't refund out of.
+  const claimedDeals = (byStatus["claimed"] ?? 0) + (byStatus["claimed_receipted"] ?? 0) + (byStatus["claimed_rail_override"] ?? 0);
   const refundedDeals = (byStatus["refunded"] ?? 0) + (byStatus["refunded_receipted"] ?? 0);
   const cancelledDeals = (byStatus["cancelled"] ?? 0) + (byStatus["cancelled_receipted"] ?? 0);
 

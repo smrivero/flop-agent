@@ -754,6 +754,91 @@ test("a contract the local fold thinks is refundable, but the counterparty alrea
   secretDb.close();
 });
 
+// Regression, the actual production case behind the resync test above:
+// resync isn't always a full fix. `refundAfterMs` is anchored to OFFER
+// CREATION time (see publisher.ts), not accept/lock -- an offer that sits
+// unaccepted on the public marketplace for a while can have its own absolute
+// deadline elapse even though the deal itself (once finally accepted) moves
+// fast. A real deployment saw exactly this: lock and reveal only ~12 minutes
+// apart, both perfectly normal, yet the reveal still landed after this
+// specific offer's refundAfterMs. A genuine resync (previous test) correctly
+// reports this fold as still "locked" -- the reveal really is too late by
+// protocol rules -- but the rail already recorded the counterparty's claim
+// regardless. Retrying refund forever after that point is pure noise for a
+// race that's already settled at the rail; this asserts it's accepted once
+// instead, marked with a distinct status, and never touched again.
+test("a reveal that genuinely lands after this offer's own refundAfterMs (offer sat unaccepted a while, deal itself was fast) is accepted from the rail instead of retried forever", async () => {
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const payer = makeTestIdentity();
+  const payee = makeTestIdentity();
+
+  // refundAfterMs is safely in the past relative to real "now" -- modeling
+  // an offer whose absolute deadline had already elapsed by the time it was
+  // finally accepted and worked, even though the deal's own internal pace
+  // (accept -> lock -> reveal) was fast.
+  const past = Date.now() - 5_000;
+  const offer = makeOffer({
+    from: payer.did, role: "payer", lock: "hash", amount: "1", asset: "PAPER", rails: ["paper"],
+    claimByMs: past + 1_000, refundAfterMs: past + 1_500, expiresMs: past + 500,
+    job: { proto: "echo", id: "job-late-claim" },
+  });
+  const lock = generateHashLock();
+  const accept = makeAccept(offer, { from: payee.did, statement: lock.hash });
+  const lockFrame: LockFrame = { type: "lock", from: payer.did, contract: accept.contract, rail: "paper", ref: accept.contract };
+
+  const offerMsg = server.postSigned(OFFER_ROOM, payer, encodeFrame(offer));
+  const acceptMsg = server.postSigned(OFFER_ROOM, payee, encodeFrame(accept));
+  const roomName = dealRoom(accept.contract);
+  const lockMsg = server.postSigned(roomName, payer, encodeFrame(lockFrame));
+
+  // The counterparty's own rail-side claim succeeds (their clock reads just
+  // before refundAfterMs) even though the REVEAL FRAME, posted moments
+  // later at the real wall-clock "now", lands after refundAfterMs -- this
+  // models the observed production case, not a malformed/adversarial one.
+  const setupRail = new PaperRail(technocoreNoteStore(client), () => past + 1_200);
+  await setupRail.lock(lockTerms(applyFrame(openContract(offer), accept, past).state));
+  const revealFrame: RevealFrame = { type: "reveal", from: payee.did, contract: accept.contract, secret: lock.preimage };
+  server.postSigned(roomName, payee, encodeFrame(revealFrame)); // real "now" -- after refundAfterMs
+  await setupRail.claim(accept.contract, lock.preimage);
+
+  const dbPath = tempPath("late-claim.sqlite3");
+  const db = openTclkMarketDatabase(dbPath);
+  const validAt = new Date(past + 100).toISOString();
+  storeFrame(db, { room: OFFER_ROOM, seq: offerMsg.seq, from_did: payer.did, frame_type: "offer", contract_id: null, offer_id: offer.id, frame_json: JSON.stringify(offer), posted_at: validAt });
+  storeFrame(db, { room: OFFER_ROOM, seq: acceptMsg.seq, from_did: payee.did, frame_type: "accept", contract_id: accept.contract, offer_id: accept.ref, frame_json: JSON.stringify(accept), posted_at: validAt });
+  storeFrame(db, { room: roomName, seq: lockMsg.seq, from_did: payer.did, frame_type: "lock", contract_id: accept.contract, offer_id: null, frame_json: JSON.stringify(lockFrame), posted_at: validAt });
+  // NOTE: deliberately no reveal frame cached locally -- see the resync test above.
+  insertContract(db, {
+    contract_id: accept.contract, offer_id: offer.id, role: "payer", payer_did: payer.did, payee_did: payee.did,
+    asset: offer.asset, amount: offer.amount, rail: "paper", job_proto: "echo", job_id: "job-late-claim",
+    deal_room: roomName, cached_status: "locked", claim_by_ms: offer.claimByMs, refund_after_ms: offer.refundAfterMs,
+    expires_ms: offer.expiresMs, secret_fingerprint: null,
+  });
+  setRoomCursor(db, OFFER_ROOM, acceptMsg.seq);
+  setRoomCursor(db, roomName, lockMsg.seq);
+
+  const secretDb = openSecretStore(tempPath("secrets-late-claim.sqlite3"));
+  const config = baseConfig({ dbPath });
+
+  const summary = await runTick({ db, secretDb, client, config, identity: payer });
+  assert.equal(summary.errors, 0);
+  assert.equal(getContract(db, accept.contract)?.cached_status, "claimed_rail_override");
+  assert.equal(getContract(db, accept.contract)?.receipted, 1);
+
+  // Never retried again -- the row drops out of listOpenContracts entirely.
+  assert.equal(
+    listOpenContracts(db).some((r) => r.contract_id === accept.contract),
+    false,
+  );
+  const secondSummary = await runTick({ db, secretDb, client, config, identity: payer });
+  assert.equal(secondSummary.errors, 0);
+  assert.equal(secondSummary.contractsAdvanced, 0);
+
+  db.close();
+  secretDb.close();
+});
+
 // Regression: a handful of real contracts ended up with an accept frame
 // cached but no matching offer frame (fallout from an earlier bug, since
 // fixed elsewhere). foldFromStore throws for these -- uncaught, that

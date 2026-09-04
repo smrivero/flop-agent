@@ -626,8 +626,31 @@ async function doRefund(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow
       for (const m of result.frames) storeFrame(db, toFrameRow(row.deal_room, m));
       setRoomCursor(db, row.deal_room, result.lastSeq);
       const resynced = foldFromStore(db, row.offer_id, row.contract_id);
-      updateContractCache(db, row.contract_id, { cachedStatus: resynced.status });
-      log.info("[REFUND][RESYNCED]", { contract: row.contract_id, was: state.status, now: resynced.status, rail_error: message });
+      if (resynced.status === "claimed" || resynced.status === "refunded" || resynced.status === "cancelled") {
+        updateContractCache(db, row.contract_id, { cachedStatus: resynced.status });
+        log.info("[REFUND][RESYNCED]", { contract: row.contract_id, was: state.status, now: resynced.status, rail_error: message });
+        return;
+      }
+      // Even a genuine, fresh re-read still folds to "locked" here -- this
+      // isn't a stale-cache problem after all. refundAfterMs is anchored to
+      // OFFER creation (see publisher.ts), not to accept/lock -- an offer
+      // that sits unaccepted for a while can legitimately have its deal
+      // (accept -> lock -> reveal) complete quickly while still landing
+      // after that absolute deadline. The counterparty's reveal is genuinely
+      // in the room, just too late for our own strict fold to accept -- yet
+      // the rail (the actual ledger for what happened to the funds) already
+      // recorded their claim. There is nothing further to do: we can't force
+      // a refund the rail refuses, and retrying forever produces nothing but
+      // noise for a race that's already settled. Accept the rail's outcome
+      // and stop -- no receipt frame is posted (our own fold can't support
+      // one), this is local bookkeeping only, to end the retry loop.
+      updateContractCache(db, row.contract_id, { cachedStatus: "claimed_rail_override", receipted: true });
+      log.info("[REFUND][ACCEPTED_LATE_CLAIM]", {
+        contract: row.contract_id,
+        local_fold_status: resynced.status,
+        rail_error: message,
+        note: "counterparty's reveal arrived after this offer's refundAfterMs but the rail already recorded their claim -- accepting it rather than retrying a settled race forever",
+      });
       return;
     }
     throw err;
