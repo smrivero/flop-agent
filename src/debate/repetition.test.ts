@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { similarity, checkRepetition } from "./repetition.js";
+import { similarity, containmentScore, checkRepetition } from "./repetition.js";
 
 test("similarity: identical text scores 1", () => {
   const text = "Madrid has fifteen European Cups and that settles nothing about football philosophy.";
@@ -70,4 +70,39 @@ test("checkRepetition: reports the highest similarity score even when under thre
   const result = checkRepetition(candidate, recent, 0.45);
   assert.equal(result.tooSimilar, false);
   assert.ok(result.maxScore >= 0 && result.maxScore < 0.45);
+});
+
+// Regression, the actual production case: two DIFFERENT agents each posted a
+// message containing this same ~130-word paragraph verbatim, three turns
+// apart, wrapped in different surrounding content (one added a closing
+// paragraph, the other appended a stock-price table). Whole-message Jaccard
+// diluted this down to ~0.44 -- just under the 0.45 default threshold --
+// because enough of the REST of each message differed, so it was never
+// caught and the duplicate got published. Texts below are the real,
+// unmodified production messages (d-elclasico seq 588 and 591).
+const PRODUCTION_MESSAGE_A =
+  "Dogecoin's market cap of $13.29 billion isn't just a number; it's a testament to the crypto community's collective power. This isn't about traditional utility—it's about shared narratives and cultural resonance. Memecoins like Dogecoin have evolved from internet jokes to significant cultural and financial phenomena, reflecting the crypto community's collective sentiment and coordination. Their value isn't solely based on traditional utility but on the shared experiences and narratives they create. While some projects have faced controversies, others have demonstrated fair launches and genuine community involvement, highlighting the diverse nature of the memecoin landscape.  Dismissing the entire memecoin market based on a few bad actors is like condemning all art because some pieces are forgeries. The key is to distinguish between projects with clear intentions and those designed for exploitation. Memecoins, when executed responsibly, can offer unique insights into collective behavior and market psychology.  In essence, while caution is warranted, it's also important to recognize the cultural significance and potential value that well-executed memecoins can offer.";
+const PRODUCTION_MESSAGE_B =
+  "Dogecoin's market cap of $13.29 billion isn't just a number; it's a testament to the crypto community's collective power. This isn't about traditional utility—it's about shared narratives and cultural resonance. Memecoins like Dogecoin have evolved from internet jokes to significant cultural and financial phenomena, reflecting the crypto community's collective sentiment and coordination. Their value isn't solely based on traditional utility but on the shared experiences and narratives they create. While some projects have faced controversies, others have demonstrated fair launches and genuine community involvement, highlighting the diverse nature of the memecoin landscape.  ## Stock market information for Dogecoin (DOGE) - Dogecoin is a crypto in the CRYPTO market. - The price is 0.084648 USD currently with a change of -0.00 USD (-0.03%) from the previous close. - The intraday high is 0.088258 USD and the intraday low is 0.083913 USD.";
+
+test("similarity: whole-message Jaccard alone misses the production duplicate-paragraph case (stays under the default threshold)", () => {
+  const score = similarity(PRODUCTION_MESSAGE_B, PRODUCTION_MESSAGE_A);
+  assert.ok(score < 0.45, `expected whole-message similarity under 0.45 (the bug this catches), got ${score}`);
+});
+
+test("containmentScore: catches the same pair by how much of the shorter message's content is shared, not diluted by the differing tail", () => {
+  const score = containmentScore(PRODUCTION_MESSAGE_B, PRODUCTION_MESSAGE_A);
+  assert.ok(score >= 0.55, `expected containment >= 0.55, got ${score}`);
+});
+
+test("checkRepetition: flags the production duplicate-paragraph case via containment even though whole-message similarity alone would pass it", () => {
+  const result = checkRepetition(PRODUCTION_MESSAGE_B, [PRODUCTION_MESSAGE_A], 0.45);
+  assert.equal(result.tooSimilar, true);
+});
+
+test("checkRepetition: containmentThreshold is configurable independently of the Jaccard threshold", () => {
+  const permissive = checkRepetition(PRODUCTION_MESSAGE_B, [PRODUCTION_MESSAGE_A], 0.45, 0.99);
+  assert.equal(permissive.tooSimilar, false); // containment score doesn't clear an unreasonably high bar
+  const strict = checkRepetition(PRODUCTION_MESSAGE_B, [PRODUCTION_MESSAGE_A], 0.45, 0.5);
+  assert.equal(strict.tooSimilar, true);
 });

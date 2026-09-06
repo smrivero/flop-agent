@@ -59,6 +59,12 @@ export interface DebateConfig {
   /** Jaccard word-trigram similarity, 0-1, above which a draft is considered a
    * repeat of the same agent's own recent messages and gets one regeneration. */
   repetitionThreshold: number;
+  /** Containment score (shared trigrams / smaller message's trigram count),
+   * 0-1, above which a draft is flagged for reusing a large verbatim chunk of
+   * a recent message even if the rest of the draft is new -- see
+   * repetition.ts's doc comment. Higher than repetitionThreshold by default:
+   * containment scores run higher than Jaccard in general. */
+  repetitionContainmentThreshold: number;
   /** How many of the same agent's own recent messages the repetition check
    * compares a fresh draft against. */
   recentMessagesForSimilarity: number;

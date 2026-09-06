@@ -22,6 +22,7 @@ function baseConfig(overrides: Partial<DebateConfig> = {}): DebateConfig {
     historyMessages: 12,
     maxMessageChars: 3500,
     repetitionThreshold: 0.45,
+    repetitionContainmentThreshold: 0.55,
     recentMessagesForSimilarity: 8,
     checkpointEnabled: true,
     checkpointEveryMessages: 10,

@@ -54,6 +54,7 @@ function buildTestRuntime(
     historyMessages: 12,
     maxMessageChars: 200,
     repetitionThreshold: 0.45,
+    repetitionContainmentThreshold: 0.55,
     recentMessagesForSimilarity: 8,
     checkpointEnabled: overrides.checkpointEnabled ?? false,
     checkpointEveryMessages: overrides.checkpointEveryMessages ?? 10,

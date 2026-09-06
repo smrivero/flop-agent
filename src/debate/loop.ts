@@ -129,6 +129,7 @@ async function generateValidatedCandidate(
   baseInput: string,
   recentMessagesForSimilarity: string[],
   repetitionThreshold: number,
+  repetitionContainmentThreshold: number,
   maxMessageChars: number,
   allowSkipTurn: boolean,
 ): Promise<{ candidate: Candidate } | { skip: true; reason: string }> {
@@ -148,7 +149,7 @@ async function generateValidatedCandidate(
 
     const sanitized = sanitizeDebateMessage(split.message, maxMessageChars);
     const shape = checkShape(sanitized);
-    const repetition = checkRepetition(sanitized, recentMessagesForSimilarity, repetitionThreshold);
+    const repetition = checkRepetition(sanitized, recentMessagesForSimilarity, repetitionThreshold, repetitionContainmentThreshold);
 
     logEvent("quality", { repetition: repetition.maxScore.toFixed(2) });
     for (const reason of shape.reasons) logEvent("quality", { issue: reason });
@@ -237,6 +238,7 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
     baseInput,
     recentMessagesForSimilarity,
     config.repetitionThreshold,
+    config.repetitionContainmentThreshold,
     config.maxMessageChars,
     config.allowSkipTurn,
   );

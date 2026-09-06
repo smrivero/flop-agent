@@ -95,6 +95,7 @@ export function loadDebateConfig(env: NodeJS.ProcessEnv = process.env): DebateCo
     historyMessages: parseIntEnv(env, "HISTORY_MESSAGES", 12),
     maxMessageChars: parseIntEnv(env, "MAX_MESSAGE_CHARS", 3500),
     repetitionThreshold: parseFloatEnv(env, "REPETITION_THRESHOLD", 0.45, 0, 1),
+    repetitionContainmentThreshold: parseFloatEnv(env, "REPETITION_CONTAINMENT_THRESHOLD", 0.55, 0, 1),
     recentMessagesForSimilarity: parseIntEnv(env, "RECENT_MESSAGES_FOR_SIMILARITY", 8),
 
     checkpointEnabled: parseBoolEnv(env, "CHECKPOINT_ENABLED", true),
