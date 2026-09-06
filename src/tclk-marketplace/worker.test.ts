@@ -71,6 +71,7 @@ function baseConfig(overrides: Partial<TclkMarketConfig> = {}): TclkMarketConfig
     offerAmount: "1000000",
     offerAsset: "PAPER",
     offerJobType: "echo",
+    offerJobContextPoolPath: "/dev/null/does-not-exist", // deterministic: no context pool in tests unless a test overrides this
     offerExpiresMinutes: 30,
     claimMinutes: 1,
     refundMinutes: 2,

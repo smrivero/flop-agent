@@ -11,6 +11,8 @@
  *    rate limit hasn't cleared", which the interval check already prevents).
  */
 
+import { readFileSync } from "node:fs";
+import { resolve } from "node:path";
 import { makeOffer, type OfferFrame } from "@flop-labs/tclk";
 import type { TechnocoreClient } from "../technocore.js";
 import type { TechnocoreIdentity } from "../identity.js";
@@ -18,6 +20,34 @@ import { postFrame } from "../tclk/frames.js";
 import type { TclkMarketConfig } from "./config.js";
 import { closeExpiredPublishedOffers, countOpenPublishedOffers, insertPublishedOffer, lastPublishedOfferAt, storeFrame, type TclkMarketDb } from "./database.js";
 import type { TclkMarketLogger } from "./logger.js";
+
+// One line at random becomes `job.context` for an offer that doesn't specify
+// its own -- pure flavor text (the field is optional per tclk/1), meant to
+// give a stranger reading the offer room something concrete to react to
+// instead of a bare "echo" with a random id. Cached per path: the pool file
+// doesn't change during a process's lifetime, and this runs once per offer.
+// A missing/unreadable file just means no context, same as before this existed.
+let cachedPool: { path: string; lines: string[] } | undefined;
+
+function loadJobContextPool(path: string): string[] {
+  if (cachedPool && cachedPool.path === path) return cachedPool.lines;
+  let lines: string[] = [];
+  try {
+    lines = readFileSync(resolve(path), "utf8")
+      .split("\n")
+      .map((line) => line.trim())
+      .filter((line) => line.length > 0);
+  } catch {
+    lines = [];
+  }
+  cachedPool = { path, lines };
+  return lines;
+}
+
+function pickRandomJobContext(path: string): string | undefined {
+  const lines = loadJobContextPool(path);
+  return lines.length === 0 ? undefined : lines[Math.floor(Math.random() * lines.length)];
+}
 
 export interface PublishOfferOptions {
   amount?: string;
@@ -39,7 +69,11 @@ export function buildOwnOffer(config: TclkMarketConfig, identity: TechnocoreIden
     claimByMs: now + config.claimMinutes * 60_000,
     refundAfterMs: now + config.refundMinutes * 60_000,
     expiresMs: now + config.offerExpiresMinutes * 60_000,
-    job: { proto: options.jobType ?? config.offerJobType, id: options.jobId ?? `mkt-${now}-${Math.random().toString(16).slice(2, 8)}`, context: options.jobContext },
+    job: {
+      proto: options.jobType ?? config.offerJobType,
+      id: options.jobId ?? `mkt-${now}-${Math.random().toString(16).slice(2, 8)}`,
+      context: options.jobContext ?? pickRandomJobContext(config.offerJobContextPoolPath),
+    },
   });
 }
 

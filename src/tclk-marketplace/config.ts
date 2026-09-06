@@ -46,6 +46,11 @@ export interface TclkMarketConfig {
   offerAmount: string;
   offerAsset: string;
   offerJobType: string;
+  /** One line is chosen at random as `job.context` for an offer that doesn't
+   * specify its own (see publisher.ts) -- optional flavor text, never
+   * required for the offer to be valid. Missing file = no context, same as
+   * before this existed. */
+  offerJobContextPoolPath: string;
   offerExpiresMinutes: number;
   claimMinutes: number;
   refundMinutes: number;
@@ -146,6 +151,7 @@ export function loadTclkMarketConfig(env: NodeJS.ProcessEnv = process.env): Tclk
     offerAmount: env.TCLK_MKT_OFFER_AMOUNT?.trim() || "1000000",
     offerAsset: env.TCLK_MKT_OFFER_ASSET?.trim() || "PAPER",
     offerJobType: env.TCLK_MKT_OFFER_JOB_TYPE?.trim() || "echo",
+    offerJobContextPoolPath: env.TCLK_MKT_OFFER_JOB_CONTEXT_POOL_PATH?.trim() || "prompts/ironic-job-contexts.txt",
     offerExpiresMinutes: parseIntPositive(env.TCLK_MKT_OFFER_EXPIRES_MINUTES, 30, "TCLK_MKT_OFFER_EXPIRES_MINUTES"),
     claimMinutes,
     refundMinutes,
