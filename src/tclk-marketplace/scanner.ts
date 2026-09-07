@@ -20,6 +20,7 @@
 import { tryDecodeFrame, type TclkFrame } from "@flop-labs/tclk";
 import { verifyEd25519 } from "../identity.js";
 import { sweepText, TechnocoreError, type Message, type TechnocoreClient } from "../technocore.js";
+import { incrementGapCounter, type TclkMarketDb } from "./database.js";
 import type { TclkMarketLogger } from "./logger.js";
 
 export interface VerifiedFrameMessage {
@@ -53,6 +54,23 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+export interface ScanResult {
+  frames: VerifiedFrameMessage[];
+  lastSeq: number;
+  /** Regression: the venue's own `RoomView.first_seq` doc comment says "if
+   * it's > since+1 you missed lines (ring rotation)" -- this worker never
+   * read that field at all, so a cursor that fell behind a high-traffic
+   * room's ring buffer would silently lose frames with zero detection, zero
+   * logging, zero metric. True when this read's own `first_seq` is further
+   * ahead than `sinceSeq + 1`, meaning the ring rotated past messages this
+   * cursor never saw. */
+  gapDetected: boolean;
+  /** Best-effort count of messages that fell in the gap (0 when no gap).
+   * Not exact -- the ring's true content between `sinceSeq` and `first_seq`
+   * is gone by definition -- but a useful order-of-magnitude signal. */
+  missedEstimate: number;
+}
+
 /**
  * Read a room incrementally: `since=sinceSeq`, long-poll up to `waitSeconds`.
  * Returns only the NEW messages (seq > sinceSeq) that (a) carry a locally
@@ -68,7 +86,7 @@ export async function scanRoomForFrames(
   room: string,
   sinceSeq: number,
   options: { waitSeconds: number; maxRetries: number },
-): Promise<{ frames: VerifiedFrameMessage[]; lastSeq: number }> {
+): Promise<ScanResult> {
   let lastError: unknown;
   for (let attempt = 0; attempt <= options.maxRetries; attempt++) {
     try {
@@ -83,7 +101,10 @@ export async function scanRoomForFrames(
         if (frame === null) continue;
         frames.push({ seq: message.seq, from: message.from, frame, raw: message });
       }
-      return { frames, lastSeq: Math.max(view.last_seq, sinceSeq) };
+      // A brand-new room (first_seq null, nothing ever posted) is never a gap.
+      const gapDetected = view.first_seq !== null && view.first_seq > sinceSeq + 1;
+      const missedEstimate = gapDetected ? (view.first_seq as number) - (sinceSeq + 1) : 0;
+      return { frames, lastSeq: Math.max(view.last_seq, sinceSeq), gapDetected, missedEstimate };
     } catch (err) {
       lastError = err;
       if (!isRetryable(err) || attempt >= options.maxRetries) throw err;
@@ -93,7 +114,15 @@ export async function scanRoomForFrames(
   throw lastError; // unreachable in practice
 }
 
-/** Log-only helper: describe what a scan pass found, for [TCLK][SCANNER]. */
-export function logScanResult(log: TclkMarketLogger, room: string, sinceSeq: number, result: { frames: VerifiedFrameMessage[]; lastSeq: number }): void {
+/** Describes what a scan pass found, for [TCLK][SCANNER] -- and, whenever the
+ * ring rotated past this cursor (see ScanResult's own doc comment), logs
+ * [SCANNER][GAP] and persists it via incrementGapCounter so tclk:status can
+ * report it. Every scanRoomForFrames call site should route its result
+ * through this, so a gap is never silently dropped on the floor. */
+export function logScanResult(db: TclkMarketDb, log: TclkMarketLogger, room: string, sinceSeq: number, result: ScanResult): void {
   log.info("[SCANNER]", { room, since: sinceSeq, last_seq: result.lastSeq, frames_found: result.frames.length });
+  if (result.gapDetected) {
+    log.info("[SCANNER][GAP]", { room, since: sinceSeq, missed_estimate: result.missedEstimate, note: "ring rotated past this cursor -- some frames were never seen" });
+    incrementGapCounter(db, result.missedEstimate);
+  }
 }

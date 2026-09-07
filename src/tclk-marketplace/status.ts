@@ -8,7 +8,7 @@
 
 import type { TechnocoreIdentity } from "../identity.js";
 import type { TclkMarketConfig } from "./config.js";
-import { getErrorCount, getRoomCursor, type TclkMarketDb } from "./database.js";
+import { getErrorCount, getGapStats, getRoomCursor, type TclkMarketDb } from "./database.js";
 
 export interface TclkMarketStatus {
   enabled: boolean;
@@ -27,6 +27,11 @@ export interface TclkMarketStatus {
   publishedOffers: number;
   openPublishedOffers: number;
   errors: number;
+  /** How many times a scan found the room's ring buffer had rotated past
+   * this worker's cursor -- i.e. frames genuinely, unrecoverably missed. See
+   * scanner.ts's ScanResult doc comment. */
+  gapsDetected: number;
+  recordsLostEstimate: number;
 }
 
 export function computeStatus(db: TclkMarketDb, config: TclkMarketConfig, identity: TechnocoreIdentity): TclkMarketStatus {
@@ -71,6 +76,7 @@ export function computeStatus(db: TclkMarketDb, config: TclkMarketConfig, identi
     publishedOffers: publishedTotals.total,
     openPublishedOffers: publishedTotals.open_count ?? 0,
     errors: getErrorCount(db),
+    ...getGapStats(db),
   };
 }
 
@@ -92,5 +98,6 @@ export function formatStatus(status: TclkMarketStatus): string {
     `cancelled: ${status.cancelledDeals}`,
     `publishedOffers: ${status.publishedOffers} (${status.openPublishedOffers} open)`,
     `errors: ${status.errors}`,
+    `gapsDetected: ${status.gapsDetected} (recordsLostEstimate: ${status.recordsLostEstimate})`,
   ].join("\n");
 }

@@ -59,6 +59,15 @@ export class FakeTechnocore {
     return full;
   }
 
+  /** Test-only: simulate the venue's ring-buffer retention rotating past
+   * older messages -- drops every stored message with `seq < keepFromSeq` so
+   * a subsequent read's `first_seq` reflects a real ring rotation, letting
+   * tests exercise gap-detection logic without waiting for real volume. */
+  evictBefore(roomName: string, keepFromSeq: number): void {
+    const room = this.room(roomName);
+    room.messages = room.messages.filter((m) => m.seq >= keepFromSeq);
+  }
+
   /** Post as a real identity would: sign locally, then feed it through the
    * same acceptance check the fake server enforces on a real request. */
   postSigned(roomName: string, identity: TechnocoreIdentity, text: string): Message {

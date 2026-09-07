@@ -61,7 +61,7 @@ import { planContractAction } from "./dealManager.js";
 import { fingerprintSecret, type TclkMarketLogger } from "./logger.js";
 import { shouldAcceptOffer } from "./policy.js";
 import { maybeAutoPublish } from "./publisher.js";
-import { scanRoomForFrames, type VerifiedFrameMessage } from "./scanner.js";
+import { logScanResult, scanRoomForFrames, type VerifiedFrameMessage } from "./scanner.js";
 
 export interface TclkMarketWorkerContext {
   db: TclkMarketDb;
@@ -179,7 +179,7 @@ async function scanOffersRoom(ctx: TclkMarketWorkerContext, summary: TickSummary
 
   const since = getRoomCursor(db, config.offerRoom);
   const result = await scanRoomForFrames(client, config.offerRoom, since, { waitSeconds: config.longPollWaitSeconds, maxRetries: config.maxRetries });
-  log.info("[SCANNER]", { room: config.offerRoom, since, last_seq: result.lastSeq, frames_found: result.frames.length });
+  logScanResult(db, log, config.offerRoom, since, result);
 
   for (const m of result.frames) {
     // Cache every verified frame we see in this room, regardless of type or
@@ -540,6 +540,7 @@ async function advanceOneContract(ctx: TclkMarketWorkerContext, row: TclkMarketC
 
   const since = getRoomCursor(db, row.deal_room);
   const result = await scanRoomForFrames(client, row.deal_room, since, { waitSeconds: 0, maxRetries: config.maxRetries });
+  logScanResult(db, log, row.deal_room, since, result);
   for (const m of result.frames) storeFrame(db, toFrameRow(row.deal_room, m));
   if (!ctx.config.dryRun) setRoomCursor(db, row.deal_room, result.lastSeq);
 
@@ -623,6 +624,7 @@ async function doRefund(ctx: TclkMarketWorkerContext, row: TclkMarketContractRow
     if (/^tclk: refund on a (claimed|refunded) record$/.test(message)) {
       const since = getRoomCursor(db, row.deal_room);
       const result = await scanRoomForFrames(client, row.deal_room, since, { waitSeconds: 0, maxRetries: config.maxRetries });
+      logScanResult(db, log, row.deal_room, since, result);
       for (const m of result.frames) storeFrame(db, toFrameRow(row.deal_room, m));
       setRoomCursor(db, row.deal_room, result.lastSeq);
       const resynced = foldFromStore(db, row.offer_id, row.contract_id);
@@ -695,7 +697,9 @@ async function doWorkAndReveal(ctx: TclkMarketWorkerContext, row: TclkMarketCont
 
   // Do not trust the HTTP 200 alone -- re-read the deal room and re-fold to
   // confirm the transcript itself now produces `claimed` before declaring victory.
-  const verify = await scanRoomForFrames(client, row.deal_room, getRoomCursor(db, row.deal_room), { waitSeconds: 0, maxRetries: config.maxRetries });
+  const verifySince = getRoomCursor(db, row.deal_room);
+  const verify = await scanRoomForFrames(client, row.deal_room, verifySince, { waitSeconds: 0, maxRetries: config.maxRetries });
+  logScanResult(db, log, row.deal_room, verifySince, verify);
   for (const m of verify.frames) storeFrame(db, toFrameRow(row.deal_room, m));
   setRoomCursor(db, row.deal_room, verify.lastSeq);
   const reFolded = foldFromStore(db, row.offer_id, row.contract_id);

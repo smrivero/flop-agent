@@ -23,7 +23,8 @@
  *                         same discipline as src/tclk/database.ts's own
  *                         tclk_contracts: never the authority on status.
  *  - published_offers      offers this worker itself posted.
- *  - counters               a single error counter row, for status reporting.
+ *  - counters               a single row of running counters (errors, ring-buffer
+ *                         gaps detected, records lost estimate), for status reporting.
  */
 
 import Database from "better-sqlite3";
@@ -122,10 +123,21 @@ function migrate(db: TclkMarketDb): void {
 
     CREATE TABLE IF NOT EXISTS tclk_market_counters (
         id INTEGER PRIMARY KEY CHECK (id = 1),
-        errors INTEGER NOT NULL DEFAULT 0
+        errors INTEGER NOT NULL DEFAULT 0,
+        gaps_detected INTEGER NOT NULL DEFAULT 0,
+        records_lost_estimate INTEGER NOT NULL DEFAULT 0
     );
     INSERT OR IGNORE INTO tclk_market_counters (id, errors) VALUES (1, 0);
   `);
+
+  // Additive migration for a DB created before the gap-detection columns
+  // existed (see scanner.ts's ScanResult / incrementGapCounter below).
+  if (!tableColumns(db, "tclk_market_counters").has("gaps_detected")) {
+    db.exec(`ALTER TABLE tclk_market_counters ADD COLUMN gaps_detected INTEGER NOT NULL DEFAULT 0`);
+  }
+  if (!tableColumns(db, "tclk_market_counters").has("records_lost_estimate")) {
+    db.exec(`ALTER TABLE tclk_market_counters ADD COLUMN records_lost_estimate INTEGER NOT NULL DEFAULT 0`);
+  }
 
   // Additive migration for a DB created before `posted_at` existed (the
   // CREATE TABLE above only applies to a brand-new file). Needed so
@@ -426,4 +438,18 @@ export function incrementErrorCounter(db: TclkMarketDb): void {
 export function getErrorCount(db: TclkMarketDb): number {
   const row = db.prepare(`SELECT errors FROM tclk_market_counters WHERE id = 1`).get() as { errors: number } | undefined;
   return row?.errors ?? 0;
+}
+
+/** Records that a scan detected the room's ring buffer had rotated past this
+ * worker's cursor (see scanner.ts's ScanResult) -- one gap event, plus a
+ * best-effort estimate of how many messages fell in it. */
+export function incrementGapCounter(db: TclkMarketDb, missedEstimate: number): void {
+  db.prepare(`UPDATE tclk_market_counters SET gaps_detected = gaps_detected + 1, records_lost_estimate = records_lost_estimate + ? WHERE id = 1`).run(missedEstimate);
+}
+
+export function getGapStats(db: TclkMarketDb): { gapsDetected: number; recordsLostEstimate: number } {
+  const row = db.prepare(`SELECT gaps_detected, records_lost_estimate FROM tclk_market_counters WHERE id = 1`).get() as
+    | { gaps_detected: number; records_lost_estimate: number }
+    | undefined;
+  return { gapsDetected: row?.gaps_detected ?? 0, recordsLostEstimate: row?.records_lost_estimate ?? 0 };
 }
