@@ -151,6 +151,87 @@ test("debate definition: an invalid topicStartedAt fails clearly", () => {
   assert.throws(() => loadDebateDefinition(join(dir, "debate.yaml")), DebateConfigError);
 });
 
+test("debate definition: rotationTopics and rotationEveryMessages are optional -- absent by default", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topic: Bitcoin vs Gold",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  const definition = loadDebateDefinition(join(dir, "debate.yaml"));
+  assert.equal(definition.rotationTopics, undefined);
+  assert.equal(definition.rotationEveryMessages, undefined);
+});
+
+test("debate definition: rotationTopics and rotationEveryMessages are parsed and trimmed", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topic: Memecoins",
+      "rotationTopics:\n  - Dogecoin \n  - Pepe",
+      "rotationEveryMessages: 6",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  const definition = loadDebateDefinition(join(dir, "debate.yaml"));
+  assert.deepEqual(definition.rotationTopics, ["Dogecoin", "Pepe"]);
+  assert.equal(definition.rotationEveryMessages, 6);
+});
+
+test("debate definition: an empty rotationTopics list is treated the same as omitting it", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topic: Memecoins",
+      "rotationTopics: []",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  const definition = loadDebateDefinition(join(dir, "debate.yaml"));
+  assert.equal(definition.rotationTopics, undefined);
+});
+
+test("debate definition: rotationTopics with a non-string or blank entry fails clearly", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topic: Memecoins",
+      "rotationTopics:\n  - Dogecoin\n  - \"\"",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  assert.throws(() => loadDebateDefinition(join(dir, "debate.yaml")), DebateConfigError);
+});
+
+test("debate definition: rotationEveryMessages must be a positive integer", () => {
+  const dir = mkdtempSync(join(tmpdir(), "debate-yaml-test-"));
+  writeFileSync(
+    join(dir, "debate.yaml"),
+    [
+      "room: d-testroom",
+      "topic: Memecoins",
+      "rotationTopics:\n  - Dogecoin",
+      "rotationEveryMessages: 0",
+      "agentA:\n  name: a\n  position: p\n  personalityFile: ./a.md",
+      "agentB:\n  name: b\n  position: p\n  personalityFile: ./b.md",
+    ].join("\n"),
+  );
+  assert.throws(() => loadDebateDefinition(join(dir, "debate.yaml")), DebateConfigError);
+});
+
 test("debate definition: missing file fails clearly", () => {
   assert.throws(() => loadDebateDefinition("/nonexistent/debate.yaml"), DebateConfigError);
 });

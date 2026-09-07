@@ -27,7 +27,20 @@ import { isSkip } from "./skip.js";
 import { sanitizeDebateMessage } from "./sanitize.js";
 import { loadState, recordTurn, saveState, touchMaintenance } from "./state.js";
 import type { Runtime } from "./runtime.js";
-import type { AgentId, LoadedAgent } from "./types.js";
+import type { AgentId, DebateDefinition, LoadedAgent } from "./types.js";
+
+/** Which `rotationTopics` entry is "in rotation" right now -- a pure function
+ * of how many messages have been posted so far, so it needs no extra
+ * persisted state and survives restarts trivially (recomputed every turn
+ * from `totalMessages`, which is already tracked). Returns undefined when
+ * the debate's config doesn't define a rotation (the common case: most
+ * debates don't need forced topic rotation). */
+export function currentRotationTopic(definition: DebateDefinition, totalMessages: number): string | undefined {
+  if (!definition.rotationTopics || definition.rotationTopics.length === 0) return undefined;
+  const every = definition.rotationEveryMessages ?? 4;
+  const index = Math.floor(totalMessages / every) % definition.rotationTopics.length;
+  return definition.rotationTopics[index];
+}
 
 function logLine(text: string): void {
   console.log(text);
@@ -230,7 +243,9 @@ export async function runOneTurn(runtime: Runtime, deps: TurnDeps = {}): Promise
   logLine(`[mode] ${mode}`);
 
   const instructions = buildInstructions(speaker, definition, config.webSearchEnabled);
-  const baseInput = buildInput(speaker, recent, state, mode, config.maxMessageChars);
+  const forcedTopic = currentRotationTopic(definition, state.totalMessages);
+  if (forcedTopic) logLine(`[rotation] focus: ${forcedTopic}`);
+  const baseInput = buildInput(speaker, recent, state, mode, config.maxMessageChars, forcedTopic);
 
   const outcome = await generateValidatedCandidate(
     generate,

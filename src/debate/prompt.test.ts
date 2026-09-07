@@ -132,6 +132,23 @@ test("buildInput: 'overused topic' steering never hardcodes football-specific an
   assert.doesNotMatch(input, /Ballon d'Or|Club World Cup|domestic leagues/i);
 });
 
+test("buildInput: a forcedTopic produces a mandatory-focus instruction naming it, and suppresses the generic 'overused topic' steering", () => {
+  const state = testState();
+  state.recentClaims = ["Some earlier claim about Dogecoin."];
+  const input = buildInput(testAgent(), [], state, "SHORT", 3500, "Pepe");
+  assert.match(input, /FOCUS FOR THIS MESSAGE \(mandatory, not a suggestion\): Pepe\./);
+  assert.doesNotMatch(input, /RECENTLY OVERUSED TOPICS/);
+  assert.match(input, /RECENT MESSAGES/); // still shown, just relabeled
+});
+
+test("buildInput: without a forcedTopic, the generic 'overused topic' steering still applies as before", () => {
+  const state = testState();
+  state.recentClaims = ["Some earlier claim."];
+  const input = buildInput(testAgent(), [], state, "SHORT", 3500);
+  assert.doesNotMatch(input, /FOCUS FOR THIS MESSAGE/);
+  assert.match(input, /RECENTLY OVERUSED TOPICS/);
+});
+
 test("buildInput: a non-empty room includes the opponent's latest message for direct reply", () => {
   const state = testState();
   const turns = [

@@ -18,6 +18,22 @@ export interface DebateDefinition {
    * repetition check permanently flagging fresh replies as duplicates of an
    * old debate about something else entirely. */
   topicStartedAt?: string;
+  /** Optional, ordered list of specific examples within the debate's overall
+   * topic (e.g. individual memecoins for a "which memecoins are legitimate"
+   * debate). When set, both agents are told to focus on the SAME entry for
+   * `rotationEveryMessages` consecutive messages, then the loop deterministically
+   * advances to the next entry -- computed purely from `totalMessages`, no
+   * extra persisted state. This exists because a soft "move to a new angle
+   * once this one is exhausted" instruction alone was not reliable in
+   * practice: a real deployment got stuck restating the same coin (Dogecoin)
+   * for a dozen-plus turns in a row, because nothing forced it to move on.
+   * Never hardcode topic-specific examples in code -- this field is how a
+   * debate's own config supplies them. */
+  rotationTopics?: string[];
+  /** How many consecutive messages stay on the same `rotationTopics` entry
+   * before advancing. Ignored if `rotationTopics` is unset. Default: 4 (two
+   * exchanges per side) -- see loop.ts's `currentRotationTopic`. */
+  rotationEveryMessages?: number;
 }
 
 /** Only "openai" is implemented today. The type is a union of one so adding a

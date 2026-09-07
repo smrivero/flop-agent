@@ -185,7 +185,25 @@ export function loadDebateDefinition(path: string): DebateDefinition {
     topicStartedAt = value;
   }
 
-  return { room: room.trim(), topic: topic.trim(), language: language.trim(), agentA, agentB, topicStartedAt };
+  let rotationTopics: string[] | undefined;
+  if (obj.rotationTopics !== undefined) {
+    if (!Array.isArray(obj.rotationTopics) || obj.rotationTopics.some((t) => typeof t !== "string" || t.trim() === "")) {
+      throw new DebateConfigError(`${path}: rotationTopics must be a list of non-empty strings`);
+    }
+    rotationTopics = (obj.rotationTopics as string[]).map((t) => t.trim());
+    if (rotationTopics.length === 0) rotationTopics = undefined; // an empty list means "no rotation", same as omitting the field
+  }
+
+  let rotationEveryMessages: number | undefined;
+  if (obj.rotationEveryMessages !== undefined) {
+    const n = obj.rotationEveryMessages;
+    if (typeof n !== "number" || !Number.isInteger(n) || n < 1) {
+      throw new DebateConfigError(`${path}: rotationEveryMessages must be a positive integer, got ${JSON.stringify(n)}`);
+    }
+    rotationEveryMessages = n;
+  }
+
+  return { room: room.trim(), topic: topic.trim(), language: language.trim(), agentA, agentB, topicStartedAt, rotationTopics, rotationEveryMessages };
 }
 
 export function loadPersonality(path: string): string {

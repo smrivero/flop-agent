@@ -131,7 +131,14 @@ function labelFor(turn: DebateTurn, agent: LoadedAgent): string {
   return turn.agentId === agent.id ? agent.name : agent.opponentName;
 }
 
-export function buildInput(agent: LoadedAgent, turns: DebateTurn[], memory: DebateState, mode: ResponseMode, maxMessageChars: number): string {
+export function buildInput(
+  agent: LoadedAgent,
+  turns: DebateTurn[],
+  memory: DebateState,
+  mode: ResponseMode,
+  maxMessageChars: number,
+  forcedTopic?: string,
+): string {
   const parts: string[] = [];
 
   if (turns.length === 0) {
@@ -156,14 +163,40 @@ export function buildInput(agent: LoadedAgent, turns: DebateTurn[], memory: Deba
 
   if (memory.recentClaims.length > 0) {
     parts.push("");
-    parts.push("RECENTLY OVERUSED TOPICS (from local memory, may extend further back than the conversation shown above):");
-    parts.push(memory.recentClaims.map((c) => `- ${c}`).join("\n"));
     parts.push(
-      "Do not return to an overused topic unless you have (1) genuinely new evidence, or (2) a " +
-        "direct rebuttal to something the opponent just said. Otherwise move to a DIFFERENT " +
-        "specific example, case or angle within the debate's overall topic -- if the topic spans " +
-        "multiple instances (several coins, players, companies, events, etc.), pick one that " +
-        "hasn't been discussed yet rather than restating the same one with different wording.",
+      forcedTopic
+        ? "RECENT MESSAGES (from local memory, may extend further back than the conversation shown above -- do not just restate these):"
+        : "RECENTLY OVERUSED TOPICS (from local memory, may extend further back than the conversation shown above):",
+    );
+    parts.push(memory.recentClaims.map((c) => `- ${c}`).join("\n"));
+    if (!forcedTopic) {
+      parts.push(
+        "Do not return to an overused topic unless you have (1) genuinely new evidence, or (2) a " +
+          "direct rebuttal to something the opponent just said. Otherwise move to a DIFFERENT " +
+          "specific example, case or angle within the debate's overall topic -- if the topic spans " +
+          "multiple instances (several coins, players, companies, events, etc.), pick one that " +
+          "hasn't been discussed yet rather than restating the same one with different wording.",
+      );
+    }
+  }
+
+  // Regression: a soft "move to a new angle once this one is exhausted"
+  // instruction alone was not reliable -- a real deployment got stuck
+  // restating the same memecoin for a dozen-plus messages in a row because
+  // nothing forced a move on. When the debate's config supplies
+  // `rotationTopics`, the loop deterministically picks which specific
+  // example is "in rotation" right now (see loop.ts's currentRotationTopic)
+  // -- not a suggestion the model can ignore.
+  if (forcedTopic) {
+    parts.push("");
+    parts.push(
+      `FOCUS FOR THIS MESSAGE (mandatory, not a suggestion): ${forcedTopic}. This debate covers one ` +
+        "specific example at a time; this is the one currently in rotation, and it will automatically " +
+        "move to the next one after a few more messages regardless of what you do -- you do not " +
+        "control that timing. You MUST discuss this specific example, not a different one, and you " +
+        "must NOT simply restate what was already said about it above -- bring a genuinely new fact, " +
+        "angle, or rebuttal, or make your point in one sharp sentence instead. If you truly have " +
+        "nothing new to add about it, use SKIP rather than repeating yourself.",
     );
   }
 

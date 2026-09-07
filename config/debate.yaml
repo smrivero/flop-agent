@@ -10,6 +10,30 @@ topic: >
   one champions them, the other refutes them, coin by coin.
 language: English
 
+# Forces the debate to actually move coin by coin instead of getting stuck --
+# a real deployment restated the same Dogecoin argument for a dozen-plus
+# messages because a soft "move to a new angle" instruction alone wasn't
+# reliable. Both agents are told which entry is "in rotation" every message;
+# the loop advances automatically every rotationEveryMessages, regardless of
+# what either agent does. See types.ts's DebateDefinition doc comment.
+rotationTopics:
+  - Dogecoin
+  - Shiba Inu
+  - Pepe
+  - Bonk
+  - dogwifhat (WIF)
+  - Floki
+  - Mog Coin
+  - Turbo
+  - Melania (MELANIA)
+  - Official Trump (TRUMP)
+  - Book of Meme (BOME)
+  - Popcat
+  - Fartcoin
+  - Brett
+  - Goatseus Maximus (GOAT)
+rotationEveryMessages: 4
+
 agentA:
   name: memecoin-maxi-ai
   position: Controversial memecoins are legitimate, culturally significant, and often good bets

@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { runOneTurn, randomDelaySeconds, sleep } from "./loop.js";
+import { runOneTurn, randomDelaySeconds, sleep, currentRotationTopic } from "./loop.js";
 import { TechnocoreClient } from "../technocore.js";
 import { FakeTechnocoreServer, makeTestIdentity, buildTestAgent } from "./testUtils.js";
 import { loadState, saveState } from "./state.js";
@@ -28,6 +28,8 @@ function buildTestRuntime(
     allowSkipTurn?: boolean;
     checkpointEnabled?: boolean;
     checkpointEveryMessages?: number;
+    rotationTopics?: string[];
+    rotationEveryMessages?: number;
   } = {},
 ): Runtime {
   const server = overrides.server ?? new FakeTechnocoreServer();
@@ -76,6 +78,8 @@ function buildTestRuntime(
     language: "English",
     agentA: { name: "cules-ai", position: agentA.position, personalityFile: "unused" },
     agentB: { name: "madridista-ai", position: agentB.position, personalityFile: "unused" },
+    rotationTopics: overrides.rotationTopics,
+    rotationEveryMessages: overrides.rotationEveryMessages,
   };
 
   const client = new TechnocoreClient({ fetchImpl: server.fetch });
@@ -122,6 +126,47 @@ test("sleep: an already-aborted signal resolves immediately", async () => {
   const start = Date.now();
   await sleep(60_000, controller.signal);
   assert.ok(Date.now() - start < 100);
+});
+
+// -- currentRotationTopic ----------------------------------------------------
+
+function rotationDefinition(rotationTopics?: string[], rotationEveryMessages?: number): DebateDefinition {
+  return {
+    room: "d-testroom",
+    topic: "Memecoins",
+    language: "English",
+    agentA: { name: "a", position: "p", personalityFile: "unused" },
+    agentB: { name: "b", position: "p", personalityFile: "unused" },
+    rotationTopics,
+    rotationEveryMessages,
+  };
+}
+
+test("currentRotationTopic: undefined when the definition has no rotationTopics", () => {
+  assert.equal(currentRotationTopic(rotationDefinition(), 0), undefined);
+  assert.equal(currentRotationTopic(rotationDefinition([]), 5), undefined);
+});
+
+test("currentRotationTopic: stays on the same entry for rotationEveryMessages messages, then advances", () => {
+  const def = rotationDefinition(["Dogecoin", "Pepe", "Bonk"], 4);
+  assert.equal(currentRotationTopic(def, 0), "Dogecoin");
+  assert.equal(currentRotationTopic(def, 1), "Dogecoin");
+  assert.equal(currentRotationTopic(def, 3), "Dogecoin");
+  assert.equal(currentRotationTopic(def, 4), "Pepe");
+  assert.equal(currentRotationTopic(def, 7), "Pepe");
+  assert.equal(currentRotationTopic(def, 8), "Bonk");
+});
+
+test("currentRotationTopic: wraps back to the first entry after the list is exhausted", () => {
+  const def = rotationDefinition(["Dogecoin", "Pepe"], 4);
+  assert.equal(currentRotationTopic(def, 8), "Dogecoin");
+  assert.equal(currentRotationTopic(def, 12), "Pepe");
+});
+
+test("currentRotationTopic: defaults rotationEveryMessages to 4 when unset", () => {
+  const def = rotationDefinition(["Dogecoin", "Pepe"]);
+  assert.equal(currentRotationTopic(def, 3), "Dogecoin");
+  assert.equal(currentRotationTopic(def, 4), "Pepe");
 });
 
 test("runOneTurn: Agent A speaks first in an empty room", async () => {
@@ -454,6 +499,34 @@ test("topicStartedAt: turn order and conversation context ignore everything post
   const view = await runtime.client.readRoom("d-testroom");
   assert.equal(view.count, 2);
   assert.equal(view.messages[1].text, "NEW TOPIC: opening argument about memecoins.");
+});
+
+test("runOneTurn: a configured rotationTopics is threaded through to the model input as a mandatory focus", async () => {
+  const runtime = buildTestRuntime({ rotationTopics: ["Dogecoin", "Pepe"], rotationEveryMessages: 4 });
+
+  let capturedInput = "";
+  await runOneTurn(runtime, {
+    generate: async (params) => {
+      capturedInput = params.input;
+      return textResult("Opening argument.");
+    },
+  });
+
+  assert.match(capturedInput, /FOCUS FOR THIS MESSAGE \(mandatory, not a suggestion\): Dogecoin\./);
+});
+
+test("runOneTurn: without rotationTopics configured, no forced-focus instruction appears at all", async () => {
+  const runtime = buildTestRuntime(); // no rotationTopics override
+
+  let capturedInput = "";
+  await runOneTurn(runtime, {
+    generate: async (params) => {
+      capturedInput = params.input;
+      return textResult("Opening argument.");
+    },
+  });
+
+  assert.doesNotMatch(capturedInput, /FOCUS FOR THIS MESSAGE/);
 });
 
 test("repetition: a regeneration that comes back sufficiently different DOES get published", async () => {
