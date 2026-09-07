@@ -27,6 +27,7 @@
     "protocol:status": "tsx src/protocol-watcher/cli.ts status",
     "protocol:diff": "tsx src/protocol-watcher/cli.ts diff",
     "protocol:baseline": "tsx src/protocol-watcher/cli.ts baseline",
+    "protocol:test-notify": "tsx src/protocol-watcher/cli.ts test-notify",
     "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts src/mentions/ai/*.test.ts src/debate/*.test.ts src/verifier/*.test.ts src/tclk/*.test.ts src/tclk-marketplace/*.test.ts src/protocol-watcher/*.test.ts src/protocol-watcher/normalize/*.test.ts src/protocol-watcher/extract/*.test.ts src/protocol-watcher/summary/*.test.ts src/protocol-watcher/notify/*.test.ts"
   },
   "dependencies": {

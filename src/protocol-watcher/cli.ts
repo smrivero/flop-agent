@@ -20,6 +20,7 @@ import { runWatcher, type RunOptions } from "./run.js";
 import { buildStatusReport } from "./status.js";
 import { createHttpTelegramTransport, type TelegramTransport } from "./notify/telegram.js";
 import { createRealTechnocoreSender, type TechnocoreSender } from "./notify/technocore.js";
+import { buildTestMessage, sendTestNotifications } from "./notify/testMessage.js";
 import { formatChangeMessage, formatChangeLine, type ChangeSummary } from "./summary/deterministic.js";
 import type { ProtocolChange, ProtocolChangeSeverity, ProtocolSource } from "./types.js";
 
@@ -41,7 +42,7 @@ interface ParsedArgs {
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [command, ...rest] = argv;
-  if (!command) throw new CliError("usage: cli.ts <watch|status|diff|baseline> [--dry-run] [--force] [--source=<id>] [--limit=N]");
+  if (!command) throw new CliError("usage: cli.ts <watch|status|diff|baseline|test-notify> [--dry-run] [--force] [--source=<id>] [--limit=N]");
 
   let dryRun = false;
   let force = false;
@@ -236,12 +237,35 @@ async function cmdBaseline(args: ParsedArgs): Promise<void> {
   }
 }
 
+async function cmdTestNotify(args: ParsedArgs): Promise<void> {
+  const config = loadProtocolWatcherConfig();
+  const text = buildTestMessage();
+
+  if (args.dryRun) {
+    print("[protocol-watcher] --dry-run: would send the following connectivity test if run for real:\n");
+    print(text);
+    print(`\n(telegram enabled=${config.telegramEnabled}, technocore enabled=${config.technocoreEnabled})`);
+    return;
+  }
+
+  const telegramTransport: TelegramTransport | undefined = config.telegramEnabled ? createHttpTelegramTransport(config.requestTimeoutMs) : undefined;
+  const technocoreSender: TechnocoreSender | undefined = config.technocoreEnabled ? createRealTechnocoreSender({ baseUrl: process.env.TECHNOCORE_BASE_URL }) : undefined;
+
+  const results = await sendTestNotifications(config, { telegramTransport, technocoreSender });
+  for (const r of results) {
+    if (!r.attempted) print(`[protocol-watcher] ${r.channel}: skipped (${r.error})`);
+    else if (r.ok) print(`[protocol-watcher] ${r.channel}: sent OK`);
+    else print(`[protocol-watcher] ${r.channel}: FAILED -- ${r.error}`);
+  }
+}
+
 async function main(): Promise<void> {
   const args = parseArgs(process.argv.slice(2));
   if (args.command === "watch") return cmdWatch(args);
   if (args.command === "status") return cmdStatus();
   if (args.command === "diff") return cmdDiff(args);
   if (args.command === "baseline") return cmdBaseline(args);
+  if (args.command === "test-notify") return cmdTestNotify(args);
   throw new CliError(`unknown command: ${args.command}`);
 }
 

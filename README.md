@@ -1522,6 +1522,13 @@ npm run protocol:status         # DB-only report: sources, versions, hashes, wat
 npm run protocol:diff           # the most recent change batch, human-readable
 npm run protocol:baseline       # explicit first-run baseline; refuses an existing baseline
                                  # unless --force, and never notifies either way
+npm run protocol:test-notify    # sends a fixed, clearly-labeled connectivity-test message
+                                 # over whichever channel(s) are enabled -- NOT a real
+                                 # change, never touches protocol_changes/protocol_events/
+                                 # protocol_notifications. Add --dry-run to only print what
+                                 # would be sent. Useful right after enabling a channel, so
+                                 # you don't have to wait for a real FLOP doc change to know
+                                 # it's wired correctly.
 ```
 
 `watch`/`baseline` accept `--source=<id>` to scope to one source; `diff` accepts
