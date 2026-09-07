@@ -1,0 +1,66 @@
+# Central registry of official FLOP documentation sources for the Protocol
+# Watcher (src/protocol-watcher/). URLs live here, not scattered as string
+# literals through the code -- same separation-of-concerns reason
+# config/debate.yaml exists (changing what's monitored must never mean
+# touching source code or .env).
+#
+# `kind` selects the extractor: "html-flop" for flop.finance pages (a generic
+# HTML extractor that looks for a `.meta` block, a `.draft-banner`, an
+# Appendix A parameter table, Appendix E open items and an Appendix H
+# implementation matrix -- each is skipped gracefully, per source, when a
+# given page doesn't have it), "markdown-tclk" for the raw GitHub docs
+# (headings + a Keep-a-Changelog version header when present).
+sources:
+  - id: yellowpaper
+    name: "Yellow Paper"
+    url: https://flop.finance/intro/yellowpaper/
+    kind: html-flop
+    enabled: true
+
+  - id: verification
+    name: "Verification (intro)"
+    url: https://flop.finance/intro/verification/
+    kind: html-flop
+    enabled: true
+
+  - id: agent
+    name: "Agent (intro)"
+    url: https://flop.finance/intro/agent/
+    kind: html-flop
+    enabled: true
+
+  - id: validator
+    name: "Validator (intro)"
+    url: https://flop.finance/intro/validator/
+    kind: html-flop
+    enabled: true
+
+  - id: revenue
+    name: "Revenue model (intro)"
+    url: https://flop.finance/intro/revenue/
+    kind: html-flop
+    enabled: true
+
+  - id: teaser
+    name: "Teaser"
+    url: https://flop.finance/teaser/
+    kind: html-flop
+    enabled: true
+
+  - id: tclk-readme
+    name: "tclk README"
+    url: https://raw.githubusercontent.com/flop-labs/tclk/main/README.md
+    kind: markdown-tclk
+    enabled: true
+
+  - id: tclk-spec
+    name: "tclk SPEC"
+    url: https://raw.githubusercontent.com/flop-labs/tclk/main/SPEC.md
+    kind: markdown-tclk
+    enabled: true
+
+  - id: tclk-changelog
+    name: "tclk CHANGELOG"
+    url: https://raw.githubusercontent.com/flop-labs/tclk/main/CHANGELOG.md
+    kind: markdown-tclk
+    enabled: true

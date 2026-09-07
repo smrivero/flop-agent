@@ -1314,3 +1314,269 @@ agentB:
   position: Gold is the superior monetary asset
   personalityFile: ./prompts/gold-investor.md
 ```
+
+## FLOP Protocol Watcher (`src/protocol-watcher/`)
+
+Monitors the official FLOP documentation (Yellow Paper, the four `intro/` pages, the
+teaser, and the `tclk` README/SPEC/CHANGELOG on GitHub) for real changes and raises typed,
+persisted alerts -- new testnet dates, a ratified open spec item, a validator stake change,
+an implementation moving from `PLANNED`/`GAP` to `PARTIAL`/`LIVE`, a real tclk settlement
+rail shipping, and so on. Completely independent of Radar/mentions, the Verifier, debate,
+the private `tclk/` pair and the `tclk-marketplace/` worker -- its own SQLite file, its own
+lock, its own JSON-Lines logger, no shared code path with any of them beyond read-only
+reuse of `TechnocoreClient` / `loadIdentity` (Agent A's existing DID) and
+`mentions/http.ts`'s `fetchWithTimeout` primitive.
+
+### Why a separate module
+
+The other pipelines watch *mentions of* Technocore, or coordinate two agents *through*
+Technocore. This one watches FLOP's own source-of-truth documents for the protocol
+parameters, open items and implementation status those other pipelines eventually depend
+on -- a different problem (structured document diffing, not search/dedup or agent
+coordination), so it gets its own database, its own config namespace
+(`PROTOCOL_WATCHER_*`), and its own commands rather than being bolted onto Radar's schema.
+
+### Sources (`config/protocol-sources.yaml`)
+
+URLs are never hardcoded in source files -- every fetch traces back to this file:
+
+```yaml
+sources:
+  - id: yellowpaper
+    name: "Yellow Paper"
+    url: https://flop.finance/intro/yellowpaper/
+    kind: html-flop
+    enabled: true
+  # ...verification, agent, validator, revenue, teaser (all html-flop),
+  # tclk-readme, tclk-spec, tclk-changelog (all markdown-tclk)
+```
+
+`kind` picks the extractor: `html-flop` looks for a `.meta` block, a `.draft-banner`, an
+Appendix A parameter table, Appendix E open items and an Appendix H implementation matrix
+-- each skipped gracefully (a warning, not an error) on a page that doesn't have it (only
+the Yellow Paper has all four; the lighter intro pages just get their footer/`.meta`
+metadata). `markdown-tclk` reads headings, a Keep-a-Changelog version header when present,
+and the README's own `## Status` section body (the "no rail holds value yet" text --
+diffing that is what flags a real settlement rail shipping later).
+
+### Architecture
+
+```
+config/protocol-sources.yaml   the URL registry -- never edit code to change what's watched
+
+src/protocol-watcher/
+  types.ts               OpenItem / ImplementationItem / ProtocolChange / ProtocolEvent shapes
+  config.ts               PROTOCOL_WATCHER_* env vars, read once
+  sources.ts               loads + validates protocol-sources.yaml
+  logger.ts                 JSON-Lines logging, isolated to this module (see "Logs" below)
+  http.ts                    conditional GET (ETag/If-Modified-Since, 304 short-circuit),
+                             capped redirects, capped response size, timeout + limited
+                             retry (5xx/network only) -- a local wrapper, NOT
+                             mentions/http.ts's fetchWithRetry (that one has no size cap
+                             or redirect cap); only its fetchWithTimeout primitive is reused
+  hash.ts                     sha256
+  storage.ts                   content-addressed raw/normalized file storage (dedup by
+                               hash, retention only after confirming nothing references it)
+  database.ts                   own SQLite file -- see "Database" below
+  diff.ts                        structural diff between two extraction sets
+  classify.ts                     diff entries -> typed ProtocolChange (category +
+                                  deterministic severity, incl. every action_required rule)
+  events.ts                        classified changes -> the 10 FLOP_* events, idempotent
+                                   per (event type, source, batch)
+  contradictions.ts                 flags the teaser's own "not yet ratified" disclosure;
+                                    Yellow Paper is always normative when it fires
+  run.ts                             orchestrates one run: fetch -> normalize -> hash ->
+                                     compare -> parse -> diff -> classify -> persist -> notify
+  status.ts                          `protocol:status` -- reads the DB only, no network
+  cli.ts                              watch / status / diff / baseline subcommands
+  normalize/
+    text.ts        whitespace/line-ending collapsing shared by both normalizers below
+    html.ts          HTML -> {root (cleaned DOM for structural extraction), normalizedText}
+    markdown.ts        Markdown -> {headings, changelogEntries, sections, normalizedText}
+  extract/
+    domUtils.ts               table/heading/section-label helpers (all DOM-based --
+                              no table is ever parsed out of raw HTML with a regex)
+    paramCategory.ts            deterministic name-prefix -> category classifier
+    metadata.ts, markdownDoc.ts   document metadata (version/status/updated/testnet/...)
+    params.ts                      Appendix A -- the ~150-row parameter reference table
+    openItems.ts                    Appendix E -- open spec items (id/status/placeholder/
+                                    blockers), reads the `<code>[TAG]</code>` structurally
+    implementationMatrix.ts          Appendix H -- the conformance/implementation matrix
+    watchedOpenItems.ts               E.35/E.38/E.39/E.40/E.42/E.43/E.44/E.45/E.46/E.49
+    index.ts                          dispatches by source kind, never throws
+  summary/
+    deterministic.ts   the Telegram template + one fixed, rule-tied Impact sentence
+                       (never freeform -- see "never invents a consequence" below)
+    llm.ts               optional short rewording (verifier/openai.ts's own plain-fetch,
+                         structured-output pattern) -- shown ONLY the structured diff JSON,
+                         never a fetched page
+    index.ts               ties them together; LLM disabled/missing keys/failed all fall
+                           back to the deterministic summary without blocking the run
+  notify/
+    telegram.ts   new integration (none existed in this project before); disabled by
+                  default; a single attempt per chunk, no retry (avoids a double-post)
+    technocore.ts   optional signed publish using Agent A's EXISTING identity; disabled
+                    by default; never publishes a cosmetic-only change or the full document
+  __fixtures__/   small HTML/Markdown fixtures + a matching *.test.ts next to each module
+```
+
+### Flow, one run
+
+1. Acquire the concurrency lock (`mentions/lock.ts`, reused unchanged) -- exit immediately
+   if another run is active.
+2. For every enabled source, independently (one source's failure never stops the rest):
+   1. Conditional GET with the previous snapshot's ETag/Last-Modified. A `304` short-
+      circuits here -- no body read, no snapshot, no further work for this source.
+   2. Normalize (strip `<script>/<style>/<svg>/<nav>/<header>/<footer>`, the `.toc` block,
+      collapse whitespace) and hash the result.
+   3. If the normalized hash matches the last snapshot's, refresh the cached ETag/
+      Last-Modified on that same row and stop -- **no new snapshot row**, regardless of
+      whether the raw bytes changed (a template regen with identical text is not a change).
+   4. Otherwise: parse into structured data (metadata / Appendix A / E / H, or the
+      Markdown equivalent), store the raw + normalized content (deduped by hash), insert
+      a new snapshot + its extractions.
+   5. First snapshot for a source (no prior one exists) -- **baseline**: persisted, never
+      diffed, never notified.
+   6. Otherwise: structurally diff this snapshot's extractions against the previous one's.
+      Zero structural differences (a wording tweak outside every tracked field, while the
+      whole-page hash still moved) -- snapshot recorded, still no alert.
+   7. Real structural differences -- classify each into a `ProtocolChange`
+      (category + severity), persist them, derive + persist the `FLOP_*` events they imply
+      (idempotent per batch), build the Telegram + Technocore notification content, and
+      send (or, in dry-run, preview-and-persist-only -- see below).
+3. Retention sweep: snapshot rows older than `PROTOCOL_WATCHER_RETENTION_DAYS` are pruned
+   **only** if they're not the latest for their source and not referenced by any recorded
+   change; their content files are deleted only once no remaining snapshot references that
+   hash.
+4. Release the lock.
+
+### Database (own file, `PROTOCOL_WATCHER_DB_PATH`, default `.data/protocol-watcher.sqlite3`)
+
+Same additive-migration convention as `mentions/database.ts` (`CREATE TABLE IF NOT EXISTS`
++ `ALTER TABLE ADD COLUMN`, never destructive):
+
+- **`protocol_sources`** -- one row per `protocol-sources.yaml` entry, plus operational
+  bookkeeping (`consecutive_errors`, `last_error`, `last_attempted_at`, `last_success_at`)
+  `protocol:status` reads directly.
+- **`protocol_snapshots`** -- one row per *semantically distinct* fetch (see step 2.3
+  above): declared version/updated date, HTTP status, ETag/Last-Modified, raw + normalized
+  hash, content file paths, parse status/error, `is_baseline`.
+- **`protocol_extractions`** -- every structured item from a snapshot (metadata, a
+  tokenomics/agent/validator/verification parameter, an open item, an implementation-matrix
+  row), one row per `(snapshot_id, category, item_key)`. This is what `protocol:status`
+  reads for "current parameters" -- it never re-fetches a page to answer that question.
+- **`protocol_changes`** -- one row per classified diff entry: category, severity,
+  before/after JSON, evidence (URL + section + before/after text preview), grouped by
+  `change_batch_id` (one id per `runWatcher()` call).
+- **`protocol_events`** -- the 10 `FLOP_*` events (see below), deduplicated by
+  `idempotency_key = event_type:source_id:change_batch_id` so a batch with three validator
+  changes still emits `FLOP_VALIDATOR_REQUIREMENTS_CHANGED` exactly once.
+- **`protocol_notifications`** -- the outcome of every Telegram/Technocore attempt,
+  including dry-run previews (`status='dry_run'`) -- `protocol:status`'s "recent
+  notifications" section reads this directly.
+
+### Internal events
+
+```
+FLOP_DOCUMENT_CHANGED             FLOP_TESTNET_DATE_CHANGED
+FLOP_AIRDROP_RULES_CHANGED        FLOP_TESTNET_ENDPOINT_AVAILABLE
+FLOP_AGENT_SCORING_RATIFIED       FLOP_INFERENCE_INTERFACE_AVAILABLE
+FLOP_VALIDATOR_REQUIREMENTS_CHANGED  FLOP_SPEND_TO_UNLOCK_CHANGED
+                                   FLOP_TCLK_RAIL_AVAILABLE
+                                   FLOP_IMPLEMENTATION_STATUS_CHANGED
+```
+
+Persisted, logged, and Telegram/Technocore-notifiable -- and, per this feature's own
+design, **inert**: nothing here (or anywhere else in this module) triggers a faucet claim,
+a payment, or a configuration change. `events.ts` only routes already-classified changes to
+one of these ten types; it makes no decisions of its own.
+
+### Never invents a consequence
+
+The deterministic summary (`summary/deterministic.ts`) is what the Telegram message always
+uses -- an "Impact:" line is either omitted or one of a handful of **fixed**, rule-tied
+sentences (e.g. "Validator stake/unbonding requirements changed -- review any
+validator-facing configuration."), never freeform text. The optional LLM rewording
+(`summary/llm.ts`, off by default) is shown only the already-computed diff JSON -- never a
+fetched page -- and its system prompt explicitly tells it to treat that JSON as untrusted
+data, summarize only what's given, never invent an impact, and distinguish ratified values
+from `TBD`/`RATIFY`/`PLANNED` placeholders using the diff's own status fields. If the LLM
+call fails or is disabled, the deterministic summary is what gets sent -- always, without
+blocking the run.
+
+### Teaser vs. Yellow Paper
+
+The teaser page discloses its own non-normative figures in its `.draft-banner` (e.g. *"Two
+figures on this page LEAD the protocol parameters of record and are not yet ratified..."*).
+`contradictions.ts` detects that disclosure structurally (a fixed phrase the page itself
+uses) rather than attempting to diff arbitrary marketing prose against Appendix A numbers.
+When it fires, the note is unambiguous: **the Yellow Paper is normative**, never the teaser.
+
+### CLI
+
+```bash
+npm run protocol:watch          # fetch, diff, persist, and send enabled notifications
+npm run protocol:watch:dry      # same pipeline, but Telegram/Technocore are only previewed
+npm run protocol:status         # DB-only report: sources, versions, hashes, watched open
+                                 # items, recent notifications -- never touches the network
+npm run protocol:diff           # the most recent change batch, human-readable
+npm run protocol:baseline       # explicit first-run baseline; refuses an existing baseline
+                                 # unless --force, and never notifies either way
+```
+
+`watch`/`baseline` accept `--source=<id>` to scope to one source; `diff` accepts
+`--source=<id>` too. `--dry-run` also works as a flag on `watch` directly
+(`tsx src/protocol-watcher/cli.ts watch --dry-run`, which is exactly what
+`protocol:watch:dry` runs). `npm run protocol:watch` itself exits immediately, doing
+nothing, while `PROTOCOL_WATCHER_ENABLED=false` (the default) -- `--dry-run` always runs
+regardless, since it never sends anything.
+
+### Cron
+
+Same shape as every other one-shot job in this project -- one process, one run, exits,
+concurrency handled internally (`acquireLock`, reused from `mentions/lock.ts`):
+
+```cron
+0 */6 * * *   cd /opt/flop-agent && /usr/bin/npm run protocol:watch >> /var/log/protocol-watcher.log 2>&1
+```
+
+This project never edits your crontab or installs/enables anything for you -- add that line
+yourself (`crontab -e`) once you've reviewed dry-run output and are ready to go live.
+
+### Logs
+
+JSON, one object per line (deliberately different from every other module here, which use
+plain `[tag] k=v` text -- this module's own choice, isolated to `logger.ts`):
+
+```json
+{"timestamp":"2026-09-07T16:00:00.000Z","component":"protocol-watcher","action":"change_detected","sourceId":"yellowpaper","previousVersion":"0.5.0","currentVersion":"0.5.1","normalizedHash":"...","changeCount":3,"severity":"action_required","telegramSent":false,"technocorePublished":false,"durationMs":820,"success":true}
+```
+
+Never logs a token, private key, or full page content -- only URLs, hashes, counts and
+short before/after value previews (capped at 300 chars).
+
+### Configuration
+
+See `.env.example`'s `FLOP Protocol Watcher` block for every variable with inline docs.
+Everything defaults to **disabled**:
+
+```env
+PROTOCOL_WATCHER_ENABLED=false
+PROTOCOL_WATCHER_TELEGRAM_ENABLED=false
+PROTOCOL_WATCHER_TECHNOCORE_ENABLED=false
+PROTOCOL_WATCHER_LLM_SUMMARY_ENABLED=false
+```
+
+Telegram is a brand-new integration in this project (no prior Telegram code existed to
+reuse). Technocore publishing reuses Agent A's existing identity
+(`TECHNOCORE_IDENTITY_PATH`) unchanged -- it never generates a DID, never publishes a
+cosmetic-only change, never the full document, and defaults to the unclaimed room
+`d-flop-protocol-watch` (never auto-created or auto-joined by this code).
+
+### Restrictions (by design, not by omission)
+
+No code path in this module generates a DID, modifies an existing identity, touches
+`src/mentions/`, `src/verifier/`, `src/debate/`, `src/tclk/` or `src/tclk-marketplace/`, or
+triggers a financial action of any kind. Enabling cron, Telegram, or Technocore publishing
+is always a manual, explicit step the operator takes after reviewing `protocol:status` and
+dry-run output -- this project does not do it for you.

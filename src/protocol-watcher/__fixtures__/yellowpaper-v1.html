@@ -1,0 +1,59 @@
+<!doctype html>
+<html lang="en">
+<head><title>FLOP Network Yellow Paper</title></head>
+<body>
+<div class="draft-banner">Draft — the normative specification of the protocol. Sections marked planned are not yet implemented.</div>
+<div class="cover">
+  <p class="kicker">FLOP Network · Yellow Paper</p>
+  <h1 class="mission">Normative specification of the <em>FLOP protocol</em>.</h1>
+  <details class="toc" open><summary>Contents</summary><ol><li><a href="#appendix-a--parameter-reference">Appendix A</a></li></ol></details>
+  <div class="meta">
+    <span>Version<b>0.5.0 (draft)</b></span>
+    <span>Status<b>Implementation spec — iterating</b></span>
+    <span>Updated<b>2026-09-05</b></span>
+  </div>
+</div>
+
+<h2 id="appendix-e--open-specification-items"><a class="section-link" href="#appendix-e--open-specification-items">Appendix E — Open Specification Items</a></h2>
+<p>Each unresolved value/definition/mechanism has a numbered stub.</p>
+<p><strong>E.8 — Value-coupled floor k + retarget cadence <code>[TBD]</code>.</strong> Set k in effective_minimum_stake and its governance retarget cadence. <em>Placeholder:</em> k &#8805; m&#183;&#954;/(&#952;N&#963;&#948;); slow-cadence retarget from the indexer. Home: &#167;11, &#167;15.2. Blocking: #556.</p>
+<p><strong>E.38 — Committee sampling capture / min-size proof <code>[TBD]</code>.</strong> Bound seat-capture and undersized-committee risk formally. Home: &#167;2.3, &#167;15.4. Blocking: #448, #848.</p>
+
+<h2 id="appendix-a--parameter-reference"><a class="section-link" href="#appendix-a--parameter-reference">Appendix A — Parameter Reference</a></h2>
+<p>The table below is generated from params/flop-protocol-params.yaml.</p>
+<p><strong>Genesis</strong></p>
+<div class="tablewrap"><table>
+<thead><tr><th>Parameter</th><th>Value</th><th>&#167;</th><th>Decision</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a id="param-genesis_supply"></a><code>genesis_supply</code></td><td>2_483_460_000 FLOP</td><td><a href="#sec">&#167;2.3</a></td><td>D-0421</td><td>Genesis (pre-emission) total supply.</td></tr>
+<tr><td><a id="param-genesis_miner_airdrop"></a><code>genesis_miner_airdrop</code></td><td>993_384_000 FLOP</td><td><a href="#sec">&#167;2.3</a></td><td>D-0421</td><td>Miner-airdrop component (40%).</td></tr>
+<tr><td><a id="param-genesis_validator_airdrop"></a><code>genesis_validator_airdrop</code></td><td>305_505_000 FLOP</td><td><a href="#sec">&#167;2.3</a></td><td>D-0435</td><td>Validator-airdrop component (12.3%).</td></tr>
+<tr><td><a id="param-genesis_agent_airdrop"></a><code>genesis_agent_airdrop</code></td><td>596_030_400 FLOP</td><td><a href="#sec">&#167;3.5</a></td><td>D-0421</td><td>Agent-airdrop component (24%).</td></tr>
+<tr><td><a id="param-airdrop_vesting_duration_blocks"></a><code>airdrop_vesting_duration_blocks</code></td><td>7_776_000 blocks</td><td><a href="#sec">&#167;9</a></td><td>SPEC-022</td><td>90-day linear airdrop vesting duration.</td></tr>
+</tbody></table></div>
+<p><strong>Validator security policy</strong></p>
+<div class="tablewrap"><table>
+<thead><tr><th>Parameter</th><th>Value</th><th>&#167;</th><th>Decision</th><th>Description</th></tr></thead>
+<tbody>
+<tr><td><a id="param-validator_min_stake"></a><code>validator_min_stake</code></td><td>50_000 FLOP</td><td><a href="#sec">&#167;15.2</a></td><td>D-0440</td><td>Minimum self-stake to enter the active set.</td></tr>
+<tr><td><a id="param-validator_unbonding_blocks"></a><code>validator_unbonding_blocks</code></td><td>604_800 blocks</td><td><a href="#sec">&#167;15.7</a></td><td>D-0440</td><td>Unbonding period after exit.</td></tr>
+</tbody></table></div>
+
+<h2 id="appendix-h--conformance--implementation-status-matrix"><a class="section-link" href="#appendix-h--conformance--implementation-status-matrix">Appendix H — Conformance &amp; Implementation-Status Matrix</a></h2>
+<h3 id="h1-core-protocol"><a class="section-link" href="#h1-core-protocol">H.1 Core protocol</a></h3>
+<div class="tablewrap"><table>
+<thead><tr><th>Requirement / mechanism</th><th>&#167;</th><th>Status</th><th>Code path &#183; tracker</th></tr></thead>
+<tbody>
+<tr><td>BABE authoring + AlephBFT finality (1 s blocks)</td><td>&#167;2</td><td>LIVE</td><td><code>pallet_aleph</code> (idx 104); 4-validator devnet</td></tr>
+<tr><td>Three safety sub-proofs</td><td>&#167;2.3</td><td>GAP: seat-capture/undersized/bootstrap bridge open (E.42)</td><td><code>q14-*-proof.md</code></td></tr>
+</tbody></table></div>
+<h3 id="h2-verification-3"><a class="section-link" href="#h2-verification-3">H.2 Verification (&#167;3)</a></h3>
+<div class="tablewrap"><table>
+<thead><tr><th>Requirement / mechanism</th><th>Status</th><th>Code path &#183; tracker</th></tr></thead>
+<tbody>
+<tr><td>TEE attestation (DCAP/dstack), quote &#8594; report_data</td><td>LIVE (on-TDX e2e pending)</td><td><code>pallets/verifiers/dstack</code>; <code>tee-bridge</code></td></tr>
+<tr><td>TOPLOC Tier 2 (commitment required; end-to-end error bound open)</td><td>PARTIAL</td><td>presence-only #929</td></tr>
+<tr><td>Metering cert circuit version + guest image-id registry</td><td>PLANNED</td><td>tracked under #929</td></tr>
+</tbody></table></div>
+</body>
+</html>
