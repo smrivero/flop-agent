@@ -9,9 +9,13 @@
  * hand-written extractor per human-language field name.
  *
  * Every row across every "Parameter | Value | ..." table in the document is
- * captured, not just Appendix A specifically -- a future page that adds a
- * similarly-shaped table elsewhere is picked up automatically, and nothing
- * here special-cases the "Appendix A" heading text itself.
+ * considered, not just Appendix A specifically -- nothing here special-cases
+ * the "Appendix A" heading text itself. A row only becomes an extracted
+ * parameter if its name cell carries a real `<code>`/`#param-` token though
+ * (see paramNameFromCell) -- a handful of short prose "summary" tables
+ * elsewhere share the exact same "Parameter | Value" header text without
+ * being the canonical reference, and their rows are skipped instead of
+ * being mistaken for parameters of their own.
  */
 
 import type { HTMLElement } from "node-html-parser";
@@ -19,6 +23,17 @@ import type { ExtractionItem } from "../types.js";
 import { classifyParamName } from "./paramCategory.js";
 import { readTableRows, sectionLabel } from "./domUtils.js";
 
+/**
+ * Only a `<a id="param-X">` anchor or a `<code>name</code>` counts as a real
+ * machine-readable parameter name -- deliberately NOT a plain-text fallback.
+ * The document also has short "Parameter | Value" *summary* tables per
+ * section (e.g. §9's "Total genesis supply" row, whose Value cell is a full
+ * prose sentence linking several real params together) that happen to share
+ * the exact same header text as Appendix A's real tables. Without this
+ * restriction those rows were extracted as bogus "parameters" of their own
+ * (item key = the prose label, value = the whole sentence) -- confirmed live
+ * against flop.finance/intro/yellowpaper/ §9's genesis-supply summary row.
+ */
 function paramNameFromCell(cell: HTMLElement): string | undefined {
   const anchor = cell.querySelector('a[id^="param-"]');
   if (anchor) {
@@ -27,8 +42,7 @@ function paramNameFromCell(cell: HTMLElement): string | undefined {
   }
   const code = cell.querySelector("code");
   if (code) return code.text.trim() || undefined;
-  const text = cell.text.trim();
-  return text.length > 0 ? text : undefined;
+  return undefined;
 }
 
 function isParameterTable(table: HTMLElement): boolean {

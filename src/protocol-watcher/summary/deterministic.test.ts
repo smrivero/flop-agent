@@ -33,6 +33,22 @@ test("deterministic summary: formats an open-item status line as 'id: before →
   assert.equal(summary.severity, "action_required");
 });
 
+test("deterministic summary: an open item whose status didn't change describes what actually did -- never 'X: TBD → TBD' -- regression for a real production alert", () => {
+  const changes = [
+    baseChange({
+      category: "other",
+      itemId: "E.38",
+      field: "E.38",
+      severity: "important",
+      previousValue: { id: "E.38", title: "x", status: "TBD", summary: "old summary", blockers: ["#448", "#848"], sourceSection: "" },
+      currentValue: { id: "E.38", title: "x", status: "TBD", summary: "old summary", blockers: ["#448"], sourceSection: "" },
+    }),
+  ];
+  const summary = buildDeterministicSummary(SOURCE, changes, {});
+  assert.equal(summary.changeLines[0], "E.38: blockers #448, #848 → #448 (status unchanged: TBD)");
+  assert.ok(!summary.changeLines[0].includes("TBD → TBD"));
+});
+
 test("deterministic summary: formats a parameter value line as 'field: before → after'", () => {
   const changes = [
     baseChange({

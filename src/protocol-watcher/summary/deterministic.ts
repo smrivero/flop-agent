@@ -40,10 +40,28 @@ function isParamValue(value: unknown): value is { value?: string } {
   return typeof value === "object" && value !== null && "value" in value;
 }
 
+/** Which OpenItem field actually differs, when the status itself didn't --
+ * e.g. a reworded summary or an updated blockers list. Without this, a
+ * status-unchanged-but-content-changed diff rendered as the confusing
+ * "E.38: TBD → TBD" (real example: a live production alert where only the
+ * blockers list had changed). Checked in a fixed, deterministic order. */
+function describeUnchangedStatusOpenItem(before: OpenItem, after: OpenItem): string {
+  if (before.title !== after.title) return `title updated (status unchanged: ${after.status})`;
+  if (JSON.stringify(before.blockers) !== JSON.stringify(after.blockers)) {
+    return `blockers ${before.blockers.join(", ") || "(none)"} → ${after.blockers.join(", ") || "(none)"} (status unchanged: ${after.status})`;
+  }
+  if (before.placeholder !== after.placeholder) return `placeholder text updated (status unchanged: ${after.status})`;
+  if (before.summary !== after.summary) return `summary text updated (status unchanged: ${after.status})`;
+  return `content updated (status unchanged: ${after.status})`;
+}
+
 export function formatChangeLine(change: ProtocolChange): string {
   const { previousValue, currentValue, changeType, field, itemId } = change;
 
   if (isOpenItem(previousValue) || isOpenItem(currentValue)) {
+    if (isOpenItem(previousValue) && isOpenItem(currentValue) && previousValue.status === currentValue.status) {
+      return `${itemId}: ${describeUnchangedStatusOpenItem(previousValue, currentValue)}`;
+    }
     const before = isOpenItem(previousValue) ? previousValue.status : "(new)";
     const after = isOpenItem(currentValue) ? currentValue.status : "(removed)";
     return `${itemId}: ${before} → ${after}`;

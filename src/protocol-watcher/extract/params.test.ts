@@ -39,3 +39,31 @@ test("params: returns an empty list (never throws) on a page with no parameter t
   const { root } = parseHtmlDocument("<html><body><p>Nothing to see here.</p></body></html>");
   assert.deepEqual(extractParameterItems(root), []);
 });
+
+test("params: a short 'Parameter | Value' summary table (prose cells, no <code> name) is not mistaken for Appendix A -- regression for the real §9 'Total genesis supply' row", () => {
+  const html = `
+    <h2 id="9-emission--supply">9. Emission &amp; Supply</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Parameter</th><th>Value</th></tr></thead>
+      <tbody>
+        <tr><td>Total genesis supply</td><td><a href="#param-genesis_supply"><code>genesis_supply</code></a> = 4,400,000,000 FLOP (no VC pre-mint, no auction) &mdash; three airdrops: <a href="#param-genesis_miner_airdrop"><code>genesis_miner_airdrop</code></a> = 1,200,000,000</td></tr>
+        <tr><td>Era 0 block reward</td><td><a href="#param-initial_block_reward"><code>initial_block_reward</code></a> = 96 FLOP/block</td></tr>
+      </tbody>
+    </table></div>
+    <h2 id="appendix-a--parameter-reference">Appendix A &mdash; Parameter Reference</h2>
+    <div class="tablewrap"><table>
+      <thead><tr><th>Parameter</th><th>Value</th><th>&#167;</th><th>Decision</th><th>Description</th></tr></thead>
+      <tbody>
+        <tr><td><a id="param-genesis_supply"></a><code>genesis_supply</code></td><td>4_400_000_000 FLOP</td><td><a href="#sec">&#167;9.3</a></td><td>D-0440</td><td>Genesis total supply.</td></tr>
+      </tbody>
+    </table></div>
+  `;
+  const { root } = parseHtmlDocument(html);
+  const items = extractParameterItems(root);
+
+  assert.equal(items.length, 1, "only the real Appendix A row should be extracted, not the two summary-table rows");
+  assert.equal(items[0].itemKey, "genesis_supply");
+  assert.equal((items[0].value as { value: string }).value, "4_400_000_000 FLOP", "the clean canonical value, not the prose sentence from the summary table");
+  assert.ok(!items.some((i) => i.itemKey === "Total genesis supply"));
+  assert.ok(!items.some((i) => i.itemKey === "Era 0 block reward"));
+});
