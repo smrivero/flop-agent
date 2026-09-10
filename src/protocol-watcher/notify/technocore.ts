@@ -21,7 +21,7 @@
  *    operation here, same as the existing mentions publisher).
  */
 
-import { TechnocoreClient } from "../../technocore.js";
+import { TechnocoreClient, TechnocoreError } from "../../technocore.js";
 import { loadIdentity } from "../../identity.js";
 import type { ProtocolChange } from "../types.js";
 import type { NotifyResult } from "./telegram.js";
@@ -44,13 +44,26 @@ export interface TechnocoreSender {
 /** Real sender -- loads Agent A's identity from disk (never generates one)
  * and wraps the existing, unmodified TechnocoreClient. Constructing this
  * does not publish anything by itself. */
-export function createRealTechnocoreSender(options: { identityPath?: string; baseUrl?: string } = {}): TechnocoreSender {
+export function createRealTechnocoreSender(options: { identityPath?: string; baseUrl?: string; fetchImpl?: typeof fetch } = {}): TechnocoreSender {
   const identity = loadIdentity({ path: options.identityPath });
-  const client = new TechnocoreClient({ baseUrl: options.baseUrl });
+  const client = new TechnocoreClient({ baseUrl: options.baseUrl, fetchImpl: options.fetchImpl });
   return {
     async sendSignedMessage(room, text) {
-      const { posted } = await client.sendSignedMessage(room, text, { identity });
-      return { seq: posted.seq };
+      try {
+        const { posted } = await client.sendSignedMessage(room, text, { identity });
+        return { seq: posted.seq };
+      } catch (err) {
+        // TechnocoreError's `.body` carries the server's actual text/plain
+        // explanation (e.g. why a 400 happened) -- err.message alone is just
+        // "Technocore request failed: 400 Bad Request", which was all
+        // publishTechnocoreSummary's catch block ever surfaced before this,
+        // making a real failure impossible to diagnose from logs/status
+        // alone. Fold the body into the message here, once, for every caller.
+        if (err instanceof TechnocoreError) {
+          throw new Error(`${err.message}${err.body ? ` -- ${err.body.slice(0, 500)}` : ""}`);
+        }
+        throw err;
+      }
     },
   };
 }

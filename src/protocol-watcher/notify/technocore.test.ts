@@ -1,7 +1,10 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { publishTechnocoreSummary, isPublishWorthy, createRealTechnocoreSender, TECHNOCORE_SUMMARY_CHAR_LIMIT } from "./technocore.js";
-import { IdentityError } from "../../identity.js";
+import { IdentityError, generateIdentitySeed } from "../../identity.js";
 import type { TechnocoreSender } from "./technocore.js";
 import type { ProtocolChange } from "../types.js";
 
@@ -90,4 +93,22 @@ test("technocore: truncates an overlong summary defensively before publishing", 
 
 test("createRealTechnocoreSender: never generates an identity -- throws IdentityError when none exists on disk", () => {
   assert.throws(() => createRealTechnocoreSender({ identityPath: "/nonexistent/identity.json" }), IdentityError);
+});
+
+test("createRealTechnocoreSender: a server error's response body is folded into the thrown message, not discarded", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "protocol-watcher-technocore-"));
+  try {
+    const identityPath = join(dir, "identity.json");
+    writeFileSync(identityPath, JSON.stringify(generateIdentitySeed()));
+
+    const fetchImpl = (async () => new Response("nonce must be strictly increasing for this key in this room", { status: 400, statusText: "Bad Request" })) as typeof fetch;
+
+    const sender = createRealTechnocoreSender({ identityPath, fetchImpl });
+    await assert.rejects(
+      () => sender.sendSignedMessage("d-flop-protocol-watch", "hello"),
+      /400 Bad Request.*nonce must be strictly increasing/s,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

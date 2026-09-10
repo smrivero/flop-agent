@@ -1529,6 +1529,13 @@ npm run protocol:test-notify    # sends a fixed, clearly-labeled connectivity-te
                                  # would be sent. Useful right after enabling a channel, so
                                  # you don't have to wait for a real FLOP doc change to know
                                  # it's wired correctly.
+npm run protocol:retry-notify   # re-sends the notifications for the most recent change
+                                 # batch (optionally --source=<id>). A real diff is only
+                                 # ever notified once per run -- if that attempt failed
+                                 # (network blip, a transient 5xx, ...) and the content
+                                 # hasn't changed again since, nothing retries it on its
+                                 # own; this is the manual recovery path. Also accepts
+                                 # --dry-run to preview instead of sending.
 ```
 
 `watch`/`baseline` accept `--source=<id>` to scope to one source; `diff` accepts

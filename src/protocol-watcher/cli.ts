@@ -18,10 +18,13 @@ import { openDatabase, getLatestSnapshot, getChangesForBatch, getSource, type Ch
 import { createProtocolWatcherLogger } from "./logger.js";
 import { runWatcher, type RunOptions } from "./run.js";
 import { buildStatusReport } from "./status.js";
-import { createHttpTelegramTransport, type TelegramTransport } from "./notify/telegram.js";
-import { createRealTechnocoreSender, type TechnocoreSender } from "./notify/technocore.js";
+import { createHttpTelegramTransport, sendTelegramNotification, type TelegramTransport } from "./notify/telegram.js";
+import { createRealTechnocoreSender, publishTechnocoreSummary, type TechnocoreSender } from "./notify/technocore.js";
 import { buildTestMessage, sendTestNotifications } from "./notify/testMessage.js";
 import { formatChangeMessage, formatChangeLine, type ChangeSummary } from "./summary/deterministic.js";
+import { buildTechnocoreSummary } from "./summary/index.js";
+import { detectTeaserYellowpaperContradiction } from "./contradictions.js";
+import { insertNotification } from "./database.js";
 import type { ProtocolChange, ProtocolChangeSeverity, ProtocolSource } from "./types.js";
 
 try {
@@ -42,7 +45,7 @@ interface ParsedArgs {
 
 function parseArgs(argv: string[]): ParsedArgs {
   const [command, ...rest] = argv;
-  if (!command) throw new CliError("usage: cli.ts <watch|status|diff|baseline|test-notify> [--dry-run] [--force] [--source=<id>] [--limit=N]");
+  if (!command) throw new CliError("usage: cli.ts <watch|status|diff|baseline|test-notify|retry-notify> [--dry-run] [--force] [--source=<id>] [--limit=N]");
 
   let dryRun = false;
   let force = false;
@@ -109,6 +112,46 @@ async function cmdWatch(args: ParsedArgs): Promise<void> {
 
 const SEVERITY_ORDER: ProtocolChangeSeverity[] = ["action_required", "important", "info"];
 
+function reconstructChange(c: ChangeRow): ProtocolChange {
+  return {
+    sourceId: c.source_id,
+    detectedAt: c.detected_at,
+    category: c.category as ProtocolChange["category"],
+    itemId: c.item_id ?? undefined,
+    field: c.field ?? undefined,
+    previousValue: c.previous_value_json ? JSON.parse(c.previous_value_json) : undefined,
+    currentValue: c.current_value_json ? JSON.parse(c.current_value_json) : undefined,
+    changeType: c.change_type as ProtocolChange["changeType"],
+    severity: c.severity as ProtocolChangeSeverity,
+    evidence: JSON.parse(c.evidence_json),
+  };
+}
+
+function groupChangesBySource(rows: ChangeRow[]): Map<string, ChangeRow[]> {
+  const bySource = new Map<string, ChangeRow[]>();
+  for (const c of rows) {
+    if (!bySource.has(c.source_id)) bySource.set(c.source_id, []);
+    bySource.get(c.source_id)!.push(c);
+  }
+  return bySource;
+}
+
+function loadSourceOrPlaceholder(db: ReturnType<typeof openDatabase>, sourceId: string): ProtocolSource {
+  const row = getSource(db, sourceId);
+  return { id: sourceId, name: row?.name ?? sourceId, url: row?.url ?? "", kind: "html-flop", enabled: true };
+}
+
+function buildSummaryFromRows(source: ProtocolSource, rows: ChangeRow[]): ChangeSummary {
+  const severity = SEVERITY_ORDER.find((s) => rows.some((c) => c.severity === s)) ?? "info";
+  return {
+    sourceId: source.id,
+    sourceName: source.name,
+    url: source.url,
+    severity,
+    changeLines: rows.map((c) => formatChangeLine(reconstructChange(c))),
+  };
+}
+
 function cmdStatus(): void {
   const config = loadProtocolWatcherConfig();
   const db = openDatabase(config.dbPath);
@@ -161,38 +204,57 @@ function cmdDiff(args: ParsedArgs): void {
       return;
     }
 
-    const bySource = new Map<string, ChangeRow[]>();
-    for (const c of allChanges) {
-      if (!bySource.has(c.source_id)) bySource.set(c.source_id, []);
-      bySource.get(c.source_id)!.push(c);
+    const bySource = groupChangesBySource(allChanges);
+    for (const [sourceId, changes] of bySource) {
+      const source = loadSourceOrPlaceholder(db, sourceId);
+      print(formatChangeMessage(buildSummaryFromRows(source, changes)));
+      print("");
+    }
+  } finally {
+    db.close();
+  }
+}
+
+async function cmdRetryNotify(args: ParsedArgs): Promise<void> {
+  const config = loadProtocolWatcherConfig();
+  const db = openDatabase(config.dbPath);
+  try {
+    const batchRow = args.source
+      ? (db.prepare(`SELECT change_batch_id FROM protocol_changes WHERE source_id = ? ORDER BY id DESC LIMIT 1`).get(args.source) as { change_batch_id: string } | undefined)
+      : (db.prepare(`SELECT change_batch_id FROM protocol_changes ORDER BY id DESC LIMIT 1`).get() as { change_batch_id: string } | undefined);
+    if (!batchRow) {
+      print("No changes recorded yet -- nothing to retry.");
+      return;
     }
 
-    for (const [sourceId, changes] of bySource) {
-      const sourceRow = getSource(db, sourceId);
-      const source: ProtocolSource = { id: sourceId, name: sourceRow?.name ?? sourceId, url: sourceRow?.url ?? "", kind: "html-flop", enabled: true };
-      const severity = SEVERITY_ORDER.find((s) => changes.some((c) => c.severity === s)) ?? "info";
-      const summary: ChangeSummary = {
-        sourceId,
-        sourceName: source.name,
-        url: source.url,
-        severity,
-        changeLines: changes.map((c) =>
-          formatChangeLine({
-            sourceId: c.source_id,
-            detectedAt: c.detected_at,
-            category: c.category as ProtocolChange["category"],
-            itemId: c.item_id ?? undefined,
-            field: c.field ?? undefined,
-            previousValue: c.previous_value_json ? JSON.parse(c.previous_value_json) : undefined,
-            currentValue: c.current_value_json ? JSON.parse(c.current_value_json) : undefined,
-            changeType: c.change_type as ProtocolChange["changeType"],
-            severity: c.severity as ProtocolChangeSeverity,
-            evidence: JSON.parse(c.evidence_json),
-          }),
-        ),
-      };
-      print(formatChangeMessage(summary));
-      print("");
+    const allChanges = getChangesForBatch(db, batchRow.change_batch_id).filter((c) => !args.source || c.source_id === args.source);
+    if (allChanges.length === 0) {
+      print(`No changes in the latest batch for source ${JSON.stringify(args.source)}.`);
+      return;
+    }
+
+    const telegramTransport: TelegramTransport | undefined = config.telegramEnabled && !args.dryRun ? createHttpTelegramTransport(config.requestTimeoutMs) : undefined;
+    const technocoreSender: TechnocoreSender | undefined = config.technocoreEnabled && !args.dryRun ? createRealTechnocoreSender({ baseUrl: process.env.TECHNOCORE_BASE_URL }) : undefined;
+
+    const bySource = groupChangesBySource(allChanges);
+    for (const [sourceId, rows] of bySource) {
+      const source = loadSourceOrPlaceholder(db, sourceId);
+      const changes = rows.map(reconstructChange);
+      const changeSummary = buildSummaryFromRows(source, rows);
+      const contradiction = detectTeaserYellowpaperContradiction(db);
+      const telegramText = formatChangeMessage(changeSummary);
+      const technocoreSummary = await buildTechnocoreSummary(changeSummary, config, contradiction.contradicts ? contradiction.note : undefined);
+
+      const attemptedAt = new Date().toISOString();
+      const telegramResult = await sendTelegramNotification(config, telegramText, telegramTransport ?? { async send() { throw new Error("unreachable"); } }, args.dryRun);
+      insertNotification(db, { changeBatchId: batchRow.change_batch_id, channel: "telegram", destination: config.telegramChatId, status: telegramResult.status, attemptedAt, error: telegramResult.error });
+
+      const technocoreResult = await publishTechnocoreSummary(config, changes, technocoreSummary.text, technocoreSender ?? { async sendSignedMessage() { throw new Error("unreachable"); } }, args.dryRun);
+      insertNotification(db, { changeBatchId: batchRow.change_batch_id, channel: "technocore", destination: config.technocoreRoom, status: technocoreResult.status, attemptedAt, error: technocoreResult.error });
+
+      print(`[protocol-watcher] ${sourceId} (batch ${batchRow.change_batch_id}):`);
+      print(`  telegram: ${telegramResult.status}${telegramResult.error ? ` -- ${telegramResult.error}` : ""}`);
+      print(`  technocore: ${technocoreResult.status}${technocoreResult.error ? ` -- ${technocoreResult.error}` : ""}`);
     }
   } finally {
     db.close();
@@ -266,6 +328,7 @@ async function main(): Promise<void> {
   if (args.command === "diff") return cmdDiff(args);
   if (args.command === "baseline") return cmdBaseline(args);
   if (args.command === "test-notify") return cmdTestNotify(args);
+  if (args.command === "retry-notify") return cmdRetryNotify(args);
   throw new CliError(`unknown command: ${args.command}`);
 }
 
