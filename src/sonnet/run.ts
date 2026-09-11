@@ -67,6 +67,18 @@ export async function pollOnce(
   if (nextState.registration && nextState.phase === "UNREGISTERED") nextState = transition(nextState, "REGISTERED");
   if (nextState.phase === "REGISTERED") nextState = transition(nextState, "DISCOVERING");
 
+  // Same self-healing for our own team-request: adopt the most recent one
+  // WE signed, as observed in the room, if local state doesn't already know
+  // about it (another environment sent it, or state.json was wiped).
+  if (!nextState.team) {
+    const ours = scanResult.teamRequests.filter((t) => t.did === agent.did).sort((a, b) => b.seq - a.seq)[0];
+    if (ours) {
+      sonnetLog("STATE", `observed our own existing team-request in the room: game_id=${ours.gameId} seq=${ours.seq} -- reconciling local state`);
+      nextState = { ...nextState, team: { gameId: ours.gameId, requestId: ours.requestId, requestedAtUtc: ours.ts } };
+      if (nextState.phase === "DISCOVERING") nextState = transition(nextState, "TEAM_REQUESTED");
+    }
+  }
+
   const newlySetUpRooms: string[] = [];
 
   const ourTeam = nextState.team;

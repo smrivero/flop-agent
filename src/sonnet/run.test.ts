@@ -90,6 +90,46 @@ test("pollOnce: does not overwrite an already-recorded local registration", asyn
   assert.equal(next.registration?.requestId, "already-local");
 });
 
+test("pollOnce: reconciles our own team-request observed in the room into a fresh/empty local state", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "satoshitrump", request_id: "team-1" }),
+  );
+
+  const state = { ...defaultState("sonnet-1", agent.did), phase: "DISCOVERING" as const };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.team?.gameId, "satoshitrump");
+  assert.equal(next.phase, "TEAM_REQUESTED");
+});
+
+test("pollOnce: does not overwrite an already-recorded local team-request", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "satoshitrump", request_id: "team-1" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "TEAM_REQUESTED" as const,
+    team: { gameId: "already-local", requestId: "local-req", requestedAtUtc: "2026-09-11T13:00:00Z" },
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.team?.gameId, "already-local");
+});
+
 test("pollOnce: detects when our own requested room becomes set up and advances the phase", async () => {
   const agent = makeAgent();
   const config = loadSonnetConfig({});
