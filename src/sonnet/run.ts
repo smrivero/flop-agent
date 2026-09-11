@@ -48,6 +48,23 @@ export async function pollOnce(
 ): Promise<{ state: SonnetState; tick: PollTickResult }> {
   const scanResult = await scanRooms(agent.did, contest, config, client);
   let nextState: SonnetState = { ...state, discovery: toDiscoverySnapshot(scanResult) };
+
+  // Reconcile OUR OWN registration from what the room actually shows --
+  // registration.ts/cli.ts only ever record `state.registration` on the
+  // machine that ran `sonnet:register` itself; a fresh environment (a
+  // different host, a wiped data/ dir) needs to learn about an
+  // already-accepted registration from the room, not just from local
+  // bookkeeping, the same way a stale/missing state.json self-heals
+  // everywhere else in this module.
+  if (!nextState.registration && scanResult.ourRegistration) {
+    const observed = scanResult.ourRegistration;
+    sonnetLog("STATE", `observed our own existing registration in the room: role=${observed.role} seq=${observed.seq} -- reconciling local state`);
+    nextState = {
+      ...nextState,
+      registration: { role: observed.role, requestId: observed.requestId, xAccountUrl: observed.xAccountUrl, confirmedSeq: observed.seq },
+    };
+  }
+  if (nextState.registration && nextState.phase === "UNREGISTERED") nextState = transition(nextState, "REGISTERED");
   if (nextState.phase === "REGISTERED") nextState = transition(nextState, "DISCOVERING");
 
   const newlySetUpRooms: string[] = [];

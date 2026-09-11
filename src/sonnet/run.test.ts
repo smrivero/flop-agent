@@ -49,6 +49,47 @@ test("pollOnce: never posts anything, even with pending interests and a team req
   assert.equal(posted, false);
 });
 
+test("pollOnce: reconciles an already-accepted registration observed in the room into a fresh/empty local state", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned(
+    "mb-sonnet-1-registration",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.register.v1", contest_id: "sonnet-1", role: "writer", x_account_url: "https://x.com/us", request_id: "register-1" }),
+  );
+
+  const state = defaultState("sonnet-1", agent.did); // phase UNREGISTERED, no registration
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.registration?.role, "writer");
+  assert.equal(next.registration?.xAccountUrl, "https://x.com/us");
+  assert.equal(next.phase, "DISCOVERING"); // both REGISTERED and DISCOVERING transitions applied in one tick
+});
+
+test("pollOnce: does not overwrite an already-recorded local registration", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned(
+    "mb-sonnet-1-registration",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.register.v1", contest_id: "sonnet-1", role: "writer", x_account_url: "https://x.com/us", request_id: "register-1" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "DISCOVERING" as const,
+    registration: { role: "writer" as const, requestId: "already-local", confirmedSeq: 42 },
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.registration?.requestId, "already-local");
+});
+
 test("pollOnce: detects when our own requested room becomes set up and advances the phase", async () => {
   const agent = makeAgent();
   const config = loadSonnetConfig({});
