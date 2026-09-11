@@ -103,9 +103,28 @@ export interface SonnetState {
    * (recruit.ts's joinTeamRequest) -- populated by `sonnet:join`, watched by
    * `sonnet:run` (run.ts) for the referee setting up the room, which is the
    * first observable sign our interest may have been acted on. */
-  pendingJoinInterests?: Array<{ gameId: string; requesterDid: string; sentAtUtc: string; roomSetUpAtUtc?: string }>;
+  pendingJoinInterests?: Array<{
+    gameId: string;
+    requesterDid: string;
+    sentAtUtc: string;
+    roomSetUpAtUtc?: string;
+    /** Set once a sonnet.roster.v1 for this game_id is observed that
+     * includes OUR OWN DID -- the actual "you're in" signal, distinct from
+     * (and more meaningful than) the room merely existing. */
+    acceptedAtUtc?: string;
+  }>;
 
-  team?: { gameId: string; requestId: string; requestedAtUtc: string; room?: string; roomGeneration?: number };
+  team?: {
+    gameId: string;
+    requestId: string;
+    requestedAtUtc: string;
+    room?: string;
+    roomGeneration?: number;
+    /** request_ids of roster.v1 proposals for our own game_id already
+     * logged, so run.ts's monitoring loop announces each one once instead
+     * of repeating it every tick. */
+    notifiedRosterRequestIds?: string[];
+  };
   /** `frozenAtUtc` is set only once discovery.ts observes the FIRST accepted
    * word in the poem room -- per sonnet-game.md, the roster freezes
    * atomically on the first accepted word, not on our own signature. */

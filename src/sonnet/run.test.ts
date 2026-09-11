@@ -174,6 +174,103 @@ test("pollOnce: detects when a pending join-interest's room becomes set up, with
   assert.equal(next.pendingJoinInterests?.find((i) => i.gameId === "keeper1")?.roomSetUpAtUtc, undefined);
 });
 
+test("pollOnce: detects being ACCEPTED into someone else's roster (our DID appears in a roster.v1 for that game_id)", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const requester = makeTestIdentity();
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    requester,
+    JSON.stringify({
+      type: "sonnet.roster.v1",
+      contest_id: "sonnet-1",
+      game_id: "flop-bard-1",
+      poem_room: "d-sonnet-1-team-flop-bard-1",
+      room_generation: 0,
+      members: [requester.did, agent.did],
+      request_id: "roster-1",
+    }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    pendingJoinInterests: [{ gameId: "flop-bard-1", requesterDid: requester.did, sentAtUtc: "2026-09-11T13:00:00Z" }],
+  };
+
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.newlyAcceptedIntoTeams, ["flop-bard-1"]);
+  assert.ok(next.pendingJoinInterests?.find((i) => i.gameId === "flop-bard-1")?.acceptedAtUtc);
+});
+
+test("pollOnce: a roster.v1 for the same game_id NOT including us is not reported as acceptance", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const requester = makeTestIdentity();
+  const someoneElse = makeTestIdentity();
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    requester,
+    JSON.stringify({
+      type: "sonnet.roster.v1",
+      contest_id: "sonnet-1",
+      game_id: "flop-bard-1",
+      poem_room: "d-sonnet-1-team-flop-bard-1",
+      room_generation: 0,
+      members: [requester.did, someoneElse.did],
+      request_id: "roster-1",
+    }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    pendingJoinInterests: [{ gameId: "flop-bard-1", requesterDid: requester.did, sentAtUtc: "2026-09-11T13:00:00Z" }],
+  };
+
+  const { tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.newlyAcceptedIntoTeams, []);
+});
+
+test("pollOnce: announces a new roster.v1 proposal for OUR OWN game_id exactly once", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const joiner = makeTestIdentity();
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    joiner,
+    JSON.stringify({
+      type: "sonnet.roster.v1",
+      contest_id: "sonnet-1",
+      game_id: "satoshitrump",
+      poem_room: "d-sonnet-1-team-satoshitrump",
+      room_generation: 0,
+      members: [agent.did, joiner.did],
+      request_id: "roster-1",
+    }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "satoshitrump", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z" },
+  };
+
+  const first = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(first.tick.newRosterProposalsForOwnTeam.length, 1);
+  assert.equal(first.tick.newRosterProposalsForOwnTeam[0].did, joiner.did);
+
+  // A second tick against the same (still-persisted) state must not re-announce it.
+  const second = await pollOnce(agent, CONTEST, config, first.state, client);
+  assert.equal(second.tick.newRosterProposalsForOwnTeam.length, 0);
+});
+
 test("runLoop: exits immediately without polling when SONNET_ENABLED is false", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), enabled: false };

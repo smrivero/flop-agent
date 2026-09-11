@@ -28,6 +28,12 @@ export interface PollTickResult {
   /** game_ids (ours or joined) whose team room was observed set up THIS
    * tick for the first time. */
   newlySetUpRooms: string[];
+  /** game_ids (from pendingJoinInterests) where a roster.v1 was observed
+   * THIS tick that includes our own DID -- the actual "you're in" signal. */
+  newlyAcceptedIntoTeams: string[];
+  /** New roster.v1 proposals for OUR OWN game_id (someone wants to join us),
+   * not yet logged in an earlier tick. */
+  newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }>;
   registeredWriterCount: number;
   registeredVoterCount: number;
   pendingTeamRequestCount: number;
@@ -80,27 +86,66 @@ export async function pollOnce(
   }
 
   const newlySetUpRooms: string[] = [];
+  const newlyAcceptedIntoTeams: string[] = [];
+  const newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }> = [];
 
   const ourTeam = nextState.team;
-  if (ourTeam && ourTeam.roomGeneration === undefined) {
-    const setup = await checkRoomSetup(contest, config, ourTeam.gameId, client);
-    if (setup.hasMessages) {
-      sonnetLog("TEAM", `our requested room is now set up: game_id=${ourTeam.gameId} generation=${setup.generation}`);
-      nextState = { ...nextState, team: { ...ourTeam, room: setup.room, roomGeneration: setup.generation } };
-      if (nextState.phase === "TEAM_REQUESTED") nextState = transition(nextState, "ROOM_ASSIGNED");
-      newlySetUpRooms.push(ourTeam.gameId);
+  if (ourTeam) {
+    if (ourTeam.roomGeneration === undefined) {
+      const setup = await checkRoomSetup(contest, config, ourTeam.gameId, client);
+      if (setup.hasMessages) {
+        sonnetLog("TEAM", `our requested room is now set up: game_id=${ourTeam.gameId} generation=${setup.generation}`);
+        nextState = { ...nextState, team: { ...ourTeam, room: setup.room, roomGeneration: setup.generation } };
+        if (nextState.phase === "TEAM_REQUESTED") nextState = transition(nextState, "ROOM_ASSIGNED");
+        newlySetUpRooms.push(ourTeam.gameId);
+      }
+    }
+
+    // Anyone proposing sonnet.roster.v1 for OUR game_id is the "someone
+    // wants to join" signal -- announce each one exactly once.
+    const alreadyNotified = new Set(ourTeam.notifiedRosterRequestIds ?? []);
+    const proposalsForUs = scanResult.rosterProposals.filter((r) => r.gameId === ourTeam.gameId);
+    const freshProposals = proposalsForUs.filter((r) => !alreadyNotified.has(r.requestId));
+    for (const proposal of freshProposals) {
+      sonnetLog(
+        "TEAM",
+        `roster proposal observed for our game_id=${ourTeam.gameId}: by=${proposal.did} members=[${proposal.members.join(", ")}]`,
+      );
+      newRosterProposalsForOwnTeam.push({ did: proposal.did, members: proposal.members, requestId: proposal.requestId });
+    }
+    if (freshProposals.length > 0) {
+      const latestTeam = nextState.team ?? ourTeam;
+      nextState = {
+        ...nextState,
+        team: { ...latestTeam, notifiedRosterRequestIds: [...alreadyNotified, ...freshProposals.map((p) => p.requestId)] },
+      };
     }
   }
 
   if (nextState.pendingJoinInterests && nextState.pendingJoinInterests.length > 0) {
     const updated = await Promise.all(
       nextState.pendingJoinInterests.map(async (interest) => {
-        if (interest.roomSetUpAtUtc) return interest;
-        const setup = await checkRoomSetup(contest, config, interest.gameId, client);
-        if (!setup.hasMessages) return interest;
-        sonnetLog("TEAM", `a room we're interested in is now set up: game_id=${interest.gameId} generation=${setup.generation} -- check whether its roster includes us`);
-        newlySetUpRooms.push(interest.gameId);
-        return { ...interest, roomSetUpAtUtc: new Date().toISOString() };
+        let next = interest;
+        if (!next.roomSetUpAtUtc) {
+          const setup = await checkRoomSetup(contest, config, interest.gameId, client);
+          if (setup.hasMessages) {
+            sonnetLog("TEAM", `a room we're interested in is now set up: game_id=${interest.gameId} generation=${setup.generation} -- checking whether its roster includes us`);
+            newlySetUpRooms.push(interest.gameId);
+            next = { ...next, roomSetUpAtUtc: new Date().toISOString() };
+          }
+        }
+        // Check for our own DID in any roster.v1 proposal for this game_id --
+        // the actual acceptance signal, independent of when the room itself
+        // was set up (a roster can be proposed before or after that).
+        if (!next.acceptedAtUtc) {
+          const acceptedProposal = scanResult.rosterProposals.find((r) => r.gameId === interest.gameId && r.members.includes(agent.did));
+          if (acceptedProposal) {
+            sonnetLog("TEAM", `ACCEPTED into roster for game_id=${interest.gameId}: members=[${acceptedProposal.members.join(", ")}]`);
+            newlyAcceptedIntoTeams.push(interest.gameId);
+            next = { ...next, acceptedAtUtc: new Date().toISOString() };
+          }
+        }
+        return next;
       }),
     );
     nextState = { ...nextState, pendingJoinInterests: updated };
@@ -110,6 +155,8 @@ export async function pollOnce(
     state: nextState,
     tick: {
       newlySetUpRooms,
+      newlyAcceptedIntoTeams,
+      newRosterProposalsForOwnTeam,
       registeredWriterCount: scanResult.registrations.filter((r) => r.role === "writer").length,
       registeredVoterCount: scanResult.registrations.filter((r) => r.role === "voter").length,
       pendingTeamRequestCount: scanResult.teamRequests.length,
@@ -163,7 +210,8 @@ export async function runLoop(
       save(statePath, state);
       sonnetLog(
         "POLL",
-        `tick complete: writers=${tick.registeredWriterCount} voters=${tick.registeredVoterCount} pending_team_requests=${tick.pendingTeamRequestCount} newly_set_up=[${tick.newlySetUpRooms.join(", ")}]`,
+        `tick complete: writers=${tick.registeredWriterCount} voters=${tick.registeredVoterCount} pending_team_requests=${tick.pendingTeamRequestCount} ` +
+          `newly_set_up=[${tick.newlySetUpRooms.join(", ")}] newly_accepted=[${tick.newlyAcceptedIntoTeams.join(", ")}] new_roster_proposals_for_us=${tick.newRosterProposalsForOwnTeam.length}`,
       );
     } catch (err) {
       sonnetError("ERROR", `poll tick failed: ${(err as Error).message} -- state left unchanged, will retry next interval`);
