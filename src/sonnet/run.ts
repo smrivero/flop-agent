@@ -1,20 +1,21 @@
 /**
- * `sonnet:run` -- mostly a READ-ONLY monitoring loop, with ONE conditional
- * write path: auto-signing a roster (see maybeAutoSignRoster below), gated
- * on SONNET_AUTO_TEAM (operator opt-in, explicitly confirmed -- default
- * false) AND still subject to SONNET_DRY_RUN like every other write path in
- * this project. This is deliberately not yet the full autonomous daemon the
- * architecture doc describes (poll -> fold protocol events -> update state
- * -> determine action -> validate -> act or log -> sleep): the actual
- * WRITING of the poem needs room-poller.ts, poetry-planner.ts, submit.ts,
- * campaign.ts and voting.ts, none of which exist yet (see README "Sonnet
- * Challenge" Status).
+ * `sonnet:run` -- mostly a READ-ONLY monitoring loop, with TWO conditional
+ * write paths, each its own explicit operator opt-in (both default false,
+ * both still subject to SONNET_DRY_RUN like every other write path here):
  *
- * Auto-signing a roster is IRREVERSIBLE once the roster's first word is
- * accepted (sonnet-game.md: "The first accepted word atomically freezes the
- * fully consented roster") -- SONNET_AUTO_TEAM is an explicit, informed
- * operator choice to skip the per-action confirmation this project uses
- * everywhere else, not a default.
+ *   - SONNET_AUTO_TEAM: auto-signs a roster (maybeAutoSignRoster below).
+ *     IRREVERSIBLE once that roster's first word is accepted.
+ *   - SONNET_AUTO_WRITE: once we have a signed roster, proposes the next
+ *     word via propose.ts's full pipeline whenever it's actually our turn.
+ *     propose.ts's own cheap gates (room set up, not the previous
+ *     contributor, hash known, poem not complete) run BEFORE the LLM call,
+ *     so a tick where it isn't our turn costs no OpenAI spend -- it just
+ *     throws ProposeError immediately, logged and ignored.
+ *
+ * Still NOT automated even with both on: submit.ts, campaign.ts, voting.ts
+ * don't exist yet, and submission specifically needs the final contributor
+ * to publish from their own X account -- something this project has no
+ * credentials or integration for and cannot do on its own, ever.
  */
 
 import { TechnocoreClient } from "../technocore.js";
@@ -23,9 +24,17 @@ import type { ContestConfig, SonnetConfig } from "./config.js";
 import { scan as scanRooms, toDiscoverySnapshot, type ObservedRoster } from "./discovery.js";
 import { checkRoomSetup } from "./team.js";
 import { signRoster, RosterError } from "./roster.js";
+import { proposeWord, ProposeError } from "./propose.js";
+import type { Lexicon } from "./cmudict.js";
+import type { RhymeIndex } from "./rhyme.js";
 import { transition, type SonnetState } from "./state.js";
 import { saveState } from "./state.js";
 import { sonnetLog, sonnetError } from "./logger.js";
+
+export interface WordResources {
+  lexicon: Lexicon;
+  rhymeIndex: RhymeIndex;
+}
 
 export interface PollTickResult {
   /** game_ids (ours or joined) whose team room was observed set up THIS
@@ -39,6 +48,9 @@ export interface PollTickResult {
   newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }>;
   /** Set only when SONNET_AUTO_TEAM signed a roster THIS tick. */
   autoSignedRoster?: { gameId: string; requestId: string };
+  /** Set only when SONNET_AUTO_WRITE successfully proposed (and had
+   * accepted-by-the-server, per the independent read-back) a word THIS tick. */
+  autoProposedWord?: { gameId: string; word: string; seq?: number };
   registeredWriterCount: number;
   registeredVoterCount: number;
   pendingTeamRequestCount: number;
@@ -56,6 +68,7 @@ export async function pollOnce(
   config: SonnetConfig,
   state: SonnetState,
   client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  wordResources?: WordResources,
 ): Promise<{ state: SonnetState; tick: PollTickResult }> {
   const scanResult = await scanRooms(agent.did, contest, config, client);
   let nextState: SonnetState = { ...state, discovery: toDiscoverySnapshot(scanResult) };
@@ -161,6 +174,11 @@ export async function pollOnce(
     : undefined;
   if (autoSignedRoster) nextState = autoSignedRoster.state;
 
+  const autoProposedWord =
+    config.autoWrite && wordResources && nextState.roster?.gameId
+      ? await maybeAutoProposeWord(agent, contest, config, nextState.roster, wordResources, client)
+      : undefined;
+
   return {
     state: nextState,
     tick: {
@@ -168,6 +186,7 @@ export async function pollOnce(
       newlyAcceptedIntoTeams,
       newRosterProposalsForOwnTeam,
       autoSignedRoster: autoSignedRoster?.signed,
+      autoProposedWord,
       registeredWriterCount: scanResult.registrations.filter((r) => r.role === "writer").length,
       registeredVoterCount: scanResult.registrations.filter((r) => r.role === "voter").length,
       pendingTeamRequestCount: scanResult.teamRequests.length,
@@ -259,6 +278,43 @@ async function maybeAutoSignRoster(
   }
 }
 
+/**
+ * SONNET_AUTO_WRITE's one write path: attempts propose.ts's full pipeline
+ * for our locked roster's game_id every tick. propose.ts's own cheap gates
+ * (room set up, poem not complete, hash known, we weren't the previous
+ * contributor) run and throw BEFORE the LLM call, so a tick where it isn't
+ * our turn -- the overwhelming majority of ticks -- costs nothing beyond a
+ * room read; only a tick where we're actually eligible spends an OpenAI
+ * call. Every ProposeError (not our turn, poem complete, room not ready,
+ * model chose outside the candidate set, state went stale mid-flight) is
+ * expected, ordinary daemon behavior, not something to alarm on -- logged
+ * at PROPOSE, never ERROR.
+ */
+async function maybeAutoProposeWord(
+  agent: SonnetAgentIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  roster: NonNullable<SonnetState["roster"]>,
+  wordResources: WordResources,
+  client: TechnocoreClient,
+): Promise<{ gameId: string; word: string; seq?: number } | undefined> {
+  if (!roster.gameId) return undefined;
+  try {
+    const result = await proposeWord(
+      agent.identity,
+      contest,
+      config,
+      { gameId: roster.gameId, rosterMembers: roster.members, lexicon: wordResources.lexicon, rhymeIndex: wordResources.rhymeIndex },
+      client,
+    );
+    if (!result.sent) return undefined; // dry-run -- proposeWord already logged the preview
+    return { gameId: roster.gameId, word: result.preview.planned.word, seq: result.postedSeq };
+  } catch (err) {
+    sonnetLog("PROPOSE", `SONNET_AUTO_WRITE: not proposing this tick -- ${err instanceof ProposeError ? err.message : (err as Error).message}`);
+    return undefined;
+  }
+}
+
 export interface RunLoopOptions {
   /** Resolves once, right before the process would otherwise sleep -- tests
    * use this to run exactly one tick instead of an infinite loop. */
@@ -270,6 +326,9 @@ export interface RunLoopOptions {
   /** Injectable for tests -- defaults to the real atomic file writer, which
    * would otherwise touch disk on every tick. */
   saveState?: (path: string, state: SonnetState) => void;
+  /** Required for SONNET_AUTO_WRITE to do anything -- loaded once by the
+   * caller (cmdRun) rather than re-read/re-hashed from disk every tick. */
+  wordResources?: WordResources;
 }
 
 const defaultSleep = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
@@ -300,14 +359,15 @@ export async function runLoop(
   for (;;) {
     let state = loadState(statePath, contest.contest_id, agent.did);
     try {
-      const { state: nextState, tick } = await pollOnce(agent, contest, config, state, options.client);
+      const { state: nextState, tick } = await pollOnce(agent, contest, config, state, options.client, options.wordResources);
       state = nextState;
       save(statePath, state);
       sonnetLog(
         "POLL",
         `tick complete: writers=${tick.registeredWriterCount} voters=${tick.registeredVoterCount} pending_team_requests=${tick.pendingTeamRequestCount} ` +
           `newly_set_up=[${tick.newlySetUpRooms.join(", ")}] newly_accepted=[${tick.newlyAcceptedIntoTeams.join(", ")}] new_roster_proposals_for_us=${tick.newRosterProposalsForOwnTeam.length}` +
-          (tick.autoSignedRoster ? ` AUTO_SIGNED_ROSTER=${tick.autoSignedRoster.gameId}` : ""),
+          (tick.autoSignedRoster ? ` AUTO_SIGNED_ROSTER=${tick.autoSignedRoster.gameId}` : "") +
+          (tick.autoProposedWord ? ` AUTO_PROPOSED_WORD=${JSON.stringify(tick.autoProposedWord.word)}(seq=${tick.autoProposedWord.seq})` : ""),
       );
     } catch (err) {
       sonnetError("ERROR", `poll tick failed: ${(err as Error).message} -- state left unchanged, will retry next interval`);

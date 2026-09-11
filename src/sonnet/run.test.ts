@@ -6,6 +6,31 @@ import { pollOnce, runLoop } from "./run.js";
 import { defaultState } from "./state.js";
 import { loadSonnetConfig, type ContestConfig, type SonnetConfig } from "./config.js";
 import type { SonnetAgentIdentity } from "./identity.js";
+import type { Lexicon } from "./cmudict.js";
+import type { RhymeIndex } from "./rhyme.js";
+
+// Deliberately spelled using ONLY letters guaranteed present in any
+// did:key: DID (the literal "did:key:" prefix supplies d/i/k/e/y) -- these
+// tests use freshly-generated random test identities, so a real word like
+// "sky" would only be a legal candidate for a subset of possible random DIDs.
+const WORD_LEXICON: Lexicon = new Map([
+  ["key", 1],
+  ["eyed", 1],
+]);
+const EMPTY_RHYME_INDEX: RhymeIndex = new Map();
+
+async function withMockFetch<T>(response: Response, fn: () => Promise<T>): Promise<T> {
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => response) as typeof fetch;
+  try {
+    return await fn();
+  } finally {
+    globalThis.fetch = original;
+  }
+}
+function llmResponse(word: string): Response {
+  return new Response(JSON.stringify({ choices: [{ message: { content: JSON.stringify({ word, reason: "test", confidence: 0.5 }) } }] }), { status: 200 });
+}
 
 const CONTEST: ContestConfig = {
   contest_id: "sonnet-1",
@@ -447,4 +472,74 @@ test("runLoop: runs exactly one tick then stops when shouldStop is already true,
   assert.equal(loadCalls, 1);
   assert.equal(sleepCalls, 0);
   assert.equal(saveCalls, 1);
+});
+
+test("pollOnce: SONNET_AUTO_WRITE disabled (default) never proposes, even with a locked roster whose turn it is", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoWrite: false, openAiApiKey: "sk-test", openAiModel: "gpt-test" };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+  server.postSigned("d-sonnet-1-team-satoshitrump", referee, "room claimed, generation 0");
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    roster: { members: [agent.did, makeTestIdentity().did], requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
+  };
+  const { tick } = await withMockFetch(llmResponse("key"), () => pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }));
+  assert.equal(tick.autoProposedWord, undefined);
+  const room = await client.readRoom("d-sonnet-1-team-satoshitrump", { since: 0 });
+  assert.equal(room.messages.some((m) => m.from === agent.did), false);
+});
+
+test("pollOnce: SONNET_AUTO_WRITE=true proposes and sends when it's genuinely our turn", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoWrite: true, dryRun: false, openAiApiKey: "sk-test", openAiModel: "gpt-test" };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+  server.postSigned("d-sonnet-1-team-satoshitrump", referee, "room claimed, generation 0");
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    roster: { members: [agent.did, makeTestIdentity().did], requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
+  };
+  const { tick } = await withMockFetch(llmResponse("key"), () => pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }));
+  assert.equal(tick.autoProposedWord?.word, "key");
+  assert.equal(tick.autoProposedWord?.gameId, "satoshitrump");
+
+  const room = await client.readRoom("d-sonnet-1-team-satoshitrump", { since: 0 });
+  assert.ok(room.messages.some((m) => m.from === agent.did && JSON.parse(m.text).word === "key"));
+});
+
+test("pollOnce: SONNET_AUTO_WRITE=true never throws out of the tick when it's NOT our turn -- just skips quietly", async () => {
+  const agent = makeAgent();
+  const other = makeTestIdentity();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoWrite: true, dryRun: false, openAiApiKey: "sk-test", openAiModel: "gpt-test" };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+  server.postSigned("d-sonnet-1-team-satoshitrump", referee, "room claimed, generation 0");
+  // WE were the previous accepted contributor -- not our turn.
+  server.postSigned("d-sonnet-1-team-satoshitrump", agent.identity, JSON.stringify({ type: "sonnet.word.v1", contest_id: "sonnet-1", game_id: "satoshitrump", room_generation: 0, version: 0, previous_state_hash: "", word: "eyed", request_id: "r-1" }));
+  server.postSigned("d-sonnet-1-team-satoshitrump", referee, JSON.stringify({ request_id: "r-1", state_hash: "h1", version: 1 }));
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    roster: { members: [agent.did, other.did], requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
+  };
+  const { tick, state: next } = await pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX });
+  assert.equal(tick.autoProposedWord, undefined);
+  assert.ok(next); // the tick completed normally, no throw
+});
+
+test("pollOnce: SONNET_AUTO_WRITE has no effect without a locked roster (wordResources alone isn't enough)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoWrite: true, dryRun: false, openAiApiKey: "sk-test", openAiModel: "gpt-test" };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const state = defaultState("sonnet-1", agent.did); // no roster at all
+  const { tick } = await pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX });
+  assert.equal(tick.autoProposedWord, undefined);
 });

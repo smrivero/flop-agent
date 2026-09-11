@@ -463,6 +463,11 @@ async function cmdRun(): Promise<void> {
   const contest = loadContestConfig(config);
   const agent = loadSonnetIdentity();
 
+  // Loaded once at startup, not per-tick -- SONNET_AUTO_WRITE is the only
+  // thing that needs these (candidate generation + rhyme hints).
+  const wordResources = config.autoWrite ? { lexicon: loadDictionary(config).lexicon, rhymeIndex: loadRhymeIndex(config) } : undefined;
+  if (config.autoWrite) sonnetLog("POLL", "SONNET_AUTO_WRITE is true -- will propose words automatically once a roster is locked and it's our turn");
+
   let stopping = false;
   const stop = (signal: string) => {
     if (stopping) return;
@@ -472,7 +477,7 @@ async function cmdRun(): Promise<void> {
   process.once("SIGINT", () => stop("SIGINT"));
   process.once("SIGTERM", () => stop("SIGTERM"));
 
-  await runLoop(agent, contest, config, config.statePath, loadState, { shouldStop: () => stopping });
+  await runLoop(agent, contest, config, config.statePath, loadState, { shouldStop: () => stopping, wordResources });
 }
 
 async function main(argv: string[]): Promise<void> {

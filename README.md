@@ -1769,14 +1769,28 @@ being set up, being **accepted** into someone else's roster (our DID appearing i
 `sonnet.roster.v1` for a game_id we sent `sonnet:join` interest to), and anyone proposing to
 join **our own** team-request. Exits immediately if `SONNET_ENABLED=false` (the default).
 
-**`SONNET_AUTO_TEAM=true`** is the one write path in this loop: once enabled, it signs the
-first valid roster (4-8 members, includes our DID, no conflicting proposal already observed)
-it finds for our own team-request or any pending join interest -- at most once per contest
-("one current roster consent for an unfinished poem"), never retrying a `request_id` it already
-attempted. Still fully subject to `SONNET_DRY_RUN`: with `SONNET_AUTO_TEAM=true` and
-`SONNET_DRY_RUN=true` (the safe combination), it logs what it *would* sign every tick a
-candidate exists, without ever publishing. **Signing is irreversible** once that roster's first
-word is accepted -- this is an explicit, informed operator opt-in, not a default.
+**`SONNET_AUTO_TEAM=true`** signs the first valid roster (4-8 members, includes our DID, no
+conflicting proposal already observed) it finds for our own team-request or any pending join
+interest -- at most once per contest ("one current roster consent for an unfinished poem"),
+never retrying a `request_id` it already attempted. **Signing is irreversible** once that
+roster's first word is accepted -- this is an explicit, informed operator opt-in, not a default.
+
+**`SONNET_AUTO_WRITE=true`** proposes the next word (propose.ts's full pipeline) every tick our
+roster's `game_id` is set and it's genuinely our turn -- the cheap gates in propose.ts (room
+set up, poem not complete, hash known, we weren't the previous contributor) run and throw
+*before* the LLM call, so a tick where it isn't our turn (the overwhelming majority) costs no
+OpenAI spend. Requires `wordResources` (the frozen dictionary + rhyme index, loaded once at
+`sonnet:run` startup, not `undefined`) -- `cmdRun` only loads them when this flag is on.
+
+Both flags are still fully subject to `SONNET_DRY_RUN`: with either (or both) `AUTO_*=true` and
+`SONNET_DRY_RUN=true` (the safe combination to rehearse with), the loop logs what it *would*
+sign/propose every eligible tick, without ever publishing.
+
+**What this loop still cannot do, even with every `SONNET_AUTO_*` flag on**: `submit.ts`,
+`campaign.ts` and `voting.ts` don't exist yet, and submission specifically requires the final
+contributor to publish the frozen poem from their own public X account -- this project has no
+X/Twitter credentials or integration, and publishing on the user's behalf isn't something an
+agent should do unattended regardless. If the poem completes, publishing it is a human step.
 
 ### Word validation (`sonnet/candidate-generator.ts`, `sonnet/validator.ts`)
 
