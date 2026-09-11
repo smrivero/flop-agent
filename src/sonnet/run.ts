@@ -91,17 +91,27 @@ export async function pollOnce(
   if (nextState.registration && nextState.phase === "UNREGISTERED") nextState = transition(nextState, "REGISTERED");
   if (nextState.phase === "REGISTERED") nextState = transition(nextState, "DISCOVERING");
 
-  // Same self-healing for our own team-request: adopt the most recent one
-  // WE signed, as observed in the room, if local state doesn't already know
-  // about it (another environment sent it, or state.json was wiped). Only
-  // self-heals the PRIMARY slot (`team`) -- additional hedge requests
-  // (additionalTeamRequests) are only ever added explicitly via `sonnet:team`.
-  if (!nextState.team) {
-    const ours = scanResult.teamRequests.filter((t) => t.did === agent.did).sort((a, b) => b.seq - a.seq)[0];
-    if (ours) {
-      sonnetLog("STATE", `observed our own existing team-request in the room: game_id=${ours.gameId} seq=${ours.seq} -- reconciling local state`);
-      nextState = { ...nextState, team: { gameId: ours.gameId, requestId: ours.requestId, requestedAtUtc: ours.ts } };
-      if (nextState.phase === "DISCOVERING") nextState = transition(nextState, "TEAM_REQUESTED");
+  // Same self-healing for our own team-request(s): adopt EVERY one WE signed,
+  // as observed in the room, that local state doesn't already know about
+  // (a different environment sent it, or state.json was wiped/fresh) -- not
+  // just the first. This is what lets a hedge strategy (many `sonnet:team`
+  // calls from one machine) be picked up automatically by another machine's
+  // sonnet:run without any manual state.json copying.
+  {
+    const hadNoTeamBefore = !nextState.team;
+    const knownGameIds = new Set([nextState.team?.gameId, ...(nextState.additionalTeamRequests ?? []).map((t) => t.gameId)].filter((g): g is string => g !== undefined));
+    const untracked = scanResult.teamRequests.filter((t) => t.did === agent.did && !knownGameIds.has(t.gameId)).sort((a, b) => a.seq - b.seq);
+    if (untracked.length > 0) {
+      sonnetLog("STATE", `observed ${untracked.length} of our own team-request(s) in the room not yet tracked locally: [${untracked.map((t) => t.gameId).join(", ")}] -- reconciling`);
+      let team = nextState.team;
+      let additional = nextState.additionalTeamRequests ?? [];
+      for (const t of untracked) {
+        const entry = { gameId: t.gameId, requestId: t.requestId, requestedAtUtc: t.ts };
+        if (!team) team = entry;
+        else additional = [...additional, entry];
+      }
+      nextState = { ...nextState, team, additionalTeamRequests: additional };
+      if (hadNoTeamBefore && nextState.phase === "DISCOVERING") nextState = transition(nextState, "TEAM_REQUESTED");
     }
   }
 

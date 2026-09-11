@@ -581,3 +581,41 @@ test("pollOnce: tracks multiple own team-requests (additionalTeamRequests) and a
     ["hedge-b", "hedge-c"],
   );
 });
+
+test("pollOnce: reconciles ALL of our own team-requests observed in the room, not just the first, into team + additionalTeamRequests", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned("mb-sonnet-1-discovery", agent.identity, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "hedge-1", request_id: "team-1" }));
+  server.postSigned("mb-sonnet-1-discovery", agent.identity, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "hedge-2", request_id: "team-2" }));
+  server.postSigned("mb-sonnet-1-discovery", agent.identity, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "hedge-3", request_id: "team-3" }));
+
+  const state = { ...defaultState("sonnet-1", agent.did), phase: "DISCOVERING" as const };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.team?.gameId, "hedge-1"); // oldest becomes primary
+  assert.deepEqual(next.additionalTeamRequests?.map((t) => t.gameId), ["hedge-2", "hedge-3"]);
+  assert.equal(next.phase, "TEAM_REQUESTED");
+});
+
+test("pollOnce: a second machine's already-known team-requests aren't duplicated when reconciling new ones", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned("mb-sonnet-1-discovery", agent.identity, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "hedge-1", request_id: "team-1" }));
+  server.postSigned("mb-sonnet-1-discovery", agent.identity, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "hedge-2", request_id: "team-2" }));
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "TEAM_REQUESTED" as const,
+    team: { gameId: "hedge-1", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z" }, // already known locally
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.team?.gameId, "hedge-1");
+  assert.deepEqual(next.additionalTeamRequests?.map((t) => t.gameId), ["hedge-2"]); // only the new one added
+});
