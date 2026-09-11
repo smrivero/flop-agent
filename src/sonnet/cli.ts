@@ -341,15 +341,30 @@ async function cmdTeam(flags: Record<string, string | true>): Promise<void> {
   }
 
   let state = loadState(config.statePath, contest.contest_id, agent.did);
-  const alreadyRequested = state.team?.gameId === gameId;
+  // Slot resolution: `team` is the primary/first request; any OTHER game_id
+  // goes in `additionalTeamRequests` -- a deliberate hedge, since the
+  // referee does not process every team-request (confirmed empirically:
+  // some sit unprocessed for 9+ hours), so pursuing several at once raises
+  // the odds one of them actually gets set up. Idempotent either way.
+  const existingAdditional = state.additionalTeamRequests ?? [];
+  const isPrimary = !state.team || state.team.gameId === gameId;
+  const existingEntry = isPrimary ? state.team : existingAdditional.find((t) => t.gameId === gameId);
+  const alreadyRequested = existingEntry?.gameId === gameId;
+
   const result = await requestTeam(agent.identity, contest, effectiveConfig, gameId, {
     alreadyRequested,
-    requestId: state.team?.requestId,
+    requestId: existingEntry?.requestId,
   });
 
   if (result.sent) {
-    state = { ...state, team: { gameId, requestId: result.preview.payload.request_id, requestedAtUtc: new Date().toISOString() } };
-    if (state.phase === "DISCOVERING") state = transition(state, "TEAM_REQUESTED");
+    const newEntry = { gameId, requestId: result.preview.payload.request_id, requestedAtUtc: new Date().toISOString() };
+    if (isPrimary) {
+      state = { ...state, team: newEntry };
+      if (state.phase === "DISCOVERING") state = transition(state, "TEAM_REQUESTED");
+    } else {
+      state = { ...state, additionalTeamRequests: [...existingAdditional, newEntry] };
+      sonnetLog("TEAM", `tracking as an additional hedge request (primary is game_id=${state.team?.gameId})`);
+    }
     saveState(config.statePath, state);
   }
 
@@ -357,13 +372,19 @@ async function cmdTeam(flags: Record<string, string | true>): Promise<void> {
   const setup = await checkRoomSetup(contest, config, gameId);
   if (setup.hasMessages) {
     sonnetLog("TEAM", `room is set up: generation=${setup.generation} candidate referee=${setup.refereeCandidateDid ?? "(unknown)"}`);
-    if (state.team && state.team.gameId === gameId) {
+    if (isPrimary && state.team?.gameId === gameId) {
       state = { ...state, team: { ...state.team, room: setup.room, roomGeneration: setup.generation } };
       if (state.phase === "TEAM_REQUESTED") state = transition(state, "ROOM_ASSIGNED");
       saveState(config.statePath, state);
+    } else if (!isPrimary) {
+      state = {
+        ...state,
+        additionalTeamRequests: (state.additionalTeamRequests ?? []).map((t) => (t.gameId === gameId ? { ...t, room: setup.room, roomGeneration: setup.generation } : t)),
+      };
+      saveState(config.statePath, state);
     }
   } else {
-    sonnetLog("TEAM", "room not set up yet (no messages observed) -- re-run sonnet:team later to check again");
+    sonnetLog("TEAM", "room not set up yet (no messages observed) -- re-run sonnet:team later to check again, or sonnet:run will keep watching it automatically");
   }
 }
 

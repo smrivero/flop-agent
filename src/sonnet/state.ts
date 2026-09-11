@@ -114,6 +114,11 @@ export interface SonnetState {
     acceptedAtUtc?: string;
   }>;
 
+  /** Kept for backward compatibility with existing state.json files / the
+   * primary team-request `sonnet:team` sends first -- the FULL set of team
+   * requests we're pursuing (there can be several at once, as a hedge
+   * against the referee never processing a given one; see
+   * additionalTeamRequests) is `[team, ...additionalTeamRequests].filter(Boolean)`. */
   team?: {
     gameId: string;
     requestId: string;
@@ -125,6 +130,20 @@ export interface SonnetState {
      * of repeating it every tick. */
     notifiedRosterRequestIds?: string[];
   };
+  /** Extra team-requests beyond the first (`team` above) -- same shape,
+   * plural, sent as a hedge since the referee does not process every
+   * team-request (confirmed empirically: some sit unprocessed for 9+
+   * hours). Whichever one the referee actually sets up and a roster locks
+   * for is the one `sonnet:run` proceeds with; the rest are simply never
+   * acted on further. */
+  additionalTeamRequests?: Array<{
+    gameId: string;
+    requestId: string;
+    requestedAtUtc: string;
+    room?: string;
+    roomGeneration?: number;
+    notifiedRosterRequestIds?: string[];
+  }>;
   /** `frozenAtUtc` is set only once discovery.ts observes the FIRST accepted
    * word in the poem room -- per sonnet-game.md, the roster freezes
    * atomically on the first accepted word, not on our own signature. */

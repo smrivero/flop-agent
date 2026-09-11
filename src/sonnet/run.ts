@@ -93,7 +93,9 @@ export async function pollOnce(
 
   // Same self-healing for our own team-request: adopt the most recent one
   // WE signed, as observed in the room, if local state doesn't already know
-  // about it (another environment sent it, or state.json was wiped).
+  // about it (another environment sent it, or state.json was wiped). Only
+  // self-heals the PRIMARY slot (`team`) -- additional hedge requests
+  // (additionalTeamRequests) are only ever added explicitly via `sonnet:team`.
   if (!nextState.team) {
     const ours = scanResult.teamRequests.filter((t) => t.did === agent.did).sort((a, b) => b.seq - a.seq)[0];
     if (ours) {
@@ -107,36 +109,46 @@ export async function pollOnce(
   const newlyAcceptedIntoTeams: string[] = [];
   const newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }> = [];
 
-  const ourTeam = nextState.team;
-  if (ourTeam) {
-    if (ourTeam.roomGeneration === undefined) {
-      const setup = await checkRoomSetup(contest, config, ourTeam.gameId, client);
-      if (setup.hasMessages) {
-        sonnetLog("TEAM", `our requested room is now set up: game_id=${ourTeam.gameId} generation=${setup.generation}`);
-        nextState = { ...nextState, team: { ...ourTeam, room: setup.room, roomGeneration: setup.generation } };
-        if (nextState.phase === "TEAM_REQUESTED") nextState = transition(nextState, "ROOM_ASSIGNED");
-        newlySetUpRooms.push(ourTeam.gameId);
-      }
-    }
+  // Every team-request WE sent (the primary `team` slot plus any hedge
+  // requests in `additionalTeamRequests`) gets the same treatment: check
+  // whether its room is now set up, and whether anyone proposed a roster for
+  // it. Processed together so a growing list of hedge requests doesn't need
+  // its own separate loop.
+  type TeamEntry = NonNullable<SonnetState["team"]>;
+  const ownTeamEntries: TeamEntry[] = [nextState.team, ...(nextState.additionalTeamRequests ?? [])].filter(
+    (t): t is TeamEntry => t !== undefined,
+  );
+  if (ownTeamEntries.length > 0) {
+    const updatedEntries = await Promise.all(
+      ownTeamEntries.map(async (entry) => {
+        let next = entry;
+        if (next.roomGeneration === undefined) {
+          const setup = await checkRoomSetup(contest, config, next.gameId, client);
+          if (setup.hasMessages) {
+            sonnetLog("TEAM", `our requested room is now set up: game_id=${next.gameId} generation=${setup.generation}`);
+            next = { ...next, room: setup.room, roomGeneration: setup.generation };
+            newlySetUpRooms.push(next.gameId);
+          }
+        }
 
-    // Anyone proposing sonnet.roster.v1 for OUR game_id is the "someone
-    // wants to join" signal -- announce each one exactly once.
-    const alreadyNotified = new Set(ourTeam.notifiedRosterRequestIds ?? []);
-    const proposalsForUs = scanResult.rosterProposals.filter((r) => r.gameId === ourTeam.gameId);
-    const freshProposals = proposalsForUs.filter((r) => !alreadyNotified.has(r.requestId));
-    for (const proposal of freshProposals) {
-      sonnetLog(
-        "TEAM",
-        `roster proposal observed for our game_id=${ourTeam.gameId}: by=${proposal.did} members=[${proposal.members.join(", ")}]`,
-      );
-      newRosterProposalsForOwnTeam.push({ did: proposal.did, members: proposal.members, requestId: proposal.requestId });
-    }
-    if (freshProposals.length > 0) {
-      const latestTeam = nextState.team ?? ourTeam;
-      nextState = {
-        ...nextState,
-        team: { ...latestTeam, notifiedRosterRequestIds: [...alreadyNotified, ...freshProposals.map((p) => p.requestId)] },
-      };
+        // Anyone proposing sonnet.roster.v1 for this game_id is the "someone
+        // wants to join" signal -- announce each one exactly once.
+        const alreadyNotified = new Set(next.notifiedRosterRequestIds ?? []);
+        const freshProposals = scanResult.rosterProposals.filter((r) => r.gameId === next.gameId && !alreadyNotified.has(r.requestId));
+        if (freshProposals.length > 0) {
+          for (const proposal of freshProposals) {
+            sonnetLog("TEAM", `roster proposal observed for our game_id=${next.gameId}: by=${proposal.did} members=[${proposal.members.join(", ")}]`);
+            newRosterProposalsForOwnTeam.push({ did: proposal.did, members: proposal.members, requestId: proposal.requestId });
+          }
+          next = { ...next, notifiedRosterRequestIds: [...alreadyNotified, ...freshProposals.map((p) => p.requestId)] };
+        }
+        return next;
+      }),
+    );
+    const [primary, ...rest] = updatedEntries;
+    nextState = { ...nextState, team: primary, additionalTeamRequests: rest };
+    if (primary?.roomGeneration !== undefined && nextState.phase === "TEAM_REQUESTED") {
+      nextState = transition(nextState, "ROOM_ASSIGNED");
     }
   }
 
@@ -170,7 +182,7 @@ export async function pollOnce(
   }
 
   const autoSignedRoster = config.autoTeam
-    ? await maybeAutoSignRoster(agent, contest, config, nextState, scanResult.rosterProposals, ourTeam, client)
+    ? await maybeAutoSignRoster(agent, contest, config, nextState, scanResult.rosterProposals, client)
     : undefined;
   if (autoSignedRoster) nextState = autoSignedRoster.state;
 
@@ -218,13 +230,13 @@ async function maybeAutoSignRoster(
   config: SonnetConfig,
   state: SonnetState,
   rosterProposals: readonly ObservedRoster[],
-  ourTeam: SonnetState["team"],
   client: TechnocoreClient,
 ): Promise<{ state: SonnetState; signed?: { gameId: string; requestId: string } } | undefined> {
   if (state.roster) return undefined; // already signed one this contest -- never a second
 
   const pursuedGameIds = new Set<string>();
-  if (ourTeam) pursuedGameIds.add(ourTeam.gameId);
+  if (state.team) pursuedGameIds.add(state.team.gameId);
+  for (const extra of state.additionalTeamRequests ?? []) pursuedGameIds.add(extra.gameId);
   for (const interest of state.pendingJoinInterests ?? []) pursuedGameIds.add(interest.gameId);
   if (pursuedGameIds.size === 0) return undefined;
 

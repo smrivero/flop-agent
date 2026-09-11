@@ -543,3 +543,41 @@ test("pollOnce: SONNET_AUTO_WRITE has no effect without a locked roster (wordRes
   const { tick } = await pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX });
   assert.equal(tick.autoProposedWord, undefined);
 });
+
+test("pollOnce: tracks multiple own team-requests (additionalTeamRequests) and auto-signs whichever gets a valid roster first", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+  // Only the SECOND of our three hedge game_ids gets set up by the referee.
+  server.postSigned("d-sonnet-1-team-hedge-b", referee, "room claimed, generation 0");
+  const members = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    makeTestIdentity(),
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "hedge-b", poem_room: "d-sonnet-1-team-hedge-b", room_generation: 0, members, request_id: "roster-b" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "hedge-a", requestId: "team-a", requestedAtUtc: "2026-09-11T13:00:00Z" },
+    additionalTeamRequests: [
+      { gameId: "hedge-b", requestId: "team-b", requestedAtUtc: "2026-09-11T13:00:00Z" },
+      { gameId: "hedge-c", requestId: "team-c", requestedAtUtc: "2026-09-11T13:00:00Z" },
+    ],
+  };
+
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.newlySetUpRooms, ["hedge-b"]);
+  assert.equal(tick.autoSignedRoster?.gameId, "hedge-b");
+  assert.equal(next.roster?.gameId, "hedge-b");
+  assert.deepEqual(next.roster?.members, members);
+
+  // hedge-a and hedge-c are untouched (never set up), still tracked.
+  assert.equal(next.team?.gameId, "hedge-a");
+  assert.deepEqual(
+    next.additionalTeamRequests?.map((t) => t.gameId),
+    ["hedge-b", "hedge-c"],
+  );
+});
