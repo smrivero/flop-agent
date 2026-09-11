@@ -1625,19 +1625,30 @@ Implemented: identity loading + the Agent-B guard, the DID-letter/CMUdict word f
 per-DID word cache, eligibility self-check, room discovery/scan, `sonnet.register.v1`
 (dry-run and real, idempotent), `sonnet.team-request.v1` + reading back the referee's room
 setup, `sonnet.roster.v1` (dry-run and real, with conflict detection -- refuses to sign over a
-different roster already observed for the same `game_id`), discovery-room recruitment
-messages (rate-limited), mechanical per-word validation (`validator.ts`'s
-`validateWordProposal`, fail-closed) and the official whole-poem validator invoked as a
-subprocess against the vendored, unmodified `sonnet_validate.py` (never reimplemented).
-Agent A is registered live as a `writer` in `sonnet-1` (see git history / `data/sonnet/state.json`
-for the exact receipt).
+different roster already observed for the same `game_id`; `SONNET_AUTO_TEAM=true` can
+auto-sign a valid observed roster, see "Monitoring loop" below), discovery-room recruitment
+messages (rate-limited, own-team-aware), mechanical per-word validation (`validator.ts`'s
+`validateWordProposal`, fail-closed), the official whole-poem validator invoked as a subprocess
+against the vendored, unmodified `sonnet_validate.py` (never reimplemented), a monitoring loop
+(`sonnet:run`) that self-heals local state from the room and detects roster
+acceptance/incoming join proposals, and the full word-proposal pipeline (`sonnet:propose`):
+`room-poller.ts` derives authoritative poem state from the team room,
+`candidate-generator.ts` computes the mechanically-legal word set,
+`poetry-planner.ts` ranks it with an LLM (closed-set re-checked), and `propose.ts` re-validates
+and re-polls for staleness immediately before signing/sending. Agent A is registered live as a
+`writer` in `sonnet-1` (see git history / `data/sonnet/state.json` for the exact receipt).
 
-**Not yet implemented**: `room-poller.ts` (deriving authoritative poem state -- version,
-previous_state_hash, current line -- from a real team room), `poetry-planner.ts` (LLM ranking
-over `candidate-generator.ts`'s legal word set), `submit.ts`, `campaign.ts`, `voting.ts`, and
-the `sonnet:run` daemon. These are deliberately deferred until there is an actual locked roster
-and team room to build and test them against, rather than writing untestable code against a
-game state that doesn't exist yet.
+**Known limitation**: the official rules give an exact JSON schema for every request message
+but not for the referee's acceptance *receipts* -- `room-poller.ts` was written defensively
+(cross-references `request_id` against proposals actually seen, computes line-closing from the
+frozen dictionary rather than guessing a receipt field, flags `hashKnown: false` rather than
+guessing a stale hash) but has not yet been run against a real team room's real receipts. Expect
+to revisit its receipt-field guessing once one exists.
+
+**Not yet implemented**: `submit.ts`, `campaign.ts`, `voting.ts`, and wiring `sonnet:propose`
+into the `sonnet:run` daemon itself (`SONNET_AUTO_WRITE` exists as a flag but isn't connected
+to anything yet -- letting the daemon write turns unattended is a separate decision from
+building the pipeline).
 
 ### Preflight
 
@@ -1786,6 +1797,27 @@ shells out to the vendored, byte-identical `vendor/technocore-sonnet/sonnet_vali
 (`python3 sonnet_validate.py cmudict.dict poem.txt --exact-ten`) rather than reimplementing
 `validate_poem` -- per the operator's own instruction to reuse the official script. Requires
 `python3` on PATH.
+
+### Word proposal (`sonnet:propose`, `sonnet/room-poller.ts`, `sonnet/poetry-planner.ts`, `sonnet/propose.ts`)
+
+```bash
+npm run sonnet:propose -- --dry-run
+npm run sonnet:propose
+```
+
+The full pipeline, in order: `room-poller.ts` derives authoritative poem state from the locked
+roster's team room (see "Known limitation" above -- receipt parsing is defensive/best-effort);
+if it's our turn (we weren't the previous contributor, the state hash is confidently known, the
+poem isn't complete), `candidate-generator.ts` computes the legal word set for the current
+line's remaining syllable budget; `poetry-planner.ts` asks an LLM to rank a shortlist of it
+(reuses this project's existing `OPENAI_API_KEY`/`OPENAI_MODEL`, no new key) and re-checks the
+model's choice is EXACTLY one of the candidates shown, rejecting anything else;
+`validator.ts`'s `validateWordProposal` re-checks the choice mechanically one more time. The
+real path (`propose.ts`'s `proposeWord`) then re-polls the team room immediately before
+signing/sending -- if the version or hash moved on while the LLM call was in flight (someone
+else's word got accepted first), it refuses to send a now-stale proposal rather than risk a
+rejected (or worse, ambiguous) POST. Requires `state.roster` to already be set (see "Roster" /
+"Monitoring loop" above) -- there is nothing to propose into without one.
 
 ### CMUdict / DID word filter (`sonnet/cmudict.ts`, `sonnet/did-words.ts`)
 

@@ -18,6 +18,7 @@ import { buildRegistrationPreview, register, RegistrationError } from "./registr
 import { buildRecruitPreview, buildOwnTeamRecruitPreview, buildJoinInterestPreview, recruit, recruitForOwnTeam, joinTeamRequest, RecruitError } from "./recruit.js";
 import { buildTeamRequestPreview, checkRoomSetup, requestTeam, TeamError } from "./team.js";
 import { buildRosterPreview, detectRosterConflict, signRoster, summarizeRosterSigners, RosterError } from "./roster.js";
+import { buildProposePreview, proposeWord, ProposeError } from "./propose.js";
 import { loadState, saveState, transition } from "./state.js";
 import { runLoop } from "./run.js";
 import { readJsonFile, writeJsonFileAtomic } from "./persistence.js";
@@ -37,6 +38,7 @@ Usage:
   npm run sonnet:join -- [--dry-run] --game-id <id> --requester-did did:key:...
   npm run sonnet:team -- [--dry-run] --game-id <id>
   npm run sonnet:roster -- [--dry-run] --game-id <id> --members did:key:...,did:key:...
+  npm run sonnet:propose -- [--dry-run]
   npm run sonnet:run
 `;
 
@@ -426,6 +428,36 @@ async function cmdRoster(flags: Record<string, string | true>): Promise<void> {
   }
 }
 
+async function cmdPropose(flags: Record<string, string | true>): Promise<void> {
+  const config = loadSonnetConfig();
+  const contest = loadContestConfig(config);
+  const agent = loadSonnetIdentity();
+  const forceDryRun = flags["dry-run"] === true;
+  const effectiveConfig = forceDryRun ? { ...config, dryRun: true } : config;
+
+  const state = loadState(config.statePath, contest.contest_id, agent.did);
+  if (!state.roster || !state.roster.gameId) {
+    throw new ProposeError("no locked roster in local state -- run sonnet:roster first (or wait for SONNET_AUTO_TEAM to sign one), then re-run sonnet:scan");
+  }
+
+  const { lexicon } = loadDictionary(config);
+  const rhymeIndex = loadRhymeIndex(config);
+  const ctx = { gameId: state.roster.gameId, rosterMembers: state.roster.members, lexicon, rhymeIndex };
+
+  if (forceDryRun) {
+    const preview = await buildProposePreview(agent.identity, contest, effectiveConfig, ctx);
+    sonnetLog("PROPOSE", "[DRY-RUN] would publish:");
+    sonnetLog("PROPOSE", `  room: ${preview.room}`);
+    sonnetLog("PROPOSE", `  payload (canonical): ${preview.canonicalJson}`);
+    sonnetLog("PROPOSE", `  reason: ${preview.planned.reason} (confidence=${preview.planned.confidence})`);
+    sonnetLog("PROPOSE", `  local signature verification: ${preview.verifiedLocally ? "PASS" : "FAIL"}`);
+    sonnetLog("PROPOSE", "  sent: false (--dry-run)");
+    return;
+  }
+
+  await proposeWord(agent.identity, contest, effectiveConfig, ctx);
+}
+
 async function cmdRun(): Promise<void> {
   const config = loadSonnetConfig();
   const contest = loadContestConfig(config);
@@ -466,6 +498,8 @@ async function main(argv: string[]): Promise<void> {
       return cmdTeam(flags);
     case "roster":
       return cmdRoster(flags);
+    case "propose":
+      return cmdPropose(flags);
     case "run":
       return cmdRun();
     default:
@@ -484,7 +518,8 @@ main(process.argv.slice(2)).catch((err) => {
     err instanceof RegistrationError ||
     err instanceof RecruitError ||
     err instanceof TeamError ||
-    err instanceof RosterError
+    err instanceof RosterError ||
+    err instanceof ProposeError
   ) {
     sonnetError("ERROR", err.message);
   } else {

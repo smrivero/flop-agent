@@ -29,6 +29,7 @@
     "sonnet:join": "tsx src/sonnet/cli.ts join",
     "sonnet:team": "tsx src/sonnet/cli.ts team",
     "sonnet:roster": "tsx src/sonnet/cli.ts roster",
+    "sonnet:propose": "tsx src/sonnet/cli.ts propose",
     "sonnet:run": "tsx src/sonnet/cli.ts run",
     "protocol:watch": "tsx src/protocol-watcher/cli.ts watch",
     "protocol:watch:dry": "tsx src/protocol-watcher/cli.ts watch --dry-run",

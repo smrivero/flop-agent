@@ -59,6 +59,14 @@ export interface SonnetConfig {
    * spam" per the operator's own instruction. Rate limit only; unrelated to
    * SONNET_POLL_INTERVAL_MS. */
   recruitMinIntervalMs: number;
+
+  /** Reuses this project's existing OPENAI_API_KEY / OPENAI_MODEL (same as
+   * mentions/debate) -- no separate key. Optional here: only poetry-planner.ts
+   * (sonnet:propose) needs it; preflight/scan/register/team/roster don't. */
+  openAiApiKey?: string;
+  openAiModel?: string;
+  httpTimeoutMs: number;
+  maxRetries: number;
 }
 
 function parseBool(value: string | undefined, defaultValue: boolean): boolean {
@@ -108,6 +116,11 @@ export function loadSonnetConfig(env: NodeJS.ProcessEnv = process.env): SonnetCo
     eligibilityExtraRooms: parseList(env.SONNET_ELIGIBILITY_EXTRA_ROOMS),
 
     recruitMinIntervalMs: parseInt10(env.SONNET_RECRUIT_MIN_INTERVAL_MS, 1_800_000, "SONNET_RECRUIT_MIN_INTERVAL_MS"),
+
+    openAiApiKey: env.OPENAI_API_KEY || undefined,
+    openAiModel: env.OPENAI_MODEL || undefined,
+    httpTimeoutMs: parseInt10(env.HTTP_TIMEOUT_MS, 15_000, "HTTP_TIMEOUT_MS"),
+    maxRetries: parseInt10(env.MAX_RETRIES, 2, "MAX_RETRIES"),
   };
 }
 
