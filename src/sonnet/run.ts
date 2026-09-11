@@ -1,25 +1,28 @@
 /**
- * `sonnet:run` -- a READ-ONLY monitoring loop. This is deliberately not yet
- * the full autonomous daemon the architecture doc describes (poll -> fold
- * protocol events -> update state -> determine action -> validate -> act or
- * log -> sleep): the "determine action" / "act" steps need room-poller.ts,
- * poetry-planner.ts, submit.ts, campaign.ts and voting.ts, none of which
- * exist yet (see README "Sonnet Challenge" Status). What DOES exist and is
- * useful today is watching for the one thing that currently blocks us:
- * whether the referee has set up a team room we're waiting on (either our
- * own `sonnet:team` request, or a `sonnet:join` interest sent to someone
- * else's team-request).
+ * `sonnet:run` -- mostly a READ-ONLY monitoring loop, with ONE conditional
+ * write path: auto-signing a roster (see maybeAutoSignRoster below), gated
+ * on SONNET_AUTO_TEAM (operator opt-in, explicitly confirmed -- default
+ * false) AND still subject to SONNET_DRY_RUN like every other write path in
+ * this project. This is deliberately not yet the full autonomous daemon the
+ * architecture doc describes (poll -> fold protocol events -> update state
+ * -> determine action -> validate -> act or log -> sleep): the actual
+ * WRITING of the poem needs room-poller.ts, poetry-planner.ts, submit.ts,
+ * campaign.ts and voting.ts, none of which exist yet (see README "Sonnet
+ * Challenge" Status).
  *
- * Every SONNET_AUTO_* flag stays irrelevant here -- this tick NEVER posts
- * anything, at any settings. It's `sonnet:scan` plus a persistent loop
- * around it, not a new write path.
+ * Auto-signing a roster is IRREVERSIBLE once the roster's first word is
+ * accepted (sonnet-game.md: "The first accepted word atomically freezes the
+ * fully consented roster") -- SONNET_AUTO_TEAM is an explicit, informed
+ * operator choice to skip the per-action confirmation this project uses
+ * everywhere else, not a default.
  */
 
 import { TechnocoreClient } from "../technocore.js";
 import type { SonnetAgentIdentity } from "./identity.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
-import { scan as scanRooms, toDiscoverySnapshot } from "./discovery.js";
+import { scan as scanRooms, toDiscoverySnapshot, type ObservedRoster } from "./discovery.js";
 import { checkRoomSetup } from "./team.js";
+import { signRoster, RosterError } from "./roster.js";
 import { transition, type SonnetState } from "./state.js";
 import { saveState } from "./state.js";
 import { sonnetLog, sonnetError } from "./logger.js";
@@ -34,6 +37,8 @@ export interface PollTickResult {
   /** New roster.v1 proposals for OUR OWN game_id (someone wants to join us),
    * not yet logged in an earlier tick. */
   newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }>;
+  /** Set only when SONNET_AUTO_TEAM signed a roster THIS tick. */
+  autoSignedRoster?: { gameId: string; requestId: string };
   registeredWriterCount: number;
   registeredVoterCount: number;
   pendingTeamRequestCount: number;
@@ -151,17 +156,107 @@ export async function pollOnce(
     nextState = { ...nextState, pendingJoinInterests: updated };
   }
 
+  const autoSignedRoster = config.autoTeam
+    ? await maybeAutoSignRoster(agent, contest, config, nextState, scanResult.rosterProposals, ourTeam, client)
+    : undefined;
+  if (autoSignedRoster) nextState = autoSignedRoster.state;
+
   return {
     state: nextState,
     tick: {
       newlySetUpRooms,
       newlyAcceptedIntoTeams,
       newRosterProposalsForOwnTeam,
+      autoSignedRoster: autoSignedRoster?.signed,
       registeredWriterCount: scanResult.registrations.filter((r) => r.role === "writer").length,
       registeredVoterCount: scanResult.registrations.filter((r) => r.role === "voter").length,
       pendingTeamRequestCount: scanResult.teamRequests.length,
     },
   };
+}
+
+interface RosterSignCandidate {
+  gameId: string;
+  proposal: ObservedRoster;
+}
+
+/**
+ * SONNET_AUTO_TEAM's one write path: among every currently-observed roster
+ * proposal that (a) includes our own DID, (b) has a valid 4-8 member count,
+ * and (c) is for a game_id we're actually pursuing (our own team-request, or
+ * a join interest we sent), sign the FIRST ONE not yet attempted --
+ * "Each contributor may have one current roster consent for an unfinished
+ * poem" (sonnet-game.md), so this only ever signs once per contest
+ * (`!nextState.roster` below) and never retries a request_id it already
+ * attempted (successfully or not), so a standing conflict doesn't spam a
+ * sign attempt every tick forever. Still fully subject to SONNET_DRY_RUN --
+ * this only ever builds+locally-verifies+confirms when dry-run is off, same
+ * as every other write path in this project.
+ */
+async function maybeAutoSignRoster(
+  agent: SonnetAgentIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  state: SonnetState,
+  rosterProposals: readonly ObservedRoster[],
+  ourTeam: SonnetState["team"],
+  client: TechnocoreClient,
+): Promise<{ state: SonnetState; signed?: { gameId: string; requestId: string } } | undefined> {
+  if (state.roster) return undefined; // already signed one this contest -- never a second
+
+  const pursuedGameIds = new Set<string>();
+  if (ourTeam) pursuedGameIds.add(ourTeam.gameId);
+  for (const interest of state.pendingJoinInterests ?? []) pursuedGameIds.add(interest.gameId);
+  if (pursuedGameIds.size === 0) return undefined;
+
+  const alreadyAttempted = new Set(state.autoSignAttemptedRequestIds ?? []);
+  const candidates: RosterSignCandidate[] = rosterProposals
+    .filter(
+      (p) =>
+        pursuedGameIds.has(p.gameId) &&
+        p.members.includes(agent.did) &&
+        p.members.length >= 4 &&
+        p.members.length <= 8 &&
+        !alreadyAttempted.has(p.requestId),
+    )
+    .map((proposal) => ({ gameId: proposal.gameId, proposal }))
+    .sort((a, b) => a.proposal.seq - b.proposal.seq);
+
+  const candidate = candidates[0];
+  if (!candidate) return undefined;
+
+  sonnetLog(
+    "ROSTER",
+    `SONNET_AUTO_TEAM: attempting to sign observed roster for game_id=${candidate.gameId} members=[${candidate.proposal.members.join(", ")}]`,
+  );
+
+  const attempted = [...alreadyAttempted, candidate.proposal.requestId];
+  try {
+    const result = await signRoster(
+      agent.identity,
+      contest,
+      config,
+      { gameId: candidate.gameId, poemRoom: candidate.proposal.poemRoom, roomGeneration: candidate.proposal.roomGeneration, members: candidate.proposal.members },
+      rosterProposals,
+      client,
+    );
+    if (!result.sent) {
+      // SONNET_DRY_RUN is true (the only reason signRoster returns
+      // sent:false without throwing) -- never mark this attempted, so it's
+      // retried for real once dry-run is turned off.
+      return undefined;
+    }
+    let nextState: SonnetState = {
+      ...state,
+      autoSignAttemptedRequestIds: attempted,
+      roster: { members: candidate.proposal.members, requestId: result.preview.payload.request_id, signedAtUtc: new Date().toISOString(), gameId: candidate.gameId },
+    };
+    if (nextState.phase === "ROOM_ASSIGNED") nextState = transition(nextState, "ROSTER_PENDING");
+    return { state: nextState, signed: { gameId: candidate.gameId, requestId: result.preview.payload.request_id } };
+  } catch (err) {
+    sonnetLog("CONFLICT", `SONNET_AUTO_TEAM: not signing game_id=${candidate.gameId} -- ${err instanceof RosterError ? err.message : (err as Error).message}`);
+    return { state: { ...state, autoSignAttemptedRequestIds: attempted } };
+  }
 }
 
 export interface RunLoopOptions {
@@ -211,7 +306,8 @@ export async function runLoop(
       sonnetLog(
         "POLL",
         `tick complete: writers=${tick.registeredWriterCount} voters=${tick.registeredVoterCount} pending_team_requests=${tick.pendingTeamRequestCount} ` +
-          `newly_set_up=[${tick.newlySetUpRooms.join(", ")}] newly_accepted=[${tick.newlyAcceptedIntoTeams.join(", ")}] new_roster_proposals_for_us=${tick.newRosterProposalsForOwnTeam.length}`,
+          `newly_set_up=[${tick.newlySetUpRooms.join(", ")}] newly_accepted=[${tick.newlyAcceptedIntoTeams.join(", ")}] new_roster_proposals_for_us=${tick.newRosterProposalsForOwnTeam.length}` +
+          (tick.autoSignedRoster ? ` AUTO_SIGNED_ROSTER=${tick.autoSignedRoster.gameId}` : ""),
       );
     } catch (err) {
       sonnetError("ERROR", `poll tick failed: ${(err as Error).message} -- state left unchanged, will retry next interval`);

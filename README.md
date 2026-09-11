@@ -1746,6 +1746,27 @@ sign and prints the conflict (`[SONNET][CONFLICT]`) instead -- per the operator'
 instruction, never silently picks a side. `--room-generation` can be passed explicitly;
 otherwise it's read from the team room the same way `sonnet:team` does.
 
+### Monitoring loop (`sonnet:run`, `sonnet/run.ts`)
+
+```bash
+npm run sonnet:run
+```
+
+Mostly read-only: polls the official rooms on `SONNET_POLL_INTERVAL_MS` and logs (once each,
+never repeated) our own registration/team-request self-healing into local state, a team room
+being set up, being **accepted** into someone else's roster (our DID appearing in a
+`sonnet.roster.v1` for a game_id we sent `sonnet:join` interest to), and anyone proposing to
+join **our own** team-request. Exits immediately if `SONNET_ENABLED=false` (the default).
+
+**`SONNET_AUTO_TEAM=true`** is the one write path in this loop: once enabled, it signs the
+first valid roster (4-8 members, includes our DID, no conflicting proposal already observed)
+it finds for our own team-request or any pending join interest -- at most once per contest
+("one current roster consent for an unfinished poem"), never retrying a `request_id` it already
+attempted. Still fully subject to `SONNET_DRY_RUN`: with `SONNET_AUTO_TEAM=true` and
+`SONNET_DRY_RUN=true` (the safe combination), it logs what it *would* sign every tick a
+candidate exists, without ever publishing. **Signing is irreversible** once that roster's first
+word is accepted -- this is an explicit, informed operator opt-in, not a default.
+
 ### Word validation (`sonnet/candidate-generator.ts`, `sonnet/validator.ts`)
 
 `candidate-generator.ts`'s `generateCandidates` is purely mechanical: given the DID and the

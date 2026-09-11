@@ -128,7 +128,11 @@ export interface SonnetState {
   /** `frozenAtUtc` is set only once discovery.ts observes the FIRST accepted
    * word in the poem room -- per sonnet-game.md, the roster freezes
    * atomically on the first accepted word, not on our own signature. */
-  roster?: { members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string };
+  roster?: { members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string; gameId?: string };
+  /** request_ids of roster.v1 proposals run.ts's SONNET_AUTO_TEAM auto-sign
+   * step has already attempted (successfully or not) -- never retried, so a
+   * genuine conflict doesn't spam [SONNET][CONFLICT] every tick forever. */
+  autoSignAttemptedRequestIds?: string[];
   /** Populated once room-poller.ts / poetry-planner.ts exist (not yet implemented). */
   poem?: {
     version: number;
