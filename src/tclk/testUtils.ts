@@ -95,6 +95,15 @@ export class FakeTechnocore {
       return json({ room: roomName, count: room.messages.length, first_seq: room.messages[0]?.seq ?? null, last_seq: room.nextSeq - 1, messages: room.messages, posted });
     }
 
+    // GET /r/<room>/export -- raw JSONL, one record per line, the whole
+    // retained (fake) ring. Added for sonnet/room-export.ts's tests; every
+    // other handler below is unchanged.
+    if (parts[0] === "r" && parts[2] === "export" && parts.length === 3) {
+      const room = this.room(decodeURIComponent(parts[1]));
+      const body = room.messages.map((m) => JSON.stringify(m)).join("\n");
+      return new Response(body, { status: 200, headers: { "X-Room-Generation": "0" } });
+    }
+
     // GET /r/<room>?since=&format=json
     if (parts[0] === "r" && parts.length === 2) {
       const room = this.room(decodeURIComponent(parts[1]));

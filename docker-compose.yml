@@ -34,3 +34,26 @@ services:
       # This worker's own SQLite DB + lock file (separate from debate's
       # ./data and from mentions/verifier's own .data usage on the host).
       - ./.data:/app/.data
+
+  # Sonnet Challenge monitoring loop (src/sonnet/run.ts) -- READ-ONLY today
+  # (see README.md "Sonnet Challenge" Status): polls the official contest
+  # rooms and watches for a team room we're waiting on being set up. Never
+  # posts anything by itself, at any SONNET_AUTO_* setting. Exits
+  # immediately (and will restart-loop under `unless-stopped`) unless
+  # SONNET_ENABLED=true is set in .env -- set that deliberately before
+  # `docker compose up -d sonnet`, same opt-in discipline as every other
+  # write-capable flag in this project.
+  sonnet:
+    build: .
+    container_name: flop-agent-sonnet
+    restart: unless-stopped
+    env_file:
+      - .env
+    command: ["npx", "tsx", "src/sonnet/cli.ts", "run"]
+    volumes:
+      # Agent A's identity (TECHNOCORE_IDENTITY_PATH) -- this feature never
+      # generates its own, it reuses the same file as debate/mentions/tclk.
+      - ./.technocore:/app/.technocore
+      # data/sonnet/state.json + the per-DID word cache -- local, regenerable,
+      # never secret, but must survive container restarts/rebuilds.
+      - ./data:/app/data

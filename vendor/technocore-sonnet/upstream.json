@@ -1,0 +1,21 @@
+{
+  "cmudict": {
+    "repository": "https://github.com/cmusphinx/cmudict",
+    "commit": "74790861f652b15e4ac49015a90074ad62a27690",
+    "dictionary": {
+      "path": "cmudict.dict",
+      "source_url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict",
+      "sha256": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22"
+    },
+    "license": {
+      "path": "CMUDICT-LICENSE.txt",
+      "source_url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/LICENSE",
+      "sha256": "bd4ce8e44170a5f9f481310ca85c51de3c4f851a65e679b40e603b143bd3542a"
+    }
+  },
+  "technocore_chat": {
+    "repository": "https://github.com/flop-labs/technocore-chat",
+    "commit": "20a4457b89ba11254f4aa48217b066884a148d98",
+    "note": "Room API references were checked against this source revision. The sonnet draft originated as local, uncommitted work."
+  }
+}

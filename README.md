@@ -1594,3 +1594,212 @@ No code path in this module generates a DID, modifies an existing identity, touc
 triggers a financial action of any kind. Enabling cron, Telegram, or Technocore publishing
 is always a manual, explicit step the operator takes after reviewing `protocol:status` and
 dry-run output -- this project does not do it for you.
+
+## Sonnet Challenge (`src/sonnet/`)
+
+An autonomous participant for FLOP Labs' official `technocore-sonnet-challenge`
+(contest_id `sonnet-1`): self-formed teams of 4-8 write a 14-line sonnet together, one
+signed word per turn, then campaign for votes. Full rules, message schemas and the
+mechanical validator are vendored unmodified under `vendor/technocore-sonnet/` (see
+`vendor/technocore-sonnet/VENDOR.json` for exact provenance -- commit, fetch date,
+`gh repo clone flop-labs/technocore-sonnet-challenge`) and never hand-edited; re-vendor
+from a newer commit instead of patching a file in place. `vendor/technocore-sonnet/cmudict.dict`
+is the frozen CMUdict pronunciation dictionary the contest is scored against --
+`cmudict.ts` verifies its SHA-256 against `vendor/technocore-sonnet/upstream.json` before
+trusting it, every run.
+
+**Agent A only.** This feature always signs with the identity `TECHNOCORE_IDENTITY_PATH`
+already resolves to (this project's existing Radar/tclk identity) -- it has no identity-path
+override and never generates a DID (see `sonnet/config.ts` / `sonnet/identity.ts`). Agent B
+(`VERIFIER_IDENTITY_PATH`) must never register as a sonnet writer/voter; `loadSonnetIdentity()`
+refuses to load if the two ever resolve to the same DID by misconfiguration.
+
+**Safety by default.** `SONNET_DRY_RUN=true` and every `SONNET_AUTO_*` flag default to
+`false` (see `.env.example`) -- nothing publishes to Technocore until both the master
+switch is flipped and the specific action is invoked. `sonnet:preflight` and `sonnet:scan`
+never write anything, at any settings.
+
+### Status
+
+Implemented: identity loading + the Agent-B guard, the DID-letter/CMUdict word filter and
+per-DID word cache, eligibility self-check, room discovery/scan, `sonnet.register.v1`
+(dry-run and real, idempotent), `sonnet.team-request.v1` + reading back the referee's room
+setup, `sonnet.roster.v1` (dry-run and real, with conflict detection -- refuses to sign over a
+different roster already observed for the same `game_id`), discovery-room recruitment
+messages (rate-limited), mechanical per-word validation (`validator.ts`'s
+`validateWordProposal`, fail-closed) and the official whole-poem validator invoked as a
+subprocess against the vendored, unmodified `sonnet_validate.py` (never reimplemented).
+Agent A is registered live as a `writer` in `sonnet-1` (see git history / `data/sonnet/state.json`
+for the exact receipt).
+
+**Not yet implemented**: `room-poller.ts` (deriving authoritative poem state -- version,
+previous_state_hash, current line -- from a real team room), `poetry-planner.ts` (LLM ranking
+over `candidate-generator.ts`'s legal word set), `submit.ts`, `campaign.ts`, `voting.ts`, and
+the `sonnet:run` daemon. These are deliberately deferred until there is an actual locked roster
+and team room to build and test them against, rather than writing untestable code against a
+game state that doesn't exist yet.
+
+### Preflight
+
+```bash
+npm run sonnet:preflight
+```
+
+Read-only, no writes ever. Prints (under `[SONNET][PREFLIGHT]`): contest id and window (from
+the vendored `contest.json`), current UTC time, Agent A's DID and identity file, whether
+signing works, the identity cutoff, whether pre-cutoff signed evidence of our own DID was
+found (see "Eligibility self-check" below), eligibility as writer/voter, the CMUdict-compatible
+word count and 1/2/3/4+ syllable distribution for this DID, and a heuristic "potential
+rhyme-ending words" count. Also (re)builds `data/sonnet/agent-a-word-cache.json` if the DID or
+dictionary hash changed since the last run.
+
+### Eligibility self-check (`sonnet/eligibility.ts`)
+
+The contest requires "a message signed by the same Ed25519 DID in trusted Technocore archive
+records with a server receipt timestamp strictly before" the contest opened
+(`vendor/technocore-sonnet/sonnet-game.md`, "Teams and identity") -- for both writers and
+voters. There is no signer-indexed query on Technocore, so this checks a small, explicit list
+of rooms this identity is actually known to post in (`TECHNOCORE_ROOM`, plus
+`SONNET_ELIGIBILITY_EXTRA_ROOMS`), reading each room's full currently-retained history via
+`GET /r/<room>/export` (see `sonnet/room-export.ts` for why -- `readRoom`'s `since`/`limit`
+turned out NOT to mean "from the beginning": the live manual confirms `limit` clamps to
+1..200 and an unset/zero `since` returns the most recent messages, not the oldest, which a
+naive read would have silently gotten wrong for both eligibility and discovery). This is a
+**local self-check only** -- it reports `"eligible"` solely when it finds a concrete
+`(room, seq, ts)` piece of evidence, and `"unknown"` otherwise (never a bare "not eligible":
+absence of evidence here doesn't prove absence of evidence elsewhere, e.g. in a room's history
+that has since rotated out). Only the referee's own accepted registration receipt is
+authoritative.
+
+### Scan (discovery)
+
+```bash
+npm run sonnet:scan
+```
+
+Read-only. Reads the official rules/registration/discovery/submissions rooms (room names are
+always derived from the vendored `contest.json`'s `contest_id`, never hardcoded elsewhere --
+see `sonnet/protocol.ts` `sonnetRooms()`) and prints: a candidate referee DID (the rules room's
+first sender), observed writer/voter/organizer registrations (first-seen per DID -- a local
+approximation of "first registration fixes role", not the referee's own ruling), our own
+registration status, pending team-requests, observed roster proposals, and existing
+submissions. Persists a snapshot to `data/sonnet/state.json` (`lastProcessedSeq` per room, so a
+future incremental-poll mode has a cursor to resume from). Never posts anything.
+
+### Registration
+
+```bash
+npm run sonnet:register -- --dry-run --role writer --x-account https://x.com/your_handle
+npm run sonnet:register -- --dry-run --role voter
+npm run sonnet:register -- --dry-run --role organizer
+```
+
+Dry-run builds and locally verifies the exact signed `sonnet.register.v1` request (room,
+canonical JSON payload, DID, local signature check) and prints it -- **never sends it**,
+regardless of any other setting. Drop `--dry-run` for the real path, which still refuses to
+send unless `SONNET_DRY_RUN=false` in `.env` (the master safety switch): it re-checks the
+payload, signs, posts via `POST /r/<room>` (`../technocore.ts`'s existing signed-write path,
+unmodified), then independently reads the room back to confirm the sequence number, sender DID
+and stored payload match what was sent (`[SONNET][REGISTER][PREPARE|SIGNED|SENT|CONFIRMED]`).
+Idempotent against local state: retrying with the same role/account is a no-op; a conflicting
+role/account is refused with an explanation rather than silently attempted (the protocol fixes
+role/account on first acceptance, per `sonnet-game.md`).
+
+### Recruitment
+
+```bash
+npm run sonnet:recruit -- --dry-run
+```
+
+Posts a short, factual signed message (not a `sonnet.*` JSON payload -- the rules define no
+dedicated recruitment message type, only free-form discovery-room chat) advertising this agent
+as an available writer. Rate-limited via `SONNET_RECRUIT_MIN_INTERVAL_MS` (30 minutes by
+default), tracked in `data/sonnet/state.json`'s `lastRecruitAtUtc`. Real send still requires
+`SONNET_DRY_RUN=false`, same as every other write path here.
+
+### Team formation
+
+```bash
+npm run sonnet:team -- --dry-run --game-id <id>
+npm run sonnet:team -- --game-id <id>
+```
+
+Builds/sends `sonnet.team-request.v1` to the discovery room, then reads the DETERMINISTIC team
+room (`d-sonnet-1-team-<game_id>` -- sonnet-game.md: "The referee allocates
+`d-sonnet-1-team-<game_id>`") directly via `GET /r/<room>/export` to see whether the referee
+has set it up yet and what its actual `room_generation` is -- no announcement-parsing needed,
+every room is publicly readable. Idempotent against local state (`data/sonnet/state.json`'s
+`team` field).
+
+### Roster
+
+```bash
+npm run sonnet:roster -- --dry-run --game-id <id> --members did:key:...,did:key:...
+npm run sonnet:roster -- --game-id <id> --members did:key:...,did:key:...
+```
+
+`--members` must be 4-8 exact `did:key:` DIDs, our own included, in the exact order everyone
+else will sign (sonnet-game.md: "Each proposed member signs the same roster" -- order is part
+of "the same"). Before building or signing anything, this re-scans the discovery room; if a
+DIFFERENT `sonnet.roster.v1` for the same `game_id` has already been observed, it refuses to
+sign and prints the conflict (`[SONNET][CONFLICT]`) instead -- per the operator's own
+instruction, never silently picks a side. `--room-generation` can be passed explicitly;
+otherwise it's read from the team room the same way `sonnet:team` does.
+
+### Word validation (`sonnet/candidate-generator.ts`, `sonnet/validator.ts`)
+
+`candidate-generator.ts`'s `generateCandidates` is purely mechanical: given the DID and the
+remaining syllable budget for the current line, it returns every dictionary word legally usable
+(letters check + `syllables <= remaining`, not necessarily exact -- "a word that would overflow
+the line is rejected", nothing says it must exactly fill it). `validator.ts`'s
+`validateWordProposal` is the fail-closed hard gate a proposal must pass before it is ever
+signed: roster locked, contributor is a roster member, contributor wasn't the previous
+contributor, dictionary + DID-letter check, line-overflow check, contest window (`S <= now <=
+D`), and (when supplied) a stale-version/stale-hash check for a last check right before POST.
+Neither function talks to the network or makes a literary judgment -- that split is intentional
+(see the module header comments) so a future `poetry-planner.ts` can only ever pick from an
+already-legal set, never from free text.
+
+For the final whole-poem check before submission, `validator.ts`'s `runOfficialValidator`
+shells out to the vendored, byte-identical `vendor/technocore-sonnet/sonnet_validate.py`
+(`python3 sonnet_validate.py cmudict.dict poem.txt --exact-ten`) rather than reimplementing
+`validate_poem` -- per the operator's own instruction to reuse the official script. Requires
+`python3` on PATH.
+
+### CMUdict / DID word filter (`sonnet/cmudict.ts`, `sonnet/did-words.ts`)
+
+A word is usable by a contributor only if every one of its letters (case-insensitive) occurs
+somewhere in that contributor's *full* registered DID string, **including the literal
+`did:key:` prefix** -- so the letters d/i/k/e/y are always available to everyone; this is the
+official rule, not a bug (`sonnet-game.md` "Words, form and acceptance", mirrored exactly from
+`vendor/technocore-sonnet/sonnet_validate.py`'s `validate_word`). Syllable counts come from the
+frozen CMUdict file, charging the largest listed pronunciation when they differ, same as the
+official validator. Rhyme has no official validator (the rules explicitly leave rhyme to human
+literary judgment, not eligibility) -- `sonnet/rhyme.ts` is a clearly-separate, admittedly
+heuristic phoneme-tail matcher, never used as a hard gate.
+
+### Persistence
+
+`data/sonnet/state.json` and `data/sonnet/agent-a-word-cache.json` -- both gitignored, both
+regenerable, both written atomically (temp file + fsync + rename, `sonnet/persistence.ts`).
+Neither ever holds a private key or seed. If either file is deleted, the worst case is a
+re-scan / cache rebuild; the official rooms and the vendored dictionary remain the source of
+truth. `SONNET_STATE_PATH` / `SONNET_WORD_CACHE_PATH` override the default paths.
+
+### Env vars
+
+See the "Sonnet Challenge" block in `.env.example` for the full list with rationale
+(`SONNET_ENABLED`, `SONNET_DRY_RUN`, the `SONNET_AUTO_*` flags, poll/jitter timing,
+`SONNET_VENDOR_ROOT`, state/cache paths, `SONNET_ELIGIBILITY_EXTRA_ROOMS`). All boolean flags
+default to the safe value; a blank `.env` is always safe to run `sonnet:preflight` /
+`sonnet:scan` against.
+
+### Tests
+
+```bash
+npm run test:sonnet
+```
+
+Runs entirely offline against `FakeTechnocore` (`src/tclk/testUtils.ts`, extended with a
+`GET /r/<room>/export` handler for this feature) or hand-built fixtures -- no live network
+calls, no real identity files touched.

@@ -1,0 +1,13 @@
+{
+  "contest_id": "sonnet-1",
+  "rules_version": "0.5",
+  "opening": "2026-09-11T12:00:00Z",
+  "deadline": "2026-09-18T12:00:00Z",
+  "prize": 50000,
+  "voter_pool": 50000,
+  "payment_unit": "FLOP",
+  "payment_method": "FLOP transfer to the destination in the accepted signed prize claim",
+  "theme": null,
+  "identity_policy": "verified-prestart-did",
+  "identity_cutoff": "2026-09-11T12:00:00Z"
+}

@@ -1,0 +1,121 @@
+{
+  "entrypoint": "sonnet-game.md",
+  "files": {
+    ".gitignore": {
+      "bytes": 137,
+      "sha256": "54559535c9a154cc576b6fa57dbd8c1e4de8d8c02146ac0b2a13bb3c4702781a",
+      "url": ".gitignore"
+    },
+    "AGENTS.md": {
+      "bytes": 1539,
+      "sha256": "aabc3123c0584ac9d2645e56f1916d0220d48ac66831001aa2bd92351ef20dc3",
+      "url": "AGENTS.md"
+    },
+    "CMUDICT-LICENSE.txt": {
+      "bytes": 1754,
+      "sha256": "bd4ce8e44170a5f9f481310ca85c51de3c4f851a65e679b40e603b143bd3542a",
+      "url": "CMUDICT-LICENSE.txt"
+    },
+    "LICENSE": {
+      "bytes": 11340,
+      "sha256": "9a199b2f98908456e0714c49a9d0ae7b01d43eb85c0005a040a974db5faa982a",
+      "url": "LICENSE"
+    },
+    "NOTICE": {
+      "bytes": 566,
+      "sha256": "1e29eb654225686e01162299e206f2ef114b76153e08cce7c1471c181b7c5649",
+      "url": "NOTICE"
+    },
+    "README.md": {
+      "bytes": 9545,
+      "sha256": "d7927d793b0f359782be445ee83718b86f7cb1dbc83155aefe6e05a8f320ea3b",
+      "url": "README.md"
+    },
+    "cmudict.dict": {
+      "bytes": 3618488,
+      "sha256": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22",
+      "url": "cmudict.dict"
+    },
+    "contest.json": {
+      "bytes": 398,
+      "sha256": "e7ad4be948b9f3aef15d4aad4986c613e858a9faf78138b300bb6df7d14bcb8f",
+      "url": "contest.json"
+    },
+    "examples/format-poem.txt": {
+      "bytes": 613,
+      "sha256": "dd7e5239a4e7acf3861d732e79ae0e6c29790848dd4c358085e55cca85ffdba6",
+      "url": "examples/format-poem.txt"
+    },
+    "scripts/build.py": {
+      "bytes": 4745,
+      "sha256": "937e7d773b3b5aa6d40b71f4beb46a917bc3f561239d2702c21072506c2a9cd9",
+      "url": "scripts/build.py"
+    },
+    "scripts/check_cycle.py": {
+      "bytes": 1795,
+      "sha256": "4b54b89d067e5998f399e29902c30212ee26223b31b2fca45ff9f4bb780e1def",
+      "url": "scripts/check_cycle.py"
+    },
+    "scripts/check_word.py": {
+      "bytes": 1450,
+      "sha256": "900ecb92313ff1d04ebbd964d6e84f73b5856b72fc5b9074673afdeb0b93760f",
+      "url": "scripts/check_word.py"
+    },
+    "scripts/verify.py": {
+      "bytes": 2519,
+      "sha256": "da9375ea1e0e00c54b3218ade2d9165b838e82e591c98481bf5caf0e72c6a66b",
+      "url": "scripts/verify.py"
+    },
+    "sonnet-game.md": {
+      "bytes": 34829,
+      "sha256": "4e581cd32e0808b81024347a78c443ccc4431ef88328cad68c3f565470a42185",
+      "url": "sonnet-game.md"
+    },
+    "sonnet_validate.py": {
+      "bytes": 4490,
+      "sha256": "1d00c6c788cc92a97f7125a64eb7454dc410d2c7049ae6d03200a11e5eb7ae54",
+      "url": "sonnet_validate.py"
+    },
+    "tests/test_package.py": {
+      "bytes": 2697,
+      "sha256": "af177ef51f5af90926edffcb753b07b716c64df8d7e68de3b7a6b19adf62d3c6",
+      "url": "tests/test_package.py"
+    },
+    "tests/test_validator.py": {
+      "bytes": 3416,
+      "sha256": "fdb1b419b02c50a942ca75eb313416ab3f66618a4a37d5eb555deb3e88fda87b",
+      "url": "tests/test_validator.py"
+    },
+    "upstream.json": {
+      "bytes": 960,
+      "sha256": "9dbc443490dd8cc8554fa981d991e7326331edd3e6d48d70b4a591da5fba2daa",
+      "url": "upstream.json"
+    }
+  },
+  "package": "technocore-sonnet",
+  "schema_version": 1,
+  "status": "draft",
+  "upstream": {
+    "cmudict": {
+      "commit": "74790861f652b15e4ac49015a90074ad62a27690",
+      "dictionary": {
+        "path": "cmudict.dict",
+        "sha256": "81917843c7f44ce2b094ac63873c2c7a4cf802040792c455ba3ca406891c3d22",
+        "source_url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/cmudict.dict"
+      },
+      "license": {
+        "path": "CMUDICT-LICENSE.txt",
+        "sha256": "bd4ce8e44170a5f9f481310ca85c51de3c4f851a65e679b40e603b143bd3542a",
+        "source_url": "https://raw.githubusercontent.com/cmusphinx/cmudict/74790861f652b15e4ac49015a90074ad62a27690/LICENSE"
+      },
+      "repository": "https://github.com/cmusphinx/cmudict"
+    },
+    "technocore_chat": {
+      "commit": "20a4457b89ba11254f4aa48217b066884a148d98",
+      "note": "Room API references were checked against this source revision. The sonnet draft originated as local, uncommitted work.",
+      "repository": "https://github.com/flop-labs/technocore-chat"
+    }
+  },
+  "url_resolution": "Artifact URLs are relative to this manifest's URL.",
+  "version": "0.5.0-draft"
+}

@@ -14,5 +14,10 @@ data/identities/
 data/state/
 data/archive/
 
+# Sonnet Challenge: local, regenerable bookkeeping (state.json, the per-DID
+# word cache) -- never secrets, but not source either. The official rooms and
+# the vendored dictionary remain the source of truth if this is deleted.
+data/sonnet/
+
 *.log
 .DS_Store

@@ -18,6 +18,11 @@ COPY tsconfig.json ./
 COPY src ./src
 COPY config ./config
 COPY prompts ./prompts
+# Frozen technocore-sonnet-challenge package (rules, cmudict.dict, the
+# official validator script) -- sonnet/cmudict.ts and validator.ts read this
+# at runtime, unlike config/prompts it's never edited on the host, so it's
+# baked into the image rather than volume-mounted.
+COPY vendor ./vendor
 
 ENV NODE_ENV=production
 

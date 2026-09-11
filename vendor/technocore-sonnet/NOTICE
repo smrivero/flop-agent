@@ -1,0 +1,11 @@
+technocore-sonnet
+
+The game document and embedded validator originated as local draft work in
+the Apache-2.0-licensed flop-labs/technocore-chat project. Source references for
+that service are pinned in upstream.json; the local sonnet draft was not part
+of the cited upstream commit.
+
+cmudict.dict is redistributed without modification from Carnegie Mellon
+University's CMUdict project. Its separate copyright notice, conditions, and
+disclaimer are reproduced in full in CMUDICT-LICENSE.txt. The precise source
+revision and file hashes are recorded in upstream.json.
