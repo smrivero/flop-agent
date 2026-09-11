@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { TechnocoreClient } from "../technocore.js";
 import { FakeTechnocore, makeTestIdentity } from "../tclk/testUtils.js";
-import { buildRecruitMessageText, buildRecruitPreview, recruit } from "./recruit.js";
+import { buildRecruitMessageText, buildOwnTeamRecruitText, buildRecruitPreview, recruit, recruitForOwnTeam } from "./recruit.js";
 import { loadSonnetConfig, type ContestConfig, type SonnetConfig } from "./config.js";
 
 const CONTEST: ContestConfig = {
@@ -73,4 +73,22 @@ test("recruit: sends when enough time has elapsed since the last message", async
   const result = await recruit(identity, CONTEST, config, { lastSentAtUtc: longAgo, minIntervalMs: 3_600_000 }, client);
   assert.equal(result.sent, true);
   assert.equal(result.rateLimited, false);
+});
+
+test("buildOwnTeamRecruitText: names our own game_id and invites people to join it, not 'looking for a team'", () => {
+  const text = buildOwnTeamRecruitText("satoshitrump", CONTEST);
+  assert.ok(text.includes("satoshitrump"));
+  assert.ok(text.includes("Started team-request"));
+  assert.equal(text.toLowerCase().includes("looking for a team of"), false);
+});
+
+test("recruitForOwnTeam: sends the own-team message, not the generic broadcast one", async () => {
+  const identity = makeTestIdentity();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const result = await recruitForOwnTeam(identity, CONTEST, config, "satoshitrump", { minIntervalMs: 1000 }, client);
+  assert.equal(result.sent, true);
+  assert.ok(result.preview.text.includes("satoshitrump"));
 });

@@ -15,7 +15,7 @@ import { buildDidWordCache, type DidWordCache } from "./did-words.js";
 import { checkEligibility } from "./eligibility.js";
 import { scan as scanRooms, toDiscoverySnapshot } from "./discovery.js";
 import { buildRegistrationPreview, register, RegistrationError } from "./registration.js";
-import { buildRecruitPreview, buildJoinInterestPreview, recruit, joinTeamRequest, RecruitError } from "./recruit.js";
+import { buildRecruitPreview, buildOwnTeamRecruitPreview, buildJoinInterestPreview, recruit, recruitForOwnTeam, joinTeamRequest, RecruitError } from "./recruit.js";
 import { buildTeamRequestPreview, checkRoomSetup, requestTeam, TeamError } from "./team.js";
 import { buildRosterPreview, detectRosterConflict, signRoster, summarizeRosterSigners, RosterError } from "./roster.js";
 import { loadState, saveState, transition } from "./state.js";
@@ -243,8 +243,16 @@ async function cmdRecruit(flags: Record<string, string | true>): Promise<void> {
   const wordCache = readJsonFile<DidWordCache>(config.wordCachePath);
   const wordCacheForMessage = wordCache && wordCache.did === agent.did ? wordCache : undefined;
 
+  // Once we have our own pending/assigned game_id, "looking for a team"
+  // reads as us wanting to join someone ELSE's -- recruit people into ours
+  // instead. See recruit.ts's module header for why these are distinct.
+  const initialState = loadState(config.statePath, contest.contest_id, agent.did);
+  const ownGameId = initialState.team?.gameId;
+
   if (forceDryRun) {
-    const preview = buildRecruitPreview(agent.identity, contest, effectiveConfig, { wordCache: wordCacheForMessage });
+    const preview = ownGameId
+      ? buildOwnTeamRecruitPreview(agent.identity, contest, effectiveConfig, ownGameId, { wordCache: wordCacheForMessage })
+      : buildRecruitPreview(agent.identity, contest, effectiveConfig, { wordCache: wordCacheForMessage });
     sonnetLog("TEAM", "[DRY-RUN] would publish:");
     sonnetLog("TEAM", `  room: ${preview.room}`);
     sonnetLog("TEAM", `  text: ${JSON.stringify(preview.text)}`);
@@ -253,12 +261,11 @@ async function cmdRecruit(flags: Record<string, string | true>): Promise<void> {
     return;
   }
 
-  let state = loadState(config.statePath, contest.contest_id, agent.did);
-  const result = await recruit(agent.identity, contest, effectiveConfig, {
-    wordCache: wordCacheForMessage,
-    lastSentAtUtc: state.lastRecruitAtUtc,
-    minIntervalMs: config.recruitMinIntervalMs,
-  });
+  let state = initialState;
+  const rateLimitOptions = { wordCache: wordCacheForMessage, lastSentAtUtc: state.lastRecruitAtUtc, minIntervalMs: config.recruitMinIntervalMs };
+  const result = ownGameId
+    ? await recruitForOwnTeam(agent.identity, contest, effectiveConfig, ownGameId, rateLimitOptions)
+    : await recruit(agent.identity, contest, effectiveConfig, rateLimitOptions);
   if (result.sent) {
     state = { ...state, lastRecruitAtUtc: new Date().toISOString() };
     saveState(config.statePath, state);

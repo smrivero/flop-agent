@@ -7,11 +7,16 @@
  * and negotiate") -- so this is ordinary signed text, deliberately NOT run
  * through protocol.ts's builders.
  *
- * Two message kinds, both rate-limited the same way (via `minIntervalMs` +
+ * Three message kinds, all rate-limited the same way (via `minIntervalMs` +
  * a caller-supplied last-sent timestamp; state.ts doesn't distinguish which
  * kind was last sent, so cli.ts should treat them as sharing one rate-limit
  * clock):
- *   - `recruit()`: a broadcast "writer available" message.
+ *   - `recruit()`: a broadcast "writer available, looking for A team" message
+ *     -- only right when we have no team-request of our own pending.
+ *   - `recruitForOwnTeam()`: "I started game_id=X, join ME" -- once we have
+ *     our own pending/assigned game_id, this is the correct message, not the
+ *     generic one above (which would confusingly read as us looking to join
+ *     someone else's team).
  *   - `joinTeamRequest()`: a targeted reply expressing interest in a
  *     SPECIFIC observed `sonnet.team-request.v1` (game_id + requester DID).
  *
@@ -43,6 +48,21 @@ export function buildRecruitMessageText(contest: ContestConfig, options: Recruit
     lines.push(`${options.wordCache.totalValidWords} dictionary words compatible with my DID.`);
   }
   lines.push("Looking for a team of 4-8 registered writers. Reply here or send a sonnet.team-request.v1.");
+  return lines.join(" ");
+}
+
+/** For when WE already have a pending/assigned game_id and want to recruit
+ * members INTO it -- distinct from buildRecruitMessageText, which reads as
+ * "looking for a team" (someone else's) rather than "join mine". */
+export function buildOwnTeamRecruitText(gameId: string, contest: ContestConfig, options: RecruitMessageOptions = {}): string {
+  const lines = [
+    `Started team-request game_id=${gameId} for ${contest.contest_id}.`,
+    "Registered writer, automated CMUdict validation, syllable tracking and signed-state word proposals.",
+  ];
+  if (options.wordCache) {
+    lines.push(`${options.wordCache.totalValidWords} dictionary words compatible with my DID.`);
+  }
+  lines.push(`Looking for 3-7 more registered writers to join (4-8 total). Reply here or send sonnet.roster.v1 with game_id=${gameId} once the room is set up.`);
   return lines.join(" ");
 }
 
@@ -87,6 +107,16 @@ export function buildRecruitPreview(
   options: RecruitMessageOptions = {},
 ): DiscoveryTextPreview {
   return buildDiscoveryTextPreview(identity, contest, config, buildRecruitMessageText(contest, options));
+}
+
+export function buildOwnTeamRecruitPreview(
+  identity: TechnocoreIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  gameId: string,
+  options: RecruitMessageOptions = {},
+): DiscoveryTextPreview {
+  return buildDiscoveryTextPreview(identity, contest, config, buildOwnTeamRecruitText(gameId, contest, options));
 }
 
 export function buildJoinInterestPreview(
@@ -159,6 +189,18 @@ export async function recruit(
   client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
 ): Promise<DiscoverySendResult> {
   const preview = buildRecruitPreview(identity, contest, config, options);
+  return sendDiscoveryText("TEAM", preview, config, options, identity, client);
+}
+
+export async function recruitForOwnTeam(
+  identity: TechnocoreIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  gameId: string,
+  options: RecruitMessageOptions & { lastSentAtUtc?: string; minIntervalMs: number },
+  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+): Promise<DiscoverySendResult> {
+  const preview = buildOwnTeamRecruitPreview(identity, contest, config, gameId, options);
   return sendDiscoveryText("TEAM", preview, config, options, identity, client);
 }
 
