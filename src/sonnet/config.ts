@@ -145,8 +145,25 @@ let cachedContest: ContestConfig | undefined;
 /**
  * Loads contest.json from the vendored package -- never hardcoded. Cached per
  * process (the vendored file never changes without a redeploy of this repo).
+ *
+ * IMPORTANT, discovered the hard way: the vendored contest.json's contest_id
+ * ("sonnet-1") is only the PUBLIC PACKAGE's draft/example value -- the
+ * public repo ships no live contest ("No contest is configured or running",
+ * AGENTS.md) and the operator assigns the REAL contest_id only at actual
+ * launch time, via a `sonnet.launch.v1` record posted in the rules room
+ * (`d-<contest_id>-rules`) by the pinned referee DID. On this run, the
+ * operator's first launch attempt under "sonnet-1" was itself withdrawn
+ * ("posted before any official launch record" -- see that room's own
+ * history) and the real contest actually launched as "sonnet-2", with
+ * otherwise byte-identical timing/config. There is currently no generic way
+ * to auto-discover the live contest_id (it would mean guessing/incrementing
+ * suffixes against `d-sonnet-<N>-rules` until one has a real launch record,
+ * which this project does not do), so `SONNET_CONTEST_ID` overrides the
+ * vendored value explicitly -- set it once you've confirmed which contest_id
+ * actually has a real `sonnet.launch.v1` record signed by a referee, the
+ * same way this was confirmed here.
  */
-export function loadContestConfig(config: SonnetConfig): ContestConfig {
+export function loadContestConfig(config: SonnetConfig, env: NodeJS.ProcessEnv = process.env): ContestConfig {
   if (cachedContest) return cachedContest;
   const path = resolve(config.vendorRoot, "contest.json");
   let raw: string;
@@ -161,6 +178,8 @@ export function loadContestConfig(config: SonnetConfig): ContestConfig {
   if (!parsed.contest_id || !parsed.opening || !parsed.identity_cutoff) {
     throw new SonnetConfigError(`${path} is missing required fields (contest_id/opening/identity_cutoff)`);
   }
-  cachedContest = parsed;
-  return parsed;
+  const contestIdOverride = env.SONNET_CONTEST_ID?.trim();
+  const resolved = contestIdOverride ? { ...parsed, contest_id: contestIdOverride } : parsed;
+  cachedContest = resolved;
+  return resolved;
 }
