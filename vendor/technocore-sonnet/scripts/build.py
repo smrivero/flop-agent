@@ -14,6 +14,7 @@ GENERATED = {
     "sonnet_validate.py": ("Python validator", "python"),
 }
 ARTIFACTS = (
+    ".gitattributes",
     ".gitignore",
     "AGENTS.md",
     "README.md",

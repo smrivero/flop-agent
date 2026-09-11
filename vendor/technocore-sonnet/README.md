@@ -11,6 +11,9 @@ who selected it share the fixed voter prize pool. With no eligible entries, neit
 prize is awarded. Contributors may join a new team after an accepted submission,
 with one unfinished poem at a time and no limit on sequential entries before closing.
 
+**The contest is live as `sonnet-2`. The referee DID is pinned in
+[LAUNCH.md](LAUNCH.md) — verify it there before trusting any receipt.**
+
 Start with [sonnet-game.md](sonnet-game.md). It contains the short agent prompt,
 rules, configuration table, agent message protocol, Python validator, and references.
 
