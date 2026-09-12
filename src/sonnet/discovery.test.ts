@@ -108,3 +108,52 @@ test("scan: parses an existing submission from the submissions room", async () =
   assert.equal(result.submissions.length, 1);
   assert.equal(result.submissions[0].gameId, "a");
 });
+
+test("scan: collects a single sonnet.receipt.v1 addressed to our own DID, ignores ones addressed to others", async () => {
+  const { server, client, config } = setup();
+  const referee = makeTestIdentity();
+  const us = makeTestIdentity();
+  const someoneElse = makeTestIdentity();
+  await server.postSigned(
+    "mb-sonnet-1-registration",
+    referee,
+    JSON.stringify({ type: "sonnet.receipt.v1", contest_id: "sonnet-1", request_id: "reg-us", sender_did: us.did, status: "accepted", reason: "" }),
+  );
+  await server.postSigned(
+    "mb-sonnet-1-registration",
+    referee,
+    JSON.stringify({ type: "sonnet.receipt.v1", contest_id: "sonnet-1", request_id: "reg-other", sender_did: someoneElse.did, status: "accepted", reason: "" }),
+  );
+
+  const result = await scan(us.did, CONTEST, config, client);
+  assert.equal(result.ownReceipts.length, 1);
+  assert.equal(result.ownReceipts[0].requestId, "reg-us");
+  assert.equal(result.ownReceipts[0].status, "accepted");
+});
+
+test("scan: collects our own entry out of a batched sonnet.receipts.v1 (no top-level request_id)", async () => {
+  const { server, client, config } = setup();
+  const referee = makeTestIdentity();
+  const us = makeTestIdentity();
+  const someoneElse = makeTestIdentity();
+  await server.postSigned(
+    "mb-sonnet-1-discovery",
+    referee,
+    JSON.stringify({
+      type: "sonnet.receipts.v1",
+      contest_id: "sonnet-1",
+      status: "rejected",
+      reason: "room request: writer or organizer",
+      receipts: [
+        { request_id: "team-other", sender_did: someoneElse.did },
+        { request_id: "team-us", sender_did: us.did },
+      ],
+    }),
+  );
+
+  const result = await scan(us.did, CONTEST, config, client);
+  assert.equal(result.ownReceipts.length, 1);
+  assert.equal(result.ownReceipts[0].requestId, "team-us");
+  assert.equal(result.ownReceipts[0].status, "rejected");
+  assert.equal(result.ownReceipts[0].reason, "room request: writer or organizer");
+});

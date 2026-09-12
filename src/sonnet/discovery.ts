@@ -14,6 +14,7 @@
  */
 
 import { TechnocoreClient, type Message } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import { tryParseSonnetMessage, sonnetRooms, type SonnetRole } from "./protocol.js";
 import { readFullRoom } from "./room-export.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
@@ -56,6 +57,20 @@ export interface ObservedSubmission {
   ts: string;
 }
 
+/** A referee `sonnet.receipt.v1` (or one entry of a batched
+ * `sonnet.receipts.v1`) addressed to OUR OWN DID -- the only authoritative
+ * accept/reject signal for anything we've sent (registration, team-request,
+ * roster, ...). Never inferred from "we see our own post landed" -- posting
+ * successfully only means the room accepted the bytes, not that the referee
+ * validated the request. */
+export interface ObservedReceipt {
+  requestId: string;
+  status: string;
+  reason?: string;
+  seq: number;
+  ts: string;
+}
+
 export interface ScanResult {
   rulesRoomRead: boolean;
   refereeDid?: string;
@@ -64,6 +79,10 @@ export interface ScanResult {
   rosterProposals: ObservedRoster[];
   submissions: ObservedSubmission[];
   ourRegistration?: ObservedRegistration;
+  /** Every receipt found (in the registration or discovery room) addressed
+   * to our own DID, keyed by nothing in particular here -- callers look up
+   * by request_id. See ObservedReceipt. */
+  ownReceipts: ObservedReceipt[];
   lastProcessedSeq: Record<string, number>;
   roomErrors: Array<{ room: string; error: string }>;
   malformedLines: number;
@@ -81,15 +100,57 @@ function firstSenderOf(messages: Message[]): string | undefined {
   return messages[0]?.from;
 }
 
+/** Not run through tryParseSonnetMessage -- the batched `sonnet.receipts.v1`
+ * form has no top-level request_id (it's per-entry inside `receipts`), which
+ * tryParseSonnetMessage's envelope check would reject outright. Both the
+ * single `sonnet.receipt.v1` and batched forms are undocumented in
+ * sonnet-game.md (observed live in both the registration and discovery
+ * rooms, never specified) -- read defensively, never assumed authoritative
+ * about fields it doesn't have. */
+function collectOwnReceipts(messages: Message[], ourDid: string): ObservedReceipt[] {
+  const out: ObservedReceipt[] = [];
+  for (const message of messages) {
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(message.text);
+    } catch {
+      continue;
+    }
+    if (typeof parsed !== "object" || parsed === null) continue;
+    const obj = parsed as Record<string, unknown>;
+    if (typeof obj.type !== "string") continue;
+    const reason = typeof obj.reason === "string" && obj.reason ? obj.reason : undefined;
+
+    if (obj.type === "sonnet.receipt.v1") {
+      if (obj.sender_did === ourDid && typeof obj.request_id === "string" && typeof obj.status === "string") {
+        out.push({ requestId: obj.request_id, status: obj.status, reason, seq: message.seq, ts: message.ts });
+      }
+    } else if (obj.type === "sonnet.receipts.v1" && Array.isArray(obj.receipts) && typeof obj.status === "string") {
+      for (const entry of obj.receipts) {
+        if (
+          entry &&
+          typeof entry === "object" &&
+          (entry as Record<string, unknown>).sender_did === ourDid &&
+          typeof (entry as Record<string, unknown>).request_id === "string"
+        ) {
+          out.push({ requestId: (entry as Record<string, unknown>).request_id as string, status: obj.status, reason, seq: message.seq, ts: message.ts });
+        }
+      }
+    }
+  }
+  return out;
+}
+
 export async function scan(
   ourDid: string,
   contest: ContestConfig,
   config: SonnetConfig,
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<ScanResult> {
   const rooms = sonnetRooms(contest);
   const lastProcessedSeq: Record<string, number> = {};
   const roomErrors: Array<{ room: string; error: string }> = [];
+  const ownReceipts: ObservedReceipt[] = [];
   let malformedLines = 0;
 
   function recordSeq(room: string, messages: Message[]): void {
@@ -114,6 +175,7 @@ export async function scan(
     const { messages, malformedLines: bad } = await readFullRoom(client, rooms.registration);
     malformedLines += bad;
     recordSeq(rooms.registration, messages);
+    ownReceipts.push(...collectOwnReceipts(messages, ourDid));
     for (const message of messages) {
       const parsed = tryParseSonnetMessage(message.text);
       if (!parsed || parsed.type !== "sonnet.register.v1") continue;
@@ -144,6 +206,7 @@ export async function scan(
     const { messages, malformedLines: bad } = await readFullRoom(client, rooms.discovery);
     malformedLines += bad;
     recordSeq(rooms.discovery, messages);
+    ownReceipts.push(...collectOwnReceipts(messages, ourDid));
     for (const message of messages) {
       const parsed = tryParseSonnetMessage(message.text);
       if (!parsed) continue;
@@ -205,6 +268,7 @@ export async function scan(
     rosterProposals,
     submissions,
     ourRegistration: registrations.find((r) => r.did === ourDid),
+    ownReceipts,
     lastProcessedSeq,
     roomErrors,
     malformedLines,

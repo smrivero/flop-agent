@@ -19,6 +19,7 @@
  */
 
 import { TechnocoreClient } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import type { SonnetAgentIdentity } from "./identity.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
 import { scan as scanRooms, toDiscoverySnapshot, type ObservedRoster } from "./discovery.js";
@@ -67,11 +68,17 @@ export async function pollOnce(
   contest: ContestConfig,
   config: SonnetConfig,
   state: SonnetState,
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
   wordResources?: WordResources,
 ): Promise<{ state: SonnetState; tick: PollTickResult }> {
   const scanResult = await scanRooms(agent.did, contest, config, client);
   let nextState: SonnetState = { ...state, discovery: toDiscoverySnapshot(scanResult) };
+
+  // Every referee receipt addressed to us, keyed by request_id -- the ONLY
+  // authoritative accept/reject signal for anything we've sent. Posting
+  // successfully (below, and everywhere else in this module) only means the
+  // room accepted the bytes; it is never treated as referee confirmation.
+  const receiptsByRequestId = new Map(scanResult.ownReceipts.map((r) => [r.requestId, r]));
 
   // Reconcile OUR OWN registration from what the room actually shows --
   // registration.ts/cli.ts only ever record `state.registration` on the
@@ -82,11 +89,27 @@ export async function pollOnce(
   // everywhere else in this module.
   if (!nextState.registration && scanResult.ourRegistration) {
     const observed = scanResult.ourRegistration;
-    sonnetLog("STATE", `observed our own existing registration in the room: role=${observed.role} seq=${observed.seq} -- reconciling local state`);
+    sonnetLog("STATE", `observed our own existing registration in the room: role=${observed.role} seq=${observed.seq} -- reconciling local state (not yet confirmed by a receipt)`);
     nextState = {
       ...nextState,
-      registration: { role: observed.role, requestId: observed.requestId, xAccountUrl: observed.xAccountUrl, confirmedSeq: observed.seq },
+      registration: { role: observed.role, requestId: observed.requestId, xAccountUrl: observed.xAccountUrl },
     };
+  }
+  // Only a real receipt confirms or rejects a registration -- our own post
+  // landing is not that signal. Checked every tick until one shows up.
+  if (nextState.registration && !nextState.registration.confirmedAtUtc && !nextState.registration.rejectedAtUtc) {
+    const receipt = receiptsByRequestId.get(nextState.registration.requestId);
+    if (receipt?.status === "accepted") {
+      sonnetLog("REGISTER", `CONFIRMED by referee receipt: request_id=${receipt.requestId} seq=${receipt.seq}`);
+      nextState = { ...nextState, registration: { ...nextState.registration, confirmedAtUtc: receipt.ts, confirmedSeq: receipt.seq } };
+    } else if (receipt?.status === "rejected") {
+      sonnetError(
+        "ERROR",
+        `registration REJECTED by referee: request_id=${receipt.requestId} reason=${receipt.reason ?? "(none given)"} -- ` +
+          `everything downstream (team requests, roster, words) will keep failing until this is fixed (re-register with a fresh request_id)`,
+      );
+      nextState = { ...nextState, registration: { ...nextState.registration, rejectedAtUtc: receipt.ts, rejectedReason: receipt.reason } };
+    }
   }
   if (nextState.registration && nextState.phase === "UNREGISTERED") nextState = transition(nextState, "REGISTERED");
   if (nextState.phase === "REGISTERED") nextState = transition(nextState, "DISCOVERING");
@@ -125,10 +148,32 @@ export async function pollOnce(
   // it. Processed together so a growing list of hedge requests doesn't need
   // its own separate loop.
   type TeamEntry = NonNullable<SonnetState["team"]>;
-  const ownTeamEntries: TeamEntry[] = [nextState.team, ...(nextState.additionalTeamRequests ?? [])].filter(
+  const allTeamEntries: TeamEntry[] = [nextState.team, ...(nextState.additionalTeamRequests ?? [])].filter(
     (t): t is TeamEntry => t !== undefined,
   );
-  if (ownTeamEntries.length > 0) {
+
+  // Drop any entry the referee explicitly REJECTED -- checked BEFORE the
+  // room-setup poll below, so a dead game_id doesn't get checked forever.
+  // Previously nothing looked at receipts at all here, so a rejection could
+  // sit unnoticed indefinitely: pollOnce would just keep polling a room that
+  // was never going to be set up, tick after tick, with no log line
+  // distinguishing "still waiting" from "already rejected hours ago".
+  const newlyDead: NonNullable<SonnetState["deadTeamRequests"]> = [];
+  const ownTeamEntries = allTeamEntries.filter((entry) => {
+    const receipt = receiptsByRequestId.get(entry.requestId);
+    if (receipt?.status !== "rejected") return true;
+    sonnetLog(
+      "TEAM",
+      `REJECTED by referee: game_id=${entry.gameId} request_id=${entry.requestId} reason=${receipt.reason ?? "(none given)"} -- dropping from active tracking`,
+    );
+    newlyDead.push({ gameId: entry.gameId, requestId: entry.requestId, requestedAtUtc: entry.requestedAtUtc, rejectedAtUtc: receipt.ts, reason: receipt.reason });
+    return false;
+  });
+  if (newlyDead.length > 0) {
+    nextState = { ...nextState, deadTeamRequests: [...(nextState.deadTeamRequests ?? []), ...newlyDead] };
+  }
+
+  {
     const updatedEntries = await Promise.all(
       ownTeamEntries.map(async (entry) => {
         let next = entry;

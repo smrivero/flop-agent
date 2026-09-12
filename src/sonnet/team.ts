@@ -12,6 +12,7 @@
  */
 
 import { TechnocoreClient, buildSignedMessageRequest, verifySignatureLocally } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import type { TechnocoreIdentity } from "../identity.js";
 import { buildTeamRequestPayload, freshRequestId, sonnetRooms, toCanonicalJson } from "./protocol.js";
 import { readFullRoom } from "./room-export.js";
@@ -69,7 +70,7 @@ export async function requestTeam(
   config: SonnetConfig,
   gameId: string,
   options: { alreadyRequested?: boolean; requestId?: string } = {},
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<TeamRequestResult> {
   const preview = buildTeamRequestPreview(identity, contest, config, gameId, options.requestId);
   sonnetLog("TEAM", `[PREPARE] room=${preview.room} payload=${preview.canonicalJson}`);
@@ -107,7 +108,7 @@ export async function checkRoomSetup(
   contest: ContestConfig,
   config: SonnetConfig,
   gameId: string,
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<RoomSetupStatus> {
   const room = sonnetRooms(contest).team(gameId);
   const { messages, generation } = await readFullRoom(client, room);

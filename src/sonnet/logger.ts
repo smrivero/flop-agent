@@ -27,6 +27,7 @@ export type SonnetLogCategory =
   | "SUBMIT"
   | "CAMPAIGN"
   | "VOTE"
+  | "HTTP"
   | "ERROR";
 
 function format(category: SonnetLogCategory, message: string): string {

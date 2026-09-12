@@ -9,6 +9,7 @@
  */
 
 import { TechnocoreClient, buildSignedMessageRequest, verifySignatureLocally } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import type { TechnocoreIdentity } from "../identity.js";
 import { buildRosterPayload, freshRequestId, sonnetRooms, toCanonicalJson } from "./protocol.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
@@ -110,7 +111,7 @@ export async function signRoster(
   config: SonnetConfig,
   options: { gameId: string; poemRoom: string; roomGeneration: number; members: string[]; requestId?: string },
   observedRosterProposals: readonly ObservedRoster[],
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<SignRosterResult> {
   const conflict = detectRosterConflict(options.gameId, options.members, observedRosterProposals);
   if (conflict) {

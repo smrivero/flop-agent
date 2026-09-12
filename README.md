@@ -1769,6 +1769,19 @@ being set up, being **accepted** into someone else's roster (our DID appearing i
 `sonnet.roster.v1` for a game_id we sent `sonnet:join` interest to), and anyone proposing to
 join **our own** team-request. Exits immediately if `SONNET_ENABLED=false` (the default).
 
+**Registration and team-requests are only ever confirmed by a referee `sonnet.receipt.v1`
+(or batched `sonnet.receipts.v1`) addressed to our own DID** -- never by the mere fact that our
+own post landed (posting successfully only means the room accepted the bytes, not that the
+referee validated the request). Each tick looks up a receipt for our registration's and every
+pending team-request's `request_id` (`discovery.ts`'s `ownReceipts`, matched in `run.ts`):
+an accepted one sets `registration.confirmedAtUtc`/`confirmedSeq`; a rejected one sets
+`registration.rejectedAtUtc`/`rejectedReason` and is logged once under `[SONNET][ERROR]` (a
+rejected registration blocks everything downstream -- re-register with a fresh `request_id`
+to fix it). A rejected team-request is logged once under `[SONNET][TEAM]` and moved out of
+`team`/`additionalTeamRequests` into `deadTeamRequests` (a historical record only, never
+re-checked), so a dead `game_id` stops being polled forever instead of sitting silently
+unresolved.
+
 **`SONNET_AUTO_TEAM=true`** signs the first valid roster (4-8 members, includes our DID, no
 conflicting proposal already observed) it finds for our own team-request or any pending join
 interest -- at most once per contest ("one current roster consent for an unfinished poem"),
@@ -1860,6 +1873,15 @@ See the "Sonnet Challenge" block in `.env.example` for the full list with ration
 `SONNET_VENDOR_ROOT`, state/cache paths, `SONNET_ELIGIBILITY_EXTRA_ROOMS`). All boolean flags
 default to the safe value; a blank `.env` is always safe to run `sonnet:preflight` /
 `sonnet:scan` against.
+
+`SONNET_HTTP_DEBUG=true` logs every HTTP request/response this feature sends to Technocore
+(method, full URL, headers, body -- truncated past a few KB) under `[SONNET][HTTP]`, request and
+response sharing a call id (see `sonnet/http-debug.ts`). Off by default -- a 30s poll loop reads
+several rooms every tick, some multiple MB -- turn it on only while actively diagnosing why
+something isn't happening; every `sonnet/*.ts` module builds its default `TechnocoreClient`
+through `createTechnocoreClient(config)` so the flag covers all of them without per-call-site
+opt-in, and it never touches `src/technocore.ts` itself (mentions/verifier/debate/tclk are
+unaffected regardless of this flag).
 
 ### Tests
 

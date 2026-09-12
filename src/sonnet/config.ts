@@ -67,6 +67,12 @@ export interface SonnetConfig {
   openAiModel?: string;
   httpTimeoutMs: number;
   maxRetries: number;
+
+  /** Logs every request/response this feature sends to Technocore (method,
+   * URL, headers, body) under [SONNET][HTTP] -- see http-debug.ts. Off by
+   * default: noisy on a 30s poll loop. Only affects this feature's own
+   * TechnocoreClient instances, never src/technocore.ts itself. */
+  httpDebug: boolean;
 }
 
 function parseBool(value: string | undefined, defaultValue: boolean): boolean {
@@ -121,6 +127,8 @@ export function loadSonnetConfig(env: NodeJS.ProcessEnv = process.env): SonnetCo
     openAiModel: env.OPENAI_MODEL || undefined,
     httpTimeoutMs: parseInt10(env.HTTP_TIMEOUT_MS, 15_000, "HTTP_TIMEOUT_MS"),
     maxRetries: parseInt10(env.MAX_RETRIES, 2, "MAX_RETRIES"),
+
+    httpDebug: parseBool(env.SONNET_HTTP_DEBUG, false),
   };
 }
 

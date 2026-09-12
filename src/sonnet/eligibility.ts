@@ -27,6 +27,7 @@
  */
 
 import { TechnocoreClient } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import { readFullRoom } from "./room-export.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
 
@@ -64,7 +65,7 @@ export async function checkEligibility(
   options: { client?: TechnocoreClient; env?: NodeJS.ProcessEnv } = {},
 ): Promise<EligibilityCheckResult> {
   const env = options.env ?? process.env;
-  const client = options.client ?? new TechnocoreClient({ baseUrl: config.technocoreBaseUrl });
+  const client = options.client ?? createTechnocoreClient(config);
 
   const cutoffMs = Date.parse(contest.identity_cutoff);
   if (!Number.isFinite(cutoffMs)) {

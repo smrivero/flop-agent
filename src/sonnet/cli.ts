@@ -221,8 +221,14 @@ async function cmdRegister(flags: Record<string, string | true>): Promise<void> 
 
   let changed = false;
   if (result.sent) {
-    state.registration = { role, requestId: result.preview.payload.request_id, xAccountUrl, confirmedSeq: result.postedSeq };
+    // NOT confirmedSeq: postedSeq -- posting successfully only means the room
+    // accepted the bytes, not that the referee validated the request. The
+    // next `sonnet:run` poll fills in confirmedAtUtc/confirmedSeq (or
+    // rejectedAtUtc/rejectedReason) from an actual referee receipt -- see
+    // run.ts's pollOnce.
+    state.registration = { role, requestId: result.preview.payload.request_id, xAccountUrl };
     changed = true;
+    sonnetLog("REGISTER", "sent -- not yet confirmed by the referee; run `sonnet:run` or `sonnet:scan` to pick up its receipt");
   }
   // Reconcile the phase whenever local state shows a registration, whether it
   // was just sent above or already existed (the idempotent no-op path, or a

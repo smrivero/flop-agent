@@ -18,6 +18,7 @@
  */
 
 import { TechnocoreClient, buildSignedMessageRequest, verifySignatureLocally } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import type { TechnocoreIdentity } from "../identity.js";
 import { buildWordPayload, freshRequestId, sonnetRooms, toCanonicalJson } from "./protocol.js";
 import { pollTeamRoom, type AuthoritativePoemState } from "./room-poller.js";
@@ -63,7 +64,7 @@ export async function buildProposePreview(
   contest: ContestConfig,
   config: SonnetConfig,
   ctx: ProposeContext,
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<ProposePreview> {
   const rooms = sonnetRooms(contest);
   const poemRoom = rooms.team(ctx.gameId);
@@ -168,7 +169,7 @@ export async function proposeWord(
   contest: ContestConfig,
   config: SonnetConfig,
   ctx: ProposeContext,
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<ProposeResult> {
   const preview = await buildProposePreview(identity, contest, config, ctx, client);
   sonnetLog("PROPOSE", `[PREPARE] room=${preview.room} payload=${preview.canonicalJson}`);

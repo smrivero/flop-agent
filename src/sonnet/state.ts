@@ -66,11 +66,18 @@ export interface RegistrationState {
   role: "writer" | "voter" | "organizer";
   requestId: string;
   xAccountUrl?: string;
-  /** Set once a referee receipt referencing our request_id is observed in the
-   * registration room -- registration.ts does not populate this from a bare
-   * "we posted it" fact. */
+  /** Set once an ACCEPTED referee receipt referencing our request_id is
+   * observed (see discovery.ts's ObservedReceipt) -- never set just because
+   * our own post landed; posting successfully only means the room accepted
+   * the bytes, not that the referee validated the request. */
   confirmedAtUtc?: string;
   confirmedSeq?: number;
+  /** Set once a REJECTED referee receipt referencing our request_id is
+   * observed. A rejected registration blocks everything downstream (team
+   * requests, roster, words) -- see run.ts's pollOnce, which logs this once
+   * under [SONNET][ERROR] rather than silently proceeding as if registered. */
+  rejectedAtUtc?: string;
+  rejectedReason?: string;
 }
 
 export interface DiscoverySnapshot {
@@ -143,6 +150,19 @@ export interface SonnetState {
     room?: string;
     roomGeneration?: number;
     notifiedRosterRequestIds?: string[];
+  }>;
+  /** Team-requests (ours) the referee explicitly REJECTED (see
+   * discovery.ts's ObservedReceipt) -- moved here out of `team`/
+   * `additionalTeamRequests` the tick the rejection is observed, so run.ts
+   * stops polling a dead game_id forever and the operator can see why a
+   * request never turned into a room. Purely a historical record; nothing
+   * reads this back. */
+  deadTeamRequests?: Array<{
+    gameId: string;
+    requestId: string;
+    requestedAtUtc: string;
+    rejectedAtUtc: string;
+    reason?: string;
   }>;
   /** `frozenAtUtc` is set only once discovery.ts observes the FIRST accepted
    * word in the poem room -- per sonnet-game.md, the roster freezes

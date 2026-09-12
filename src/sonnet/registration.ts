@@ -13,6 +13,7 @@
  */
 
 import { TechnocoreClient, buildSignedMessageRequest, verifySignatureLocally } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import type { TechnocoreIdentity } from "../identity.js";
 import { buildRegisterPayload, freshRequestId, sonnetRooms, toCanonicalJson, type SonnetRole } from "./protocol.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
@@ -99,7 +100,7 @@ export async function register(
   config: SonnetConfig,
   options: RegisterOptions,
   existingRegistration: RegistrationState | undefined,
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<RegisterResult> {
   if (existingRegistration) {
     const sameRole = existingRegistration.role === options.role;

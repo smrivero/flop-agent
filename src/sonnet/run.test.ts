@@ -115,6 +115,65 @@ test("pollOnce: does not overwrite an already-recorded local registration", asyn
   assert.equal(next.registration?.requestId, "already-local");
 });
 
+test("pollOnce: does NOT mark a registration confirmed just because our own post landed -- only a receipt does", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned(
+    "mb-sonnet-1-registration",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.register.v1", contest_id: "sonnet-1", role: "writer", request_id: "register-1" }),
+  );
+  // No receipt posted yet -- the referee hasn't gotten to it.
+
+  const { state: next } = await pollOnce(agent, CONTEST, config, defaultState("sonnet-1", agent.did), client);
+  assert.equal(next.registration?.requestId, "register-1");
+  assert.equal(next.registration?.confirmedAtUtc, undefined);
+  assert.equal(next.registration?.rejectedAtUtc, undefined);
+});
+
+test("pollOnce: confirms a registration once the referee's accepted receipt is observed", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+
+  server.postSigned(
+    "mb-sonnet-1-registration",
+    referee,
+    JSON.stringify({ type: "sonnet.receipt.v1", contest_id: "sonnet-1", request_id: "register-1", sender_did: agent.did, status: "accepted", reason: "" }),
+  );
+
+  const state = { ...defaultState("sonnet-1", agent.did), registration: { role: "writer" as const, requestId: "register-1" } };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.ok(next.registration?.confirmedAtUtc);
+  assert.equal(typeof next.registration?.confirmedSeq, "number");
+  assert.equal(next.registration?.rejectedAtUtc, undefined);
+});
+
+test("pollOnce: marks a registration REJECTED once the referee's rejection receipt is observed, and never confirms it", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+
+  server.postSigned(
+    "mb-sonnet-1-registration",
+    referee,
+    JSON.stringify({ type: "sonnet.receipt.v1", contest_id: "sonnet-1", request_id: "register-1", sender_did: agent.did, status: "rejected", reason: "room request: writer or organizer" }),
+  );
+
+  const state = { ...defaultState("sonnet-1", agent.did), registration: { role: "writer" as const, requestId: "register-1" } };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.ok(next.registration?.rejectedAtUtc);
+  assert.equal(next.registration?.rejectedReason, "room request: writer or organizer");
+  assert.equal(next.registration?.confirmedAtUtc, undefined);
+});
+
 test("pollOnce: reconciles our own team-request observed in the room into a fresh/empty local state", async () => {
   const agent = makeAgent();
   const config = loadSonnetConfig({});
@@ -153,6 +212,80 @@ test("pollOnce: does not overwrite an already-recorded local team-request", asyn
   };
   const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
   assert.equal(next.team?.gameId, "already-local");
+});
+
+test("pollOnce: drops a REJECTED team-request from active tracking into deadTeamRequests, and stops polling its room", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const referee = makeTestIdentity();
+  let roomSetupChecks = 0;
+  const client = new TechnocoreClient({
+    fetchImpl: async (input, init) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.includes("/team-dead/export")) roomSetupChecks++;
+      return server.fetch(input, init);
+    },
+  });
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    referee,
+    JSON.stringify({
+      type: "sonnet.receipts.v1",
+      contest_id: "sonnet-1",
+      status: "rejected",
+      reason: "room request: writer or organizer",
+      receipts: [{ request_id: "team-dead-req", sender_did: agent.did }],
+    }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "TEAM_REQUESTED" as const,
+    team: { gameId: "team-dead", requestId: "team-dead-req", requestedAtUtc: "2026-09-11T13:00:00Z" },
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.team, undefined);
+  assert.equal(next.additionalTeamRequests?.length ?? 0, 0);
+  assert.equal(next.deadTeamRequests?.length, 1);
+  assert.equal(next.deadTeamRequests?.[0].gameId, "team-dead");
+  assert.equal(next.deadTeamRequests?.[0].reason, "room request: writer or organizer");
+  assert.equal(roomSetupChecks, 0); // never even checked room setup for a game_id we already know is dead
+});
+
+test("pollOnce: a hedge team-request that's still pending survives when a DIFFERENT one is rejected", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const referee = makeTestIdentity();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    referee,
+    JSON.stringify({
+      type: "sonnet.receipt.v1",
+      contest_id: "sonnet-1",
+      request_id: "req-a",
+      sender_did: agent.did,
+      status: "rejected",
+      reason: "room request: writer or organizer",
+    }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "TEAM_REQUESTED" as const,
+    team: { gameId: "game-a", requestId: "req-a", requestedAtUtc: "2026-09-11T13:00:00Z" },
+    additionalTeamRequests: [{ gameId: "game-b", requestId: "req-b", requestedAtUtc: "2026-09-11T13:00:01Z" }],
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.team?.gameId, "game-b"); // the survivor is promoted to primary
+  assert.equal(next.additionalTeamRequests?.length ?? 0, 0);
+  assert.equal(next.deadTeamRequests?.[0].gameId, "game-a");
 });
 
 test("pollOnce: detects when our own requested room becomes set up and advances the phase", async () => {

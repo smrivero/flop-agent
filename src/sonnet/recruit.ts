@@ -24,6 +24,7 @@
  */
 
 import { TechnocoreClient, buildSignedMessageRequest, verifySignatureLocally } from "../technocore.js";
+import { createTechnocoreClient } from "./http-debug.js";
 import type { TechnocoreIdentity } from "../identity.js";
 import { sonnetRooms } from "./protocol.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
@@ -186,7 +187,7 @@ export async function recruit(
   contest: ContestConfig,
   config: SonnetConfig,
   options: RecruitMessageOptions & { lastSentAtUtc?: string; minIntervalMs: number },
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<DiscoverySendResult> {
   const preview = buildRecruitPreview(identity, contest, config, options);
   return sendDiscoveryText("TEAM", preview, config, options, identity, client);
@@ -198,7 +199,7 @@ export async function recruitForOwnTeam(
   config: SonnetConfig,
   gameId: string,
   options: RecruitMessageOptions & { lastSentAtUtc?: string; minIntervalMs: number },
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<DiscoverySendResult> {
   const preview = buildOwnTeamRecruitPreview(identity, contest, config, gameId, options);
   return sendDiscoveryText("TEAM", preview, config, options, identity, client);
@@ -211,7 +212,7 @@ export async function joinTeamRequest(
   gameId: string,
   requesterDid: string,
   options: RecruitMessageOptions & { lastSentAtUtc?: string; minIntervalMs: number },
-  client: TechnocoreClient = new TechnocoreClient({ baseUrl: config.technocoreBaseUrl }),
+  client: TechnocoreClient = createTechnocoreClient(config),
 ): Promise<DiscoverySendResult> {
   const preview = buildJoinInterestPreview(identity, contest, config, gameId, requesterDid, options);
   return sendDiscoveryText("TEAM", preview, config, options, identity, client);
