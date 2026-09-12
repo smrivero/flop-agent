@@ -619,6 +619,49 @@ test("pollOnce: SONNET_AUTO_TEAM does not sign a roster whose member count is ou
   assert.equal(tick.autoSignedRoster, undefined);
 });
 
+test("pollOnce: SONNET_AUTO_TEAM refuses a roster proposal with a duplicate DID in members", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity().did;
+  const dupedMembers = [agent.did, other, other, makeTestIdentity().did]; // "other" appears twice
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    makeTestIdentity(),
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "satoshitrump", poem_room: "d-sonnet-1-team-satoshitrump", room_generation: 0, members: dupedMembers, request_id: "roster-dup" }),
+  );
+
+  const state = { ...defaultState("sonnet-1", agent.did), team: { gameId: "satoshitrump", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z" } };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.roster, undefined);
+  assert.equal(tick.autoSignedRoster, undefined);
+});
+
+test("pollOnce: a REJECTED roster receipt clears state.roster so a different candidate can be signed next tick", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const referee = makeTestIdentity();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  await server.postSigned(
+    "mb-sonnet-1-discovery",
+    referee,
+    JSON.stringify({ type: "sonnet.receipt.v1", contest_id: "sonnet-1", request_id: "roster-req-rejected", sender_did: agent.did, status: "rejected", reason: "duplicate signer" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "ROSTER_PENDING" as const,
+    roster: { members: [agent.did, "x", "y", "z"], requestId: "roster-req-rejected", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
+    autoSignAttemptedRequestIds: ["roster-req-rejected"],
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.roster, undefined); // unlocked -- a different candidate could now be signed
+});
+
 test("pollOnce: SONNET_AUTO_TEAM never retries a conflicting candidate it already attempted", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };

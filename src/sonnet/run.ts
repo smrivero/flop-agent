@@ -254,6 +254,24 @@ export async function pollOnce(
     nextState = { ...nextState, pendingJoinInterests: updated };
   }
 
+  // Same receipt-confirmation discipline as registration/team-requests:
+  // sending our own sonnet.roster.v1 successfully only means the room
+  // accepted the bytes, never that the referee validated it. If rejected
+  // (duplicate signer, unregistered member, stale generation, ...), clear
+  // `roster` back to undefined so maybeAutoSignRoster can try a different
+  // candidate -- otherwise `if (state.roster) return` below would block
+  // ever signing anything again for the rest of the contest.
+  if (nextState.roster && !nextState.roster.rejectedAtUtc && !nextState.roster.frozenAtUtc) {
+    const receipt = receiptsByRequestId.get(nextState.roster.requestId);
+    if (receipt?.status === "rejected") {
+      sonnetError(
+        "ERROR",
+        `roster signature REJECTED by referee: game_id=${nextState.roster.gameId} request_id=${receipt.requestId} reason=${receipt.reason ?? "(none given)"} -- clearing local lock so a different roster can be signed`,
+      );
+      nextState = { ...nextState, roster: undefined };
+    }
+  }
+
   const autoSignedRoster = config.autoTeam
     ? await maybeAutoSignRoster(agent, contest, config, nextState, scanResult.rosterProposals, client)
     : undefined;
@@ -304,6 +322,22 @@ interface RosterSignCandidate {
  * that used to be here would have silently ignored it forever). Our own DID
  * being a member IS the pursuit signal; requiring anything more just means
  * missing real invitations.
+ *
+ * Also refuses a proposal with duplicate DIDs in `members` -- a cheap sanity
+ * check against a malformed draft, since a candidate wastes our one-time
+ * sign attempt for the whole contest if it turns out to be garbage (paired
+ * with pollOnce's receipt-based rejection handling above, which unlocks
+ * `state.roster` again if the referee itself rejects a signed one).
+ *
+ * Deliberately does NOT cross-check that every member is a currently
+ * "registered writer" per our own scan: the registration room is a bounded
+ * retention ring under heavy churn (confirmed live: tens of thousands of
+ * voter registrations rotated the window from seq ~11675 to ~83000+ within
+ * 14 hours), so a genuinely-registered writer's own registration message
+ * can already have rolled off it -- rejecting a real, valid roster candidate
+ * for that reason would be actively counterproductive. The referee itself
+ * enforces this server-side; if it rejects our sign attempt for exactly
+ * that reason, pollOnce's receipt handling above unlocks and retries.
  */
 async function maybeAutoSignRoster(
   agent: SonnetAgentIdentity,
@@ -327,6 +361,7 @@ async function maybeAutoSignRoster(
         p.members.includes(agent.did) &&
         p.members.length >= 4 &&
         p.members.length <= 8 &&
+        new Set(p.members).size === p.members.length &&
         !alreadyAttempted.has(p.requestId),
     )
     .map((proposal) => ({ gameId: proposal.gameId, proposal }))

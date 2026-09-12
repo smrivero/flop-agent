@@ -166,8 +166,16 @@ export interface SonnetState {
   }>;
   /** `frozenAtUtc` is set only once discovery.ts observes the FIRST accepted
    * word in the poem room -- per sonnet-game.md, the roster freezes
-   * atomically on the first accepted word, not on our own signature. */
-  roster?: { members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string; gameId?: string };
+   * atomically on the first accepted word, not on our own signature.
+   * `rejectedAtUtc`/`rejectedReason`: set once a referee receipt (see
+   * discovery.ts's ObservedReceipt) rejects our OWN roster.v1 requestId --
+   * signing successfully (getting a seq back) only means the room accepted
+   * the bytes, never that the referee validated the roster. Without this,
+   * a rejected sign attempt would be indistinguishable from a real one and
+   * `maybeAutoSignRoster`'s `if (state.roster) return` would block ever
+   * trying a different candidate again -- see run.ts's pollOnce, which
+   * clears `roster` back to undefined once a rejection is observed. */
+  roster?: { members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string; gameId?: string; rejectedAtUtc?: string; rejectedReason?: string };
   /** request_ids of roster.v1 proposals run.ts's SONNET_AUTO_TEAM auto-sign
    * step has already attempted (successfully or not) -- never retried, so a
    * genuine conflict doesn't spam [SONNET][CONFLICT] every tick forever. */
