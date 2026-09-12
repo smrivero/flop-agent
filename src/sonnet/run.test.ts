@@ -255,6 +255,55 @@ test("pollOnce: drops a REJECTED team-request from active tracking into deadTeam
   assert.equal(roomSetupChecks, 0); // never even checked room setup for a game_id we already know is dead
 });
 
+test("pollOnce: a REJECTED team-request already in deadTeamRequests is never resurrected or re-logged on a later tick", async () => {
+  // Regression test for a real bug: our OWN team-request message never
+  // disappears from the room (we sent it), so the "observed untracked
+  // team-request" self-healing block would see it again on the very next
+  // tick after it was dropped, re-add it to team/additionalTeamRequests,
+  // and the rejection-handling block would then re-detect and re-append it
+  // to deadTeamRequests -- forever, once per tick, spamming [SONNET][TEAM]
+  // REJECTED and growing deadTeamRequests without bound.
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const referee = makeTestIdentity();
+
+  await server.postSigned(
+    "mb-sonnet-1-discovery",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "team-dead", request_id: "team-dead-req" }),
+  );
+  await server.postSigned(
+    "mb-sonnet-1-discovery",
+    referee,
+    JSON.stringify({
+      type: "sonnet.receipts.v1",
+      contest_id: "sonnet-1",
+      status: "rejected",
+      reason: "room request: writer or organizer",
+      receipts: [{ request_id: "team-dead-req", sender_did: agent.did }],
+    }),
+  );
+
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  // Starting state already reflects a PRIOR tick's correct handling: the
+  // request was already dropped into deadTeamRequests and is no longer in
+  // team/additionalTeamRequests -- but the message is still sitting in the
+  // room, exactly like production.
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    phase: "DISCOVERING" as const,
+    deadTeamRequests: [{ gameId: "team-dead", requestId: "team-dead-req", requestedAtUtc: "2026-09-11T13:00:00Z", rejectedAtUtc: "2026-09-11T17:00:00Z", reason: "room request: writer or organizer" }],
+  };
+
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.equal(next.team, undefined); // never resurrected
+  assert.equal(next.additionalTeamRequests?.length ?? 0, 0);
+  assert.equal(next.deadTeamRequests?.length, 1); // not duplicated
+  assert.equal(next.phase, "DISCOVERING"); // never transitions to TEAM_REQUESTED for a dead request
+});
+
 test("pollOnce: a hedge team-request that's still pending survives when a DIFFERENT one is rejected", async () => {
   const agent = makeAgent();
   const config = loadSonnetConfig({});

@@ -122,8 +122,19 @@ export async function pollOnce(
   // sonnet:run without any manual state.json copying.
   {
     const hadNoTeamBefore = !nextState.team;
+    // MUST also exclude dead (rejected) request_ids, not just game_ids still
+    // being actively tracked -- otherwise a request the rejection-handling
+    // block below just dropped gets "discovered" as untracked again THIS
+    // SAME tick (it's still sitting in the room, we sent it), gets re-added
+    // to team/additionalTeamRequests, then re-rejected and re-appended to
+    // deadTeamRequests next tick, forever: infinite REJECTED-log spam and an
+    // ever-growing duplicate deadTeamRequests list. Matched on request_id,
+    // not game_id, since a game_id is free to reuse after its own rejection.
+    const deadRequestIds = new Set((nextState.deadTeamRequests ?? []).map((d) => d.requestId));
     const knownGameIds = new Set([nextState.team?.gameId, ...(nextState.additionalTeamRequests ?? []).map((t) => t.gameId)].filter((g): g is string => g !== undefined));
-    const untracked = scanResult.teamRequests.filter((t) => t.did === agent.did && !knownGameIds.has(t.gameId)).sort((a, b) => a.seq - b.seq);
+    const untracked = scanResult.teamRequests
+      .filter((t) => t.did === agent.did && !knownGameIds.has(t.gameId) && !deadRequestIds.has(t.requestId))
+      .sort((a, b) => a.seq - b.seq);
     if (untracked.length > 0) {
       sonnetLog("STATE", `observed ${untracked.length} of our own team-request(s) in the room not yet tracked locally: [${untracked.map((t) => t.gameId).join(", ")}] -- reconciling`);
       let team = nextState.team;
@@ -170,7 +181,14 @@ export async function pollOnce(
     return false;
   });
   if (newlyDead.length > 0) {
-    nextState = { ...nextState, deadTeamRequests: [...(nextState.deadTeamRequests ?? []), ...newlyDead] };
+    // Defensive de-dup by request_id, belt-and-suspenders alongside the
+    // deadRequestIds exclusion above -- never let the same rejection get
+    // appended twice even if both guards were somehow bypassed.
+    const existingDeadIds = new Set((nextState.deadTeamRequests ?? []).map((d) => d.requestId));
+    const freshlyDead = newlyDead.filter((d) => !existingDeadIds.has(d.requestId));
+    if (freshlyDead.length > 0) {
+      nextState = { ...nextState, deadTeamRequests: [...(nextState.deadTeamRequests ?? []), ...freshlyDead] };
+    }
   }
 
   {
