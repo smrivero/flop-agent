@@ -286,16 +286,24 @@ interface RosterSignCandidate {
 
 /**
  * SONNET_AUTO_TEAM's one write path: among every currently-observed roster
- * proposal that (a) includes our own DID, (b) has a valid 4-8 member count,
- * and (c) is for a game_id we're actually pursuing (our own team-request, or
- * a join interest we sent), sign the FIRST ONE not yet attempted --
- * "Each contributor may have one current roster consent for an unfinished
- * poem" (sonnet-game.md), so this only ever signs once per contest
- * (`!nextState.roster` below) and never retries a request_id it already
- * attempted (successfully or not), so a standing conflict doesn't spam a
- * sign attempt every tick forever. Still fully subject to SONNET_DRY_RUN --
- * this only ever builds+locally-verifies+confirms when dry-run is off, same
- * as every other write path in this project.
+ * proposal that (a) includes our own DID and (b) has a valid 4-8 member
+ * count, sign the FIRST ONE not yet attempted -- "Each contributor may have
+ * one current roster consent for an unfinished poem" (sonnet-game.md), so
+ * this only ever signs once per contest (`!nextState.roster` below) and
+ * never retries a request_id it already attempted (successfully or not), so
+ * a standing conflict doesn't spam a sign attempt every tick forever. Still
+ * fully subject to SONNET_DRY_RUN -- this only ever builds+locally-verifies+
+ * confirms when dry-run is off, same as every other write path here.
+ *
+ * Deliberately NOT gated on "a game_id we're actually pursuing" (our own
+ * team-request or a join interest we sent) -- confirmed live that another
+ * writer can add our DID to their own roster draft without us ever having
+ * sent a team-request or join-interest for that game_id (observed: game_id
+ * "echowrites", roster version echo-roster-v4-1789170722, included our DID
+ * even though we'd never touched that game_id -- the pursuedGameIds gate
+ * that used to be here would have silently ignored it forever). Our own DID
+ * being a member IS the pursuit signal; requiring anything more just means
+ * missing real invitations.
  */
 async function maybeAutoSignRoster(
   agent: SonnetAgentIdentity,
@@ -311,13 +319,11 @@ async function maybeAutoSignRoster(
   if (state.team) pursuedGameIds.add(state.team.gameId);
   for (const extra of state.additionalTeamRequests ?? []) pursuedGameIds.add(extra.gameId);
   for (const interest of state.pendingJoinInterests ?? []) pursuedGameIds.add(interest.gameId);
-  if (pursuedGameIds.size === 0) return undefined;
 
   const alreadyAttempted = new Set(state.autoSignAttemptedRequestIds ?? []);
   const candidates: RosterSignCandidate[] = rosterProposals
     .filter(
       (p) =>
-        pursuedGameIds.has(p.gameId) &&
         p.members.includes(agent.did) &&
         p.members.length >= 4 &&
         p.members.length <= 8 &&
@@ -331,7 +337,8 @@ async function maybeAutoSignRoster(
 
   sonnetLog(
     "ROSTER",
-    `SONNET_AUTO_TEAM: attempting to sign observed roster for game_id=${candidate.gameId} members=[${candidate.proposal.members.join(", ")}]`,
+    `SONNET_AUTO_TEAM: attempting to sign observed roster for game_id=${candidate.gameId} members=[${candidate.proposal.members.join(", ")}]` +
+      (pursuedGameIds.has(candidate.gameId) ? "" : " (a game_id we never explicitly pursued -- someone else added us)"),
   );
 
   const attempted = [...alreadyAttempted, candidate.proposal.requestId];

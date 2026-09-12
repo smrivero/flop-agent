@@ -547,6 +547,36 @@ test("pollOnce: SONNET_AUTO_TEAM=true + SONNET_DRY_RUN=false signs a valid obser
   assert.ok(ours);
 });
 
+test("pollOnce: SONNET_AUTO_TEAM signs a roster for a game_id we NEVER pursued (no team-request, no join-interest) -- someone else added us", async () => {
+  // Regression test for a real, live-confirmed gap: another writer can add
+  // our DID to their own roster draft for a game we never touched (observed
+  // live: game_id "echowrites", roster echo-roster-v4-1789170722 -- we'd
+  // never sent a team-request or join-interest for "echowrites"). The old
+  // code required the game_id to be in state.team/additionalTeamRequests/
+  // pendingJoinInterests before even considering the proposal, so it never
+  // noticed. Our own DID being a member of a valid 4-8 roster IS the signal.
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const members = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    makeTestIdentity(),
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "surprise-team", poem_room: "d-sonnet-1-team-surprise-team", room_generation: 0, members, request_id: "roster-surprise" }),
+  );
+
+  // No team, no additionalTeamRequests, no pendingJoinInterests -- this
+  // game_id is a complete surprise to our own state.
+  const state = { ...defaultState("sonnet-1", agent.did), phase: "DISCOVERING" as const };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+
+  assert.deepEqual(next.roster?.members, members);
+  assert.equal(next.roster?.gameId, "surprise-team");
+  assert.equal(tick.autoSignedRoster?.gameId, "surprise-team");
+});
+
 test("pollOnce: SONNET_AUTO_TEAM never signs a second roster once one is already signed this contest", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
