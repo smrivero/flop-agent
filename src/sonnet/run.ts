@@ -26,6 +26,8 @@ import { scan as scanRooms, toDiscoverySnapshot, type ObservedRoster } from "./d
 import { checkRoomSetup } from "./team.js";
 import { signRoster, RosterError } from "./roster.js";
 import { proposeWord, ProposeError } from "./propose.js";
+import { readFullRoom } from "./room-export.js";
+import { tryParseSonnetMessage } from "./protocol.js";
 import type { Lexicon } from "./cmudict.js";
 import type { RhymeIndex } from "./rhyme.js";
 import { transition, type SonnetState } from "./state.js";
@@ -275,17 +277,59 @@ export async function pollOnce(
   // sending our own sonnet.roster.v1 successfully only means the room
   // accepted the bytes, never that the referee validated it. If rejected
   // (duplicate signer, unregistered member, stale generation, ...), clear
-  // `roster` back to undefined so maybeAutoSignRoster can try a different
-  // candidate -- otherwise `if (state.roster) return` below would block
-  // ever signing anything again for the rest of the contest.
+  // `roster` back to undefined so a candidate can be promoted in its place.
   if (nextState.roster && !nextState.roster.rejectedAtUtc && !nextState.roster.frozenAtUtc) {
     const receipt = receiptsByRequestId.get(nextState.roster.requestId);
     if (receipt?.status === "rejected") {
       sonnetError(
         "ERROR",
-        `roster signature REJECTED by referee: game_id=${nextState.roster.gameId} request_id=${receipt.requestId} reason=${receipt.reason ?? "(none given)"} -- clearing local lock so a different roster can be signed`,
+        `roster signature REJECTED by referee: game_id=${nextState.roster.gameId} request_id=${receipt.requestId} reason=${receipt.reason ?? "(none given)"} -- clearing local lock so a different roster can be promoted`,
       );
       nextState = { ...nextState, roster: undefined };
+    }
+  }
+
+  // Drop any signed-but-not-yet-promoted candidate the referee explicitly
+  // rejected -- it was our own send, so a receipt for it (if any) is
+  // addressed to us and already in receiptsByRequestId.
+  if (nextState.rosterCandidates && nextState.rosterCandidates.length > 0) {
+    const surviving = nextState.rosterCandidates.filter((c) => {
+      const receipt = receiptsByRequestId.get(c.requestId);
+      if (receipt?.status !== "rejected") return true;
+      sonnetLog("ROSTER", `candidate REJECTED by referee: game_id=${c.gameId} request_id=${c.requestId} reason=${receipt.reason ?? "(none given)"} -- dropping`);
+      return false;
+    });
+    if (surviving.length !== nextState.rosterCandidates.length) {
+      nextState = { ...nextState, rosterCandidates: surviving };
+    }
+  }
+
+  // Promote the first pending candidate whose poem room shows real
+  // sonnet.word.v1 activity -- the only unambiguous "this one actually
+  // locked" signal (the referee's roster_ready receipt is addressed to
+  // whichever signer completed the set, which usually isn't us, so it
+  // can't be matched via our own receipts). Downstream (maybeAutoProposeWord
+  // and propose.ts's own turn/hash checks) never acts wrongly even if this
+  // promotion is ever wrong, since a mismatched roster just fails to find a
+  // legal turn for us -- so this heuristic is safe to run unconditionally.
+  if (!nextState.roster && nextState.rosterCandidates && nextState.rosterCandidates.length > 0) {
+    for (const candidate of nextState.rosterCandidates) {
+      let started = false;
+      try {
+        started = await poemRoomHasWordActivity(client, candidate.poemRoom);
+      } catch (err) {
+        sonnetError("ERROR", `checking word activity failed for candidate game_id=${candidate.gameId}: ${(err as Error).message} -- skipping this tick`);
+        continue;
+      }
+      if (started) {
+        sonnetLog("ROSTER", `PROMOTED candidate to active roster: game_id=${candidate.gameId} -- its poem room already has word activity`);
+        nextState = {
+          ...nextState,
+          roster: { members: candidate.members, requestId: candidate.requestId, signedAtUtc: candidate.signedAtUtc, gameId: candidate.gameId },
+          rosterCandidates: [],
+        };
+        break;
+      }
     }
   }
 
@@ -364,13 +408,17 @@ async function maybeAutoSignRoster(
   rosterProposals: readonly ObservedRoster[],
   client: TechnocoreClient,
 ): Promise<{ state: SonnetState; signed?: { gameId: string; requestId: string } } | undefined> {
-  if (state.roster) return undefined; // already signed one this contest -- never a second
+  if (state.roster) return undefined; // a real, promoted commitment already exists -- never a second
 
   const pursuedGameIds = new Set<string>();
   if (state.team) pursuedGameIds.add(state.team.gameId);
   for (const extra of state.additionalTeamRequests ?? []) pursuedGameIds.add(extra.gameId);
   for (const interest of state.pendingJoinInterests ?? []) pursuedGameIds.add(interest.gameId);
 
+  // Never re-sign a request_id already attempted (success, conflict, or
+  // rejection) -- includes both the legacy single `roster.requestId` (kept
+  // for backward-compatible state.json shapes) and every still-pending
+  // `rosterCandidates` entry.
   const alreadyAttempted = new Set(state.autoSignAttemptedRequestIds ?? []);
   const candidates: RosterSignCandidate[] = rosterProposals
     .filter(
@@ -390,7 +438,8 @@ async function maybeAutoSignRoster(
   sonnetLog(
     "ROSTER",
     `SONNET_AUTO_TEAM: attempting to sign observed roster for game_id=${candidate.gameId} members=[${candidate.proposal.members.join(", ")}]` +
-      (pursuedGameIds.has(candidate.gameId) ? "" : " (a game_id we never explicitly pursued -- someone else added us)"),
+      (pursuedGameIds.has(candidate.gameId) ? "" : " (a game_id we never explicitly pursued -- someone else added us)") +
+      (state.rosterCandidates?.length ? ` (already have ${state.rosterCandidates.length} other candidate(s) pending -- signing this one too, as a hedge)` : ""),
   );
 
   const attempted = [...alreadyAttempted, candidate.proposal.requestId];
@@ -409,10 +458,19 @@ async function maybeAutoSignRoster(
       // retried for real once dry-run is turned off.
       return undefined;
     }
+    // NOT promoted to `roster` yet -- most signed candidates never actually
+    // lock (the other signers scatter across many competing teams), so
+    // committing here would repeat the old single-commitment bug. pollOnce's
+    // promotion step moves this to `roster` once its poem room shows real
+    // word activity; until then it just sits alongside any other pending
+    // candidates as one more hedge.
     let nextState: SonnetState = {
       ...state,
       autoSignAttemptedRequestIds: attempted,
-      roster: { members: candidate.proposal.members, requestId: result.preview.payload.request_id, signedAtUtc: new Date().toISOString(), gameId: candidate.gameId },
+      rosterCandidates: [
+        ...(state.rosterCandidates ?? []),
+        { gameId: candidate.gameId, poemRoom: candidate.proposal.poemRoom, roomGeneration: candidate.proposal.roomGeneration, members: candidate.proposal.members, requestId: result.preview.payload.request_id, signedAtUtc: new Date().toISOString() },
+      ],
     };
     if (nextState.phase === "ROOM_ASSIGNED") nextState = transition(nextState, "ROSTER_PENDING");
     return { state: nextState, signed: { gameId: candidate.gameId, requestId: result.preview.payload.request_id } };
@@ -420,6 +478,18 @@ async function maybeAutoSignRoster(
     sonnetLog("CONFLICT", `SONNET_AUTO_TEAM: not signing game_id=${candidate.gameId} -- ${err instanceof RosterError ? err.message : (err as Error).message}`);
     return { state: { ...state, autoSignAttemptedRequestIds: attempted } };
   }
+}
+
+/** Reads a poem room and checks whether any sonnet.word.v1 has ever been
+ * posted there -- the only unambiguous "this roster actually locked" signal
+ * (per sonnet-game.md, the roster freezes atomically on the first accepted
+ * word). Deliberately does not attempt to verify the word was ACCEPTED
+ * (that would need a referee receipt cross-reference); a rejected first
+ * attempt still proves the room is live and someone is writing in it, which
+ * is exactly the promotion signal this needs. */
+async function poemRoomHasWordActivity(client: TechnocoreClient, poemRoom: string): Promise<boolean> {
+  const { messages } = await readFullRoom(client, poemRoom);
+  return messages.some((m) => tryParseSonnetMessage(m.text)?.type === "sonnet.word.v1");
 }
 
 /**

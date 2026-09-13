@@ -176,6 +176,26 @@ export interface SonnetState {
    * trying a different candidate again -- see run.ts's pollOnce, which
    * clears `roster` back to undefined once a rejection is observed. */
   roster?: { members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string; gameId?: string; rejectedAtUtc?: string; rejectedReason?: string };
+  /** Roster proposals we've signed but that haven't been PROMOTED to
+   * `roster` yet -- i.e. we don't yet know whether this is the one that
+   * actually locks. Confirmed live that this matters: most of a contributor's
+   * signed candidates never complete (the other signers scatter across many
+   * competing teams), so gating on "never sign a second roster" -- the
+   * original design -- meant one stalled candidate blocked ever trying
+   * anywhere else for the rest of the contest. Multiple candidates can be
+   * pending at once; each tick, pollOnce checks every candidate's poem room
+   * for real sonnet.word.v1 activity and promotes the first one that shows
+   * it to `roster` (clearing the rest -- the protocol only ever honors one
+   * locked roster per contributor per poem). A candidate that gets an
+   * explicit rejection receipt is dropped without ever being promoted. */
+  rosterCandidates?: Array<{
+    gameId: string;
+    poemRoom: string;
+    roomGeneration: number;
+    members: string[];
+    requestId: string;
+    signedAtUtc: string;
+  }>;
   /** request_ids of roster.v1 proposals run.ts's SONNET_AUTO_TEAM auto-sign
    * step has already attempted (successfully or not) -- never retried, so a
    * genuine conflict doesn't spam [SONNET][CONFLICT] every tick forever. */

@@ -579,8 +579,13 @@ test("pollOnce: SONNET_AUTO_TEAM=true + SONNET_DRY_RUN=false signs a valid obser
     team: { gameId: "satoshitrump", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z" },
   };
   const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
-  assert.deepEqual(next.roster?.members, members);
-  assert.equal(next.roster?.gameId, "satoshitrump");
+  // Signing lands it as a pending CANDIDATE, not an immediate lock -- most
+  // signed candidates never actually complete, so committing here would
+  // repeat the old single-commitment bug. See the promotion test below.
+  assert.equal(next.roster, undefined);
+  assert.equal(next.rosterCandidates?.length, 1);
+  assert.deepEqual(next.rosterCandidates?.[0].members, members);
+  assert.equal(next.rosterCandidates?.[0].gameId, "satoshitrump");
   assert.equal(next.phase, "ROSTER_PENDING");
   assert.equal(tick.autoSignedRoster?.gameId, "satoshitrump");
 
@@ -588,6 +593,64 @@ test("pollOnce: SONNET_AUTO_TEAM=true + SONNET_DRY_RUN=false signs a valid obser
   const room = await client.readRoom("mb-sonnet-1-discovery", { since: 0 });
   const ours = room.messages.find((m) => m.from === agent.did && JSON.parse(m.text).type === "sonnet.roster.v1");
   assert.ok(ours);
+});
+
+test("pollOnce: PROMOTES a pending roster candidate to the active roster once its poem room shows real word activity", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity();
+  const members = [agent.did, other.did, makeTestIdentity().did, makeTestIdentity().did];
+
+  // Someone actually started writing in this room -- the unambiguous signal
+  // that this candidate (and not some other one we also signed) is real.
+  server.postSigned(
+    "d-sonnet-1-team-satoshitrump",
+    other,
+    JSON.stringify({ type: "sonnet.word.v1", contest_id: "sonnet-1", game_id: "satoshitrump", room_generation: 0, version: 0, previous_state_hash: "", word: "The", request_id: "w-1" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    rosterCandidates: [
+      { gameId: "satoshitrump", poemRoom: "d-sonnet-1-team-satoshitrump", roomGeneration: 0, members, requestId: "roster-real", signedAtUtc: "2026-09-11T13:00:00Z" },
+      { gameId: "other-game", poemRoom: "d-sonnet-1-team-other-game", roomGeneration: 0, members, requestId: "roster-other", signedAtUtc: "2026-09-11T13:00:00Z" },
+    ],
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.roster?.gameId, "satoshitrump");
+  assert.equal(next.roster?.requestId, "roster-real");
+  assert.deepEqual(next.rosterCandidates, []); // the other pending candidate is abandoned, not re-checked
+});
+
+test("pollOnce: signs a SECOND roster candidate as a hedge even while a first candidate is still pending (not yet promoted)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const membersB = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    makeTestIdentity(),
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "game-b", poem_room: "d-sonnet-1-team-game-b", room_generation: 0, members: membersB, request_id: "roster-b" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    // A first candidate is already pending (signed, not promoted) -- the
+    // OLD `if (state.roster) return` gate never applied to candidates, only
+    // to a real promoted commitment, so this must not block a second sign.
+    rosterCandidates: [
+      { gameId: "game-a", poemRoom: "d-sonnet-1-team-game-a", roomGeneration: 0, members: membersB, requestId: "roster-a", signedAtUtc: "2026-09-11T13:00:00Z" },
+    ],
+  };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(tick.autoSignedRoster?.gameId, "game-b");
+  assert.equal(next.rosterCandidates?.length, 2);
+  assert.ok(next.rosterCandidates?.some((c) => c.gameId === "game-a"));
+  assert.ok(next.rosterCandidates?.some((c) => c.gameId === "game-b"));
 });
 
 test("pollOnce: SONNET_AUTO_TEAM signs a roster for a game_id we NEVER pursued (no team-request, no join-interest) -- someone else added us", async () => {
@@ -615,8 +678,9 @@ test("pollOnce: SONNET_AUTO_TEAM signs a roster for a game_id we NEVER pursued (
   const state = { ...defaultState("sonnet-1", agent.did), phase: "DISCOVERING" as const };
   const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
 
-  assert.deepEqual(next.roster?.members, members);
-  assert.equal(next.roster?.gameId, "surprise-team");
+  assert.equal(next.roster, undefined); // pending candidate, not yet promoted
+  assert.deepEqual(next.rosterCandidates?.[0].members, members);
+  assert.equal(next.rosterCandidates?.[0].gameId, "surprise-team");
   assert.equal(tick.autoSignedRoster?.gameId, "surprise-team");
 });
 
@@ -869,8 +933,9 @@ test("pollOnce: tracks multiple own team-requests (additionalTeamRequests) and a
   const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
   assert.deepEqual(tick.newlySetUpRooms, ["hedge-b"]);
   assert.equal(tick.autoSignedRoster?.gameId, "hedge-b");
-  assert.equal(next.roster?.gameId, "hedge-b");
-  assert.deepEqual(next.roster?.members, members);
+  assert.equal(next.roster, undefined); // pending candidate, not yet promoted
+  assert.equal(next.rosterCandidates?.[0].gameId, "hedge-b");
+  assert.deepEqual(next.rosterCandidates?.[0].members, members);
 
   // hedge-a and hedge-c are untouched (never set up), still tracked.
   assert.equal(next.team?.gameId, "hedge-a");
