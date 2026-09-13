@@ -3,9 +3,23 @@
  * signs the same roster... A changed roster needs fresh consent from
  * everyone" (sonnet-game.md "Teams and identity") -- so signing here is
  * gated on there being NO conflicting roster.v1 already observed for the
- * same game_id (a different members list from a different signer). This
- * module never signs through a conflict; it reports one and waits, per the
- * operator's own instruction.
+ * same game_id that SHARES A MEMBER with the one we intend to sign (a
+ * different members list, from a different signer, involving at least one
+ * of the same people). This module never signs through a conflict; it
+ * reports one and waits, per the operator's own instruction.
+ *
+ * Confirmed live: popular-sounding game_id strings (e.g. "power_team")
+ * attract multiple, completely UNRELATED groups independently proposing
+ * their own 4-person rosters under the same name -- zero overlap in
+ * membership, just a naming coincidence in an open discovery room. Treating
+ * every differently-membered proposal for the game_id as a conflict (the
+ * original, broader check) meant we'd refuse to ever countersign an
+ * invitation we'd genuinely and validly received, purely because some
+ * unrelated third group also used the same name. Scoping the conflict to
+ * "shares a member with what we intend to sign" keeps the real protection
+ * (never risk a `consent: withdraw before changing` rejection by signing
+ * two different rosters that both involve the same person(s), most
+ * importantly us) while no longer blocking on pure name-squatting noise.
  */
 
 import { TechnocoreClient, buildSignedMessageRequest, verifySignatureLocally } from "../technocore.js";
@@ -33,10 +47,16 @@ function sameMembers(a: readonly string[], b: readonly string[]): boolean {
  * Compares our intended members list against every roster.v1 already
  * observed for this game_id (from discovery.ts's scan). A proposal with the
  * SAME exact members list (order included -- "the same roster") is not a
- * conflict, it's a co-signer; anything else is.
+ * conflict, it's a co-signer. A DIFFERENT members list is only a conflict if
+ * it shares at least one DID with what we intend to sign -- otherwise it's
+ * an unrelated group that happens to have picked the same game_id name, not
+ * a real threat to our own consent.
  */
 export function detectRosterConflict(gameId: string, intendedMembers: readonly string[], observed: readonly ObservedRoster[]): RosterConflict | undefined {
-  const conflicting = observed.filter((r) => r.gameId === gameId && !sameMembers(r.members, intendedMembers));
+  const intendedSet = new Set(intendedMembers);
+  const conflicting = observed.filter(
+    (r) => r.gameId === gameId && !sameMembers(r.members, intendedMembers) && r.members.some((did) => intendedSet.has(did)),
+  );
   return conflicting.length > 0 ? { gameId, conflictingProposals: conflicting } : undefined;
 }
 

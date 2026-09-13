@@ -71,6 +71,21 @@ test("detectRosterConflict: order matters -- same members in a different order i
   assert.ok(conflict);
 });
 
+test("detectRosterConflict: a same-game_id proposal with ZERO overlapping members is NOT a conflict -- an unrelated group squatting the same name", () => {
+  const intended = ["did:key:1", "did:key:2", "did:key:3", "did:key:4"];
+  const unrelated = ["did:key:9", "did:key:10", "did:key:11", "did:key:12"];
+  const conflict = detectRosterConflict("a", intended, [observed("a", "did:key:9", unrelated, 1)]);
+  assert.equal(conflict, undefined);
+});
+
+test("detectRosterConflict: a same-game_id proposal sharing even ONE member is still a conflict", () => {
+  const intended = ["did:key:1", "did:key:2", "did:key:3", "did:key:4"];
+  const partiallyShared = ["did:key:1", "did:key:9", "did:key:10", "did:key:11"]; // only did:key:1 overlaps
+  const conflict = detectRosterConflict("a", intended, [observed("a", "did:key:9", partiallyShared, 1)]);
+  assert.ok(conflict);
+  assert.equal(conflict!.conflictingProposals.length, 1);
+});
+
 test("detectRosterConflict: a proposal for a DIFFERENT game_id never conflicts", () => {
   const intended = ["did:key:1", "did:key:2", "did:key:3", "did:key:4"];
   const conflict = detectRosterConflict("a", intended, [observed("b", "did:key:9", ["did:key:9"], 1)]);
