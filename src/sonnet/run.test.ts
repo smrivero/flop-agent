@@ -820,6 +820,37 @@ test("pollOnce: SONNET_AUTO_TEAM does not sign a roster whose member count is ou
   assert.equal(tick.autoSignedRoster, undefined);
 });
 
+test("pollOnce: self-heals duplicate roster candidates (same content, different request_id) left over from before the self-loop fix", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const fetchLog: string[] = [];
+  const client = new TechnocoreClient({
+    fetchImpl: async (input, init) => {
+      fetchLog.push(String(input));
+      return server.fetch(input, init);
+    },
+  });
+  const membersA = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    rosterCandidates: [
+      { gameId: "game-a", poemRoom: "d-sonnet-1-team-game-a", roomGeneration: 0, members: membersA, requestId: "roster-a-1", signedAtUtc: "2026-09-13T17:00:00Z" },
+      { gameId: "game-a", poemRoom: "d-sonnet-1-team-game-a", roomGeneration: 0, members: membersA, requestId: "roster-a-2", signedAtUtc: "2026-09-13T17:01:00Z" },
+      { gameId: "game-a", poemRoom: "d-sonnet-1-team-game-a", roomGeneration: 0, members: membersA, requestId: "roster-a-3", signedAtUtc: "2026-09-13T17:02:00Z" },
+    ],
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.rosterCandidates?.length, 1);
+  assert.equal(next.rosterCandidates?.[0].requestId, "roster-a-1"); // earliest-signed survives
+
+  // The promotion check should only hit the poem room ONCE for this game,
+  // not once per leftover duplicate.
+  const roomHits = fetchLog.filter((u) => u.includes("d-sonnet-1-team-game-a")).length;
+  assert.equal(roomHits, 1);
+});
+
 test("pollOnce: SONNET_AUTO_TEAM refuses a roster proposal with a duplicate DID in members", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };

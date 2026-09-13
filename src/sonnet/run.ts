@@ -313,6 +313,27 @@ export async function pollOnce(
     }
   }
 
+  // Self-heal duplicate candidates accumulated by an older build's re-sign
+  // loop (fixed in maybeAutoSignRoster, but state.json persisted from before
+  // the fix can still carry many identical entries for the same content,
+  // each with its own request_id) -- collapse to one per distinct
+  // game_id/room_generation/members, keeping the earliest-signed. Without
+  // this, the promotion loop below re-reads the SAME poem room once per
+  // leftover duplicate, every tick, forever.
+  if (nextState.rosterCandidates && nextState.rosterCandidates.length > 1) {
+    const seen = new Map<string, (typeof nextState.rosterCandidates)[number]>();
+    for (const c of nextState.rosterCandidates) {
+      const key = `${c.gameId}|${c.roomGeneration}|${[...c.members].sort().join(",")}`;
+      const existing = seen.get(key);
+      if (!existing || c.signedAtUtc < existing.signedAtUtc) seen.set(key, c);
+    }
+    const deduped = [...seen.values()];
+    if (deduped.length !== nextState.rosterCandidates.length) {
+      sonnetLog("ROSTER", `collapsed ${nextState.rosterCandidates.length - deduped.length} duplicate roster candidate(s) (same content, different request_id) down to ${deduped.length}`);
+      nextState = { ...nextState, rosterCandidates: deduped };
+    }
+  }
+
   // Promote the first pending candidate whose poem room shows real
   // sonnet.word.v1 activity -- the only unambiguous "this one actually
   // locked" signal (the referee's roster_ready receipt is addressed to
