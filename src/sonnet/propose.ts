@@ -76,7 +76,7 @@ export async function buildProposePreview(
     throw new ProposeError(`team room ${poemRoom} does not appear to be set up by the referee yet`);
   }
 
-  const poem = await pollTeamRoom(client, poemRoom, ctx.rosterMembers, ctx.lexicon);
+  const poem = await pollTeamRoom(client, poemRoom, ctx.rosterMembers, ctx.lexicon, setup.generation);
   if (poem.complete) throw new ProposeError("poem is already complete (14 lines) -- nothing to propose");
   if (!poem.hashKnown) throw new ProposeError("cannot confidently determine the referee's latest state hash yet -- refusing to propose (see room-poller.ts)");
   if (poem.previousContributorDid === identity.did) {
@@ -104,15 +104,35 @@ export async function buildProposePreview(
   );
   if (candidates.length === 0) throw new ProposeError(`no legal candidates for line ${poem.currentLineIndex + 1} (remaining ${remainingSyllables} syllables)`);
 
-  if (!config.openAiApiKey || !config.openAiModel) {
-    throw new ProposeError("OPENAI_API_KEY and OPENAI_MODEL are required for sonnet:propose (reuses this project's existing keys)");
+  // A real, active coordinator plan for this poem (see coordinator-plan.ts)
+  // takes priority over the LLM: if the word it assigns for our position
+  // (poem.version, i.e. how many words are already accepted) is on our OWN
+  // independently-generated, already-validated candidate list, use it as-is
+  // -- no LLM call needed, and it's exactly what a real human/agent teammate
+  // is expecting next. Never trusted blindly: a plan word that ISN'T legal
+  // (wrong dictionary word, letters missing from our DID, already used, line
+  // overflow) is silently ignored and normal independent selection proceeds.
+  const planWord = poem.coordinatorPlanWords?.[poem.version];
+  const planWordIsLegal = planWord && candidates.some((c) => c.word === planWord.word);
+
+  let planned: PlannedWord;
+  if (planWord && planWordIsLegal) {
+    sonnetLog(
+      "CANDIDATES",
+      `game_id=${ctx.gameId} line=${poem.currentLineIndex + 1} following active coordinator plan: word=${JSON.stringify(planWord.raw)} (position ${poem.version} in the plan's poem text)`,
+    );
+    planned = { word: planWord.raw, reason: "following the active coordinator plan for this room", confidence: 1 };
+  } else {
+    if (!config.openAiApiKey || !config.openAiModel) {
+      throw new ProposeError("OPENAI_API_KEY and OPENAI_MODEL are required for sonnet:propose (reuses this project's existing keys)");
+    }
+    planned = await planNextWord(poem, poem.currentLineIndex, candidates, ctx.rhymeIndex, {
+      apiKey: config.openAiApiKey,
+      model: config.openAiModel,
+      timeoutMs: config.httpTimeoutMs,
+      maxRetries: config.maxRetries,
+    });
   }
-  const planned = await planNextWord(poem, poem.currentLineIndex, candidates, ctx.rhymeIndex, {
-    apiKey: config.openAiApiKey,
-    model: config.openAiModel,
-    timeoutMs: config.httpTimeoutMs,
-    maxRetries: config.maxRetries,
-  });
 
   // Final mechanical re-check, against the state as we polled it -- the
   // authoritative gate, independent of poetry-planner.ts's own closed-set check.

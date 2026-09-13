@@ -26,6 +26,7 @@ import { TechnocoreClient, type Message } from "../technocore.js";
 import { tryParseSonnetMessage } from "./protocol.js";
 import { readFullRoom } from "./room-export.js";
 import { wordSyllables } from "./did-words.js";
+import { findLatestCoordinatorPlan, type CoordinatorPlanWord } from "./coordinator-plan.js";
 import type { Lexicon } from "./cmudict.js";
 import { sonnetLog } from "./logger.js";
 
@@ -48,6 +49,9 @@ export interface AuthoritativePoemState {
   complete: boolean;
   lastProcessedSeq: number;
   unrecognizedRefereeMessages: number;
+  /** Set only by pollTeamRoom (never by derivePoemState, which stays a pure
+   * function over messages alone) -- see coordinator-plan.ts. */
+  coordinatorPlanWords?: CoordinatorPlanWord[];
 }
 
 export const TOTAL_LINES = 14; // 4/4/4/2 stanzas
@@ -196,6 +200,7 @@ export async function pollTeamRoom(
   room: string,
   rosterMembers: readonly string[],
   lexicon: Lexicon,
+  roomGeneration?: number,
 ): Promise<AuthoritativePoemState> {
   const { messages, malformedLines } = await readFullRoom(client, room);
   if (malformedLines > 0) sonnetLog("STATE", `${room}: ${malformedLines} export line(s) could not be parsed and were skipped`);
@@ -206,5 +211,7 @@ export async function pollTeamRoom(
   if (state.unrecognizedRefereeMessages > 0) {
     sonnetLog("STATE", `${room}: ${state.unrecognizedRefereeMessages} referee message(s) did not match any known receipt shape (see room-poller.ts header)`);
   }
-  return state;
+  if (roomGeneration === undefined) return state;
+  const coordinatorPlanWords = findLatestCoordinatorPlan(messages, roomGeneration);
+  return coordinatorPlanWords ? { ...state, coordinatorPlanWords } : state;
 }

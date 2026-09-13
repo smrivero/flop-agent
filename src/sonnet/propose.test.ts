@@ -76,6 +76,58 @@ test("buildProposePreview: happy path on an empty poem produces a verified, unse
   assert.equal(preview.room, "d-sonnet-1-team-a");
 });
 
+test("buildProposePreview: follows an active coordinator plan instead of calling the LLM, when the plan's word for our position is legal", async () => {
+  const us = makeTestIdentity();
+  const other = makeTestIdentity();
+  const referee = makeTestIdentity();
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  await setUpRoom(server, "a", referee);
+  server.postSigned(
+    "d-sonnet-1-team-a",
+    other,
+    JSON.stringify({ type: "sonnet.note.v1", contest_id: "sonnet-1", game_id: "a", room_generation: 0, request_id: "plan-1", poem: "Key eyed" }),
+  );
+
+  const config = baseConfig();
+  let fetchCalled = false;
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetchCalled = true;
+    throw new Error("LLM should never be called when a legal plan word exists");
+  }) as typeof fetch;
+  let preview;
+  try {
+    preview = await buildProposePreview(us, CONTEST, config, { gameId: "a", rosterMembers: [us.did, other.did], lexicon: LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }, client);
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(fetchCalled, false);
+  assert.equal(preview.planned.word, "Key"); // original casing from the plan, preserved
+  assert.equal(preview.payload.word, "Key");
+});
+
+test("buildProposePreview: ignores a coordinator plan word that isn't mechanically legal, falls back to the LLM", async () => {
+  const us = makeTestIdentity();
+  const other = makeTestIdentity();
+  const referee = makeTestIdentity();
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  await setUpRoom(server, "a", referee);
+  // Plan's word at position 0 is "banana" -- not in our tiny LEXICON at all.
+  server.postSigned(
+    "d-sonnet-1-team-a",
+    other,
+    JSON.stringify({ type: "sonnet.note.v1", contest_id: "sonnet-1", game_id: "a", room_generation: 0, request_id: "plan-1", poem: "banana eyed" }),
+  );
+
+  const config = baseConfig();
+  const preview = await withMockFetch(llmResponse("key"), () =>
+    buildProposePreview(us, CONTEST, config, { gameId: "a", rosterMembers: [us.did, other.did], lexicon: LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }, client),
+  );
+  assert.equal(preview.planned.word, "key"); // fell back to the (mocked) LLM choice
+});
+
 test("buildProposePreview: refuses when we were the previous contributor", async () => {
   const us = makeTestIdentity();
   const other = makeTestIdentity();
