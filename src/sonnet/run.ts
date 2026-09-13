@@ -196,11 +196,21 @@ export async function pollOnce(
       ownTeamEntries.map(async (entry) => {
         let next = entry;
         if (next.roomGeneration === undefined) {
-          const setup = await checkRoomSetup(contest, config, next.gameId, client);
-          if (setup.hasMessages) {
-            sonnetLog("TEAM", `our requested room is now set up: game_id=${next.gameId} generation=${setup.generation}`);
-            next = { ...next, room: setup.room, roomGeneration: setup.generation };
-            newlySetUpRooms.push(next.gameId);
+          // A single malformed/oversized game_id (e.g. scraped from someone
+          // else's free-text message) must never abort the whole tick --
+          // confirmed live: one bad entry threw inside Promise.all here,
+          // which failed the entire pollOnce call, which skipped saveState
+          // for that tick entirely, silently discarding every OTHER real
+          // update (including a genuine roster acceptance) tick after tick.
+          try {
+            const setup = await checkRoomSetup(contest, config, next.gameId, client);
+            if (setup.hasMessages) {
+              sonnetLog("TEAM", `our requested room is now set up: game_id=${next.gameId} generation=${setup.generation}`);
+              next = { ...next, room: setup.room, roomGeneration: setup.generation };
+              newlySetUpRooms.push(next.gameId);
+            }
+          } catch (err) {
+            sonnetError("ERROR", `checkRoomSetup failed for our own game_id=${next.gameId}: ${(err as Error).message} -- skipping this entry for this tick`);
           }
         }
 
@@ -230,11 +240,18 @@ export async function pollOnce(
       nextState.pendingJoinInterests.map(async (interest) => {
         let next = interest;
         if (!next.roomSetUpAtUtc) {
-          const setup = await checkRoomSetup(contest, config, interest.gameId, client);
-          if (setup.hasMessages) {
-            sonnetLog("TEAM", `a room we're interested in is now set up: game_id=${interest.gameId} generation=${setup.generation} -- checking whether its roster includes us`);
-            newlySetUpRooms.push(interest.gameId);
-            next = { ...next, roomSetUpAtUtc: new Date().toISOString() };
+          // Same isolation as the ownTeamEntries loop above -- one bad
+          // game_id here must not abort the tick and lose every other
+          // pendingJoinInterests update (including a real acceptance).
+          try {
+            const setup = await checkRoomSetup(contest, config, interest.gameId, client);
+            if (setup.hasMessages) {
+              sonnetLog("TEAM", `a room we're interested in is now set up: game_id=${interest.gameId} generation=${setup.generation} -- checking whether its roster includes us`);
+              newlySetUpRooms.push(interest.gameId);
+              next = { ...next, roomSetUpAtUtc: new Date().toISOString() };
+            }
+          } catch (err) {
+            sonnetError("ERROR", `checkRoomSetup failed for pending join-interest game_id=${interest.gameId}: ${(err as Error).message} -- skipping this entry for this tick`);
           }
         }
         // Check for our own DID in any roster.v1 proposal for this game_id --

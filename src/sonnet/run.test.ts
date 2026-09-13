@@ -381,6 +381,49 @@ test("pollOnce: detects when a pending join-interest's room becomes set up, with
   assert.equal(next.pendingJoinInterests?.find((i) => i.gameId === "keeper1")?.roomSetUpAtUtc, undefined);
 });
 
+test("pollOnce: a malformed game_id in pendingJoinInterests never aborts the whole tick -- other entries (including a real acceptance) still get processed and saved", async () => {
+  // Regression test for a real production incident: pendingJoinInterests
+  // picked up a scraped game_id ("sonnet-test-ed27dc02", 20 chars) that
+  // fails assertValidName's 16-char limit. checkRoomSetup threw inside the
+  // Promise.all over ALL pendingJoinInterests entries, which rejected the
+  // whole array, which threw out of pollOnce entirely -- caught by runLoop's
+  // outer catch, which logs "poll tick failed" and explicitly skips
+  // saveState. A genuine roster acceptance detected earlier in that same
+  // tick (for a different, valid game_id) was silently discarded, tick
+  // after tick, forever -- because it was never persisted.
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const requester = makeTestIdentity();
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    requester,
+    JSON.stringify({
+      type: "sonnet.roster.v1",
+      contest_id: "sonnet-1",
+      game_id: "realgame",
+      poem_room: "d-sonnet-1-team-realgame",
+      room_generation: 0,
+      members: [requester.did, agent.did],
+      request_id: "roster-real",
+    }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    pendingJoinInterests: [
+      { gameId: "realgame", requesterDid: requester.did, sentAtUtc: "2026-09-11T13:00:00Z" },
+      { gameId: "this-game-id-is-way-too-long-for-the-protocols-16-char-limit", requesterDid: requester.did, sentAtUtc: "2026-09-11T13:00:00Z" },
+    ],
+  };
+
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.newlyAcceptedIntoTeams, ["realgame"]);
+  assert.ok(next.pendingJoinInterests?.find((i) => i.gameId === "realgame")?.acceptedAtUtc);
+});
+
 test("pollOnce: detects being ACCEPTED into someone else's roster (our DID appears in a roster.v1 for that game_id)", async () => {
   const agent = makeAgent();
   const config = loadSonnetConfig({});
