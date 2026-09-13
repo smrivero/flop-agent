@@ -57,7 +57,7 @@ export interface PollTickResult {
   autoSignedRoster?: { gameId: string; requestId: string };
   /** Set only when SONNET_AUTO_WRITE successfully proposed (and had
    * accepted-by-the-server, per the independent read-back) a word THIS tick. */
-  autoProposedWord?: { gameId: string; word: string; seq?: number };
+  autoProposedWords: Array<{ gameId: string; word: string; seq?: number }>;
   registeredWriterCount: number;
   registeredVoterCount: number;
   pendingTeamRequestCount: number;
@@ -297,6 +297,18 @@ export async function pollOnce(
       nextState = { ...nextState, roster: undefined };
     }
   }
+  if (nextState.additionalRosters && nextState.additionalRosters.length > 0) {
+    const survivingRosters = nextState.additionalRosters.filter((r) => {
+      if (r.rejectedAtUtc || r.frozenAtUtc) return true;
+      const receipt = receiptsByRequestId.get(r.requestId);
+      if (receipt?.status !== "rejected") return true;
+      sonnetError("ERROR", `roster signature REJECTED by referee: game_id=${r.gameId} request_id=${receipt.requestId} reason=${receipt.reason ?? "(none given)"} -- dropping`);
+      return false;
+    });
+    if (survivingRosters.length !== nextState.additionalRosters.length) {
+      nextState = { ...nextState, additionalRosters: survivingRosters };
+    }
+  }
 
   // Drop any signed-but-not-yet-promoted candidate the referee explicitly
   // rejected -- it was our own send, so a receipt for it (if any) is
@@ -334,7 +346,7 @@ export async function pollOnce(
     }
   }
 
-  // Promote the first pending candidate whose poem room shows real
+  // Promote EVERY pending candidate whose poem room shows real
   // sonnet.word.v1 activity -- the only unambiguous "this one actually
   // locked" signal (the referee's roster_ready receipt is addressed to
   // whichever signer completed the set, which usually isn't us, so it
@@ -342,24 +354,41 @@ export async function pollOnce(
   // and propose.ts's own turn/hash checks) never acts wrongly even if this
   // promotion is ever wrong, since a mismatched roster just fails to find a
   // legal turn for us -- so this heuristic is safe to run unconditionally.
-  if (!nextState.roster && nextState.rosterCandidates && nextState.rosterCandidates.length > 0) {
-    for (const candidate of nextState.rosterCandidates) {
+  // A contributor can be genuinely, validly locked into several DIFFERENT
+  // poems (game_ids) at once, so this no longer stops at the first one --
+  // the first promotion in a tick fills `roster`, every one after that
+  // (this tick or a later one) is appended to `additionalRosters`, skipping
+  // a game_id already locked either place.
+  if (nextState.rosterCandidates && nextState.rosterCandidates.length > 0) {
+    const originalCandidates = nextState.rosterCandidates;
+    const stillPending: NonNullable<typeof nextState.rosterCandidates> = [];
+    const lockedGameIds = new Set<string>([nextState.roster?.gameId, ...(nextState.additionalRosters ?? []).map((r) => r.gameId)].filter((g): g is string => !!g));
+    for (const candidate of originalCandidates) {
+      if (lockedGameIds.has(candidate.gameId)) continue; // already locked via a different candidate for the same game_id
       let started = false;
       try {
         started = await poemRoomHasWordActivity(client, candidate.poemRoom);
       } catch (err) {
         sonnetError("ERROR", `checking word activity failed for candidate game_id=${candidate.gameId}: ${(err as Error).message} -- skipping this tick`);
+        stillPending.push(candidate);
         continue;
       }
-      if (started) {
-        sonnetLog("ROSTER", `PROMOTED candidate to active roster: game_id=${candidate.gameId} -- its poem room already has word activity`);
-        nextState = {
-          ...nextState,
-          roster: { members: candidate.members, requestId: candidate.requestId, signedAtUtc: candidate.signedAtUtc, gameId: candidate.gameId },
-          rosterCandidates: [],
-        };
-        break;
+      if (!started) {
+        stillPending.push(candidate);
+        continue;
       }
+      const promoted = { members: candidate.members, requestId: candidate.requestId, signedAtUtc: candidate.signedAtUtc, gameId: candidate.gameId };
+      if (!nextState.roster) {
+        sonnetLog("ROSTER", `PROMOTED candidate to active roster: game_id=${candidate.gameId} -- its poem room already has word activity`);
+        nextState = { ...nextState, roster: promoted };
+      } else {
+        sonnetLog("ROSTER", `PROMOTED candidate to an ADDITIONAL active roster (writing in multiple poems at once): game_id=${candidate.gameId} -- its poem room already has word activity`);
+        nextState = { ...nextState, additionalRosters: [...(nextState.additionalRosters ?? []), promoted] };
+      }
+      lockedGameIds.add(candidate.gameId);
+    }
+    if (stillPending.length !== originalCandidates.length) {
+      nextState = { ...nextState, rosterCandidates: stillPending };
     }
   }
 
@@ -379,10 +408,21 @@ export async function pollOnce(
     : undefined;
   if (autoSignedRoster) nextState = autoSignedRoster.state;
 
-  const autoProposedWord =
-    config.autoWrite && wordResources && nextState.roster?.gameId
-      ? await maybeAutoProposeWord(agent, contest, config, nextState.roster, wordResources, client)
-      : undefined;
+  // One attempt per ACTIVE roster, every tick -- a contributor can be
+  // genuinely locked into several different poems at once (see
+  // maybeAutoSignRoster's header), and each attempt is cheap when it isn't
+  // that poem's turn (propose.ts throws before ever spending an LLM call),
+  // so there's no reason to write in only one of them.
+  const activeRosters = [nextState.roster, ...(nextState.additionalRosters ?? [])].filter(
+    (r): r is NonNullable<typeof nextState.roster> => !!r?.gameId,
+  );
+  const autoProposedWords: Array<{ gameId: string; word: string; seq?: number }> = [];
+  if (config.autoWrite && wordResources) {
+    for (const roster of activeRosters) {
+      const result = await maybeAutoProposeWord(agent, contest, config, roster, wordResources, client);
+      if (result) autoProposedWords.push(result);
+    }
+  }
 
   return {
     state: nextState,
@@ -392,7 +432,7 @@ export async function pollOnce(
       newRosterProposalsForOwnTeam,
       autoJoinedNewTeams: newlyDiscoveredAndApplied?.joined ?? [],
       autoSignedRoster: autoSignedRoster?.signed,
-      autoProposedWord,
+      autoProposedWords,
       registeredWriterCount: scanResult.registrations.filter((r) => r.role === "writer").length,
       registeredVoterCount: scanResult.registrations.filter((r) => r.role === "voter").length,
       pendingTeamRequestCount: scanResult.teamRequests.length,
@@ -429,6 +469,7 @@ async function maybeAutoJoinNewTeams(
   for (const i of state.pendingJoinInterests ?? []) known.add(i.gameId);
   for (const c of state.rosterCandidates ?? []) known.add(c.gameId);
   if (state.roster?.gameId) known.add(state.roster.gameId);
+  for (const r of state.additionalRosters ?? []) if (r.gameId) known.add(r.gameId);
 
   const fresh = new Map<string, string>(); // gameId -> requester DID (first seen)
   for (const t of scanResult.teamRequests) {
@@ -542,15 +583,19 @@ async function maybeAutoProposeOwnRoster(
 }
 
 /**
- * SONNET_AUTO_TEAM's one write path: among every currently-observed roster
+ * SONNET_AUTO_TEAM's write path: among every currently-observed roster
  * proposal that (a) includes our own DID and (b) has a valid 4-8 member
- * count, sign the FIRST ONE not yet attempted -- "Each contributor may have
- * one current roster consent for an unfinished poem" (sonnet-game.md), so
- * this only ever signs once per contest (`!nextState.roster` below) and
- * never retries a request_id it already attempted (successfully or not), so
- * a standing conflict doesn't spam a sign attempt every tick forever. Still
- * fully subject to SONNET_DRY_RUN -- this only ever builds+locally-verifies+
- * confirms when dry-run is off, same as every other write path here.
+ * count, sign the FIRST ONE not yet attempted per tick -- "Each contributor
+ * may have one current roster consent for an unfinished poem" (sonnet-game.md)
+ * is scoped PER POEM (game_id), not globally, so this signs across as many
+ * DIFFERENT game_ids as show up, one per tick, and never retries a
+ * request_id it already attempted (successfully or not), so a standing
+ * conflict doesn't spam a sign attempt every tick forever. The one-per-poem
+ * rule is still enforced -- detectRosterConflict (roster.ts) refuses to sign
+ * a SECOND different composition for a game_id we're already committed to.
+ * Still fully subject to SONNET_DRY_RUN -- this only ever
+ * builds+locally-verifies+confirms when dry-run is off, same as every other
+ * write path here.
  *
  * Deliberately NOT gated on "a game_id we're actually pursuing" (our own
  * team-request or a join interest we sent) -- confirmed live that another
@@ -586,7 +631,15 @@ async function maybeAutoSignRoster(
   rosterProposals: readonly ObservedRoster[],
   client: TechnocoreClient,
 ): Promise<{ state: SonnetState; signed?: { gameId: string; requestId: string } } | undefined> {
-  if (state.roster) return undefined; // a real, promoted commitment already exists -- never a second
+  // A contributor may be locked into several DIFFERENT poems (game_ids) at
+  // once -- see this function's header. What's still never allowed is a
+  // SECOND, different composition for a game_id already locked (roster or
+  // additionalRosters): skip those game_ids here as a cheap pre-filter;
+  // detectRosterConflict (roster.ts) would refuse them anyway, but there's
+  // no reason to spend a sign attempt (and a CONFLICT log line) on it.
+  const lockedGameIds = new Set<string>(
+    [state.roster?.gameId, ...(state.additionalRosters ?? []).map((r) => r.gameId)].filter((g): g is string => !!g),
+  );
 
   const pursuedGameIds = new Set<string>();
   if (state.team) pursuedGameIds.add(state.team.gameId);
@@ -617,6 +670,7 @@ async function maybeAutoSignRoster(
         p.members.length >= 4 &&
         p.members.length <= 8 &&
         new Set(p.members).size === p.members.length &&
+        !lockedGameIds.has(p.gameId) &&
         !alreadyAttempted.has(p.requestId) &&
         !alreadySignedContent.has(`${p.gameId}|${p.roomGeneration}|${[...p.members].sort().join(",")}`),
     )
@@ -773,7 +827,7 @@ export async function runLoop(
           `newly_set_up=[${tick.newlySetUpRooms.join(", ")}] newly_accepted=[${tick.newlyAcceptedIntoTeams.join(", ")}] new_roster_proposals_for_us=${tick.newRosterProposalsForOwnTeam.length}` +
           (tick.autoJoinedNewTeams.length ? ` AUTO_JOINED=[${tick.autoJoinedNewTeams.join(", ")}]` : "") +
           (tick.autoSignedRoster ? ` AUTO_SIGNED_ROSTER=${tick.autoSignedRoster.gameId}` : "") +
-          (tick.autoProposedWord ? ` AUTO_PROPOSED_WORD=${JSON.stringify(tick.autoProposedWord.word)}(seq=${tick.autoProposedWord.seq})` : ""),
+          (tick.autoProposedWords.length ? tick.autoProposedWords.map((w) => ` AUTO_PROPOSED_WORD[${w.gameId}]=${JSON.stringify(w.word)}(seq=${w.seq})`).join("") : ""),
       );
     } catch (err) {
       sonnetError("ERROR", `poll tick failed: ${(err as Error).message} -- state left unchanged, will retry next interval`);

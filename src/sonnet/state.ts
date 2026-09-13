@@ -176,18 +176,30 @@ export interface SonnetState {
    * trying a different candidate again -- see run.ts's pollOnce, which
    * clears `roster` back to undefined once a rejection is observed. */
   roster?: { members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string; gameId?: string; rejectedAtUtc?: string; rejectedReason?: string };
+  /** Every OTHER promoted (locked, real) roster beyond `roster` -- a
+   * contributor may be genuinely, validly locked into MULTIPLE different
+   * poems at once (each game_id is independent; "one locked roster per
+   * contributor per poem" is scoped per game_id, not globally). `roster`
+   * stays the first one promoted for backward-compatible state.json shapes
+   * and as the primary target for anything that still only checks one; every
+   * poem after the first lands here instead. Same shape, same lifecycle
+   * (receipt-rejection clears an entry out of this array the same way it
+   * clears `roster` to undefined). */
+  additionalRosters?: Array<{ members: string[]; requestId: string; signedAtUtc: string; frozenAtUtc?: string; gameId?: string; rejectedAtUtc?: string; rejectedReason?: string }>;
   /** Roster proposals we've signed but that haven't been PROMOTED to
-   * `roster` yet -- i.e. we don't yet know whether this is the one that
-   * actually locks. Confirmed live that this matters: most of a contributor's
-   * signed candidates never complete (the other signers scatter across many
-   * competing teams), so gating on "never sign a second roster" -- the
-   * original design -- meant one stalled candidate blocked ever trying
-   * anywhere else for the rest of the contest. Multiple candidates can be
-   * pending at once; each tick, pollOnce checks every candidate's poem room
-   * for real sonnet.word.v1 activity and promotes the first one that shows
-   * it to `roster` (clearing the rest -- the protocol only ever honors one
-   * locked roster per contributor per poem). A candidate that gets an
-   * explicit rejection receipt is dropped without ever being promoted. */
+   * `roster`/`additionalRosters` yet -- i.e. we don't yet know whether this
+   * is one that actually locks. Confirmed live that this matters: most of a
+   * contributor's signed candidates never complete (the other signers
+   * scatter across many competing teams), so gating on "never sign a second
+   * roster" -- the original design -- meant one stalled candidate blocked
+   * ever trying anywhere else for the rest of the contest. Multiple
+   * candidates can be pending at once; each tick, pollOnce checks every
+   * candidate's poem room for real sonnet.word.v1 activity and promotes
+   * every one that shows it (to `roster` if empty, else appended to
+   * `additionalRosters`) -- a contributor can be genuinely locked into
+   * several different poems simultaneously, so promotion is no longer
+   * "first one wins, clear the rest." A candidate that gets an explicit
+   * rejection receipt is dropped without ever being promoted. */
   rosterCandidates?: Array<{
     gameId: string;
     poemRoom: string;

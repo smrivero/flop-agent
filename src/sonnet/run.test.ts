@@ -621,7 +621,78 @@ test("pollOnce: PROMOTES a pending roster candidate to the active roster once it
   const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
   assert.equal(next.roster?.gameId, "satoshitrump");
   assert.equal(next.roster?.requestId, "roster-real");
-  assert.deepEqual(next.rosterCandidates, []); // the other pending candidate is abandoned, not re-checked
+  // The OTHER pending candidate is checked too (not abandoned just because a
+  // different one promoted first) -- its room has no word activity, so it
+  // stays a candidate for a later tick instead of being silently dropped.
+  assert.equal(next.rosterCandidates?.length, 1);
+  assert.equal(next.rosterCandidates?.[0].gameId, "other-game");
+});
+
+test("pollOnce: PROMOTES two candidates for DIFFERENT game_ids in the same tick -- roster gets the first, additionalRosters the second", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity();
+  const membersA = [agent.did, other.did, makeTestIdentity().did, makeTestIdentity().did];
+  const membersB = [agent.did, other.did, makeTestIdentity().did, makeTestIdentity().did];
+
+  server.postSigned(
+    "d-sonnet-1-team-game-a",
+    other,
+    JSON.stringify({ type: "sonnet.word.v1", contest_id: "sonnet-1", game_id: "game-a", room_generation: 0, version: 0, previous_state_hash: "", word: "The", request_id: "w-a" }),
+  );
+  server.postSigned(
+    "d-sonnet-1-team-game-b",
+    other,
+    JSON.stringify({ type: "sonnet.word.v1", contest_id: "sonnet-1", game_id: "game-b", room_generation: 0, version: 0, previous_state_hash: "", word: "The", request_id: "w-b" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    rosterCandidates: [
+      { gameId: "game-a", poemRoom: "d-sonnet-1-team-game-a", roomGeneration: 0, members: membersA, requestId: "roster-a", signedAtUtc: "2026-09-11T13:00:00Z" },
+      { gameId: "game-b", poemRoom: "d-sonnet-1-team-game-b", roomGeneration: 0, members: membersB, requestId: "roster-b", signedAtUtc: "2026-09-11T13:01:00Z" },
+    ],
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.roster?.gameId, "game-a");
+  assert.equal(next.additionalRosters?.length, 1);
+  assert.equal(next.additionalRosters?.[0].gameId, "game-b");
+  assert.deepEqual(next.rosterCandidates, []);
+});
+
+test("pollOnce: writes to MULTIPLE active rosters in the same tick -- genuinely writing in several poems at once", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoWrite: true, dryRun: false, openAiApiKey: "sk-test", openAiModel: "gpt-test" };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const referee = makeTestIdentity();
+  server.postSigned("d-sonnet-1-team-game-a", referee, "room claimed, generation 0");
+  server.postSigned("d-sonnet-1-team-game-b", referee, "room claimed, generation 0");
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    roster: { members: [agent.did, makeTestIdentity().did], requestId: "roster-a", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "game-a" },
+    additionalRosters: [{ members: [agent.did, makeTestIdentity().did], requestId: "roster-b", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "game-b" }],
+  };
+  // withMockFetch reuses a single Response instance across every call, but a
+  // Response body can only be read once -- fine for a single proposal, but
+  // this test makes TWO real LLM calls (one per active roster) in one tick,
+  // so it needs a fresh Response per call instead.
+  const original = globalThis.fetch;
+  globalThis.fetch = (async () => llmResponse("key")) as typeof fetch;
+  let tick;
+  try {
+    ({ tick } = await pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }));
+  } finally {
+    globalThis.fetch = original;
+  }
+  assert.equal(tick.autoProposedWords.length, 2);
+  assert.deepEqual(
+    tick.autoProposedWords.map((w) => w.gameId).sort(),
+    ["game-a", "game-b"],
+  );
 });
 
 test("pollOnce: signs a SECOND roster candidate as a hedge even while a first candidate is still pending (not yet promoted)", async () => {
@@ -778,7 +849,7 @@ test("pollOnce: SONNET_AUTO_TEAM signs a roster for a game_id we NEVER pursued (
   assert.equal(tick.autoSignedRoster?.gameId, "surprise-team");
 });
 
-test("pollOnce: SONNET_AUTO_TEAM never signs a second roster once one is already signed this contest", async () => {
+test("pollOnce: SONNET_AUTO_TEAM signs a roster for a DIFFERENT game_id even with one already locked -- multiple simultaneous poems are valid", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
   const server = new FakeTechnocore();
@@ -797,8 +868,32 @@ test("pollOnce: SONNET_AUTO_TEAM never signs a second roster once one is already
     pendingJoinInterests: [{ gameId: "flop-bard-1", requesterDid: makeTestIdentity().did, sentAtUtc: "2026-09-11T13:00:00Z" }],
   };
   const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
-  assert.equal(next.roster?.gameId, "keeper1"); // unchanged
+  assert.equal(next.roster?.gameId, "keeper1"); // untouched -- still the primary
+  assert.equal(tick.autoSignedRoster?.gameId, "flop-bard-1"); // signed as a NEW candidate for a different poem
+  assert.ok(next.rosterCandidates?.some((c) => c.gameId === "flop-bard-1"));
+});
+
+test("pollOnce: SONNET_AUTO_TEAM never signs a DIFFERENT composition for a game_id already locked (roster or additionalRosters)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const differentMembers = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    makeTestIdentity(),
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "keeper1", poem_room: "d-sonnet-1-team-keeper1", room_generation: 0, members: differentMembers, request_id: "roster-y" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    roster: { members: ["already", "signed"], requestId: "prior", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "keeper1" },
+  };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.roster?.requestId, "prior"); // unchanged
   assert.equal(tick.autoSignedRoster, undefined);
+  assert.equal((next.rosterCandidates ?? []).length, 0);
 });
 
 test("pollOnce: SONNET_AUTO_TEAM does not sign a roster whose member count is outside 4-8", async () => {
@@ -1037,7 +1132,7 @@ test("pollOnce: SONNET_AUTO_WRITE disabled (default) never proposes, even with a
     roster: { members: [agent.did, makeTestIdentity().did], requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
   };
   const { tick } = await withMockFetch(llmResponse("key"), () => pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }));
-  assert.equal(tick.autoProposedWord, undefined);
+  assert.deepEqual(tick.autoProposedWords, []);
   const room = await client.readRoom("d-sonnet-1-team-satoshitrump", { since: 0 });
   assert.equal(room.messages.some((m) => m.from === agent.did), false);
 });
@@ -1055,8 +1150,8 @@ test("pollOnce: SONNET_AUTO_WRITE=true proposes and sends when it's genuinely ou
     roster: { members: [agent.did, makeTestIdentity().did], requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
   };
   const { tick } = await withMockFetch(llmResponse("key"), () => pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX }));
-  assert.equal(tick.autoProposedWord?.word, "key");
-  assert.equal(tick.autoProposedWord?.gameId, "satoshitrump");
+  assert.equal(tick.autoProposedWords[0]?.word, "key");
+  assert.equal(tick.autoProposedWords[0]?.gameId, "satoshitrump");
 
   const room = await client.readRoom("d-sonnet-1-team-satoshitrump", { since: 0 });
   assert.ok(room.messages.some((m) => m.from === agent.did && JSON.parse(m.text).word === "key"));
@@ -1079,7 +1174,7 @@ test("pollOnce: SONNET_AUTO_WRITE=true never throws out of the tick when it's NO
     roster: { members: [agent.did, other.did], requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z", gameId: "satoshitrump" },
   };
   const { tick, state: next } = await pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX });
-  assert.equal(tick.autoProposedWord, undefined);
+  assert.deepEqual(tick.autoProposedWords, []);
   assert.ok(next); // the tick completed normally, no throw
 });
 
@@ -1091,7 +1186,7 @@ test("pollOnce: SONNET_AUTO_WRITE has no effect without a locked roster (wordRes
 
   const state = defaultState("sonnet-1", agent.did); // no roster at all
   const { tick } = await pollOnce(agent, CONTEST, config, state, client, { lexicon: WORD_LEXICON, rhymeIndex: EMPTY_RHYME_INDEX });
-  assert.equal(tick.autoProposedWord, undefined);
+  assert.deepEqual(tick.autoProposedWords, []);
 });
 
 test("pollOnce: tracks multiple own team-requests (additionalTeamRequests) and auto-signs whichever gets a valid roster first", async () => {
