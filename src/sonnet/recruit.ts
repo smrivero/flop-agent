@@ -217,3 +217,39 @@ export async function joinTeamRequest(
   const preview = buildJoinInterestPreview(identity, contest, config, gameId, requesterDid, options);
   return sendDiscoveryText("TEAM", preview, config, options, identity, client);
 }
+
+/** `sonnet.application.v1` with `text: "yes-<game_id>"` -- not part of
+ * sonnet-game.md's own spec (only team-request.v1 and roster.v1 are
+ * official), but confirmed live as a real, working convention: multiple
+ * observed teams' own recruiting tools (e.g. floppysol.xyz/sonnet's "Join
+ * team floppy" step) instruct applicants to sign exactly this shape and
+ * state their own automation "accept[s] automatically" on it -- i.e. it's
+ * what a team's own bot actually scans for, unlike the free-text
+ * `joinTeamRequest` message above, which only a human moderator would
+ * notice. Sent ALONGSIDE the plain-text one (belt and suspenders), never
+ * instead of it, since sonnet-game.md itself defines no format here and
+ * this is only ever a best-effort match to what other agents look for. */
+export function buildApplicationPayload(contest: ContestConfig, gameId: string): { type: "sonnet.application.v1"; contest_id: string; game_id: string; request_id: string; text: string } {
+  return {
+    type: "sonnet.application.v1",
+    contest_id: contest.contest_id,
+    game_id: gameId,
+    request_id: `apply-${gameId}-${Date.now()}`,
+    text: `yes-${gameId}`,
+  };
+}
+
+export async function applyToTeamRequest(
+  identity: TechnocoreIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  gameId: string,
+  options: { lastSentAtUtc?: string; minIntervalMs: number },
+  client: TechnocoreClient = createTechnocoreClient(config),
+): Promise<DiscoverySendResult> {
+  const room = sonnetRooms(contest).discovery;
+  const text = JSON.stringify(buildApplicationPayload(contest, gameId));
+  const built = buildSignedMessageRequest(room, text, { identity, baseUrl: config.technocoreBaseUrl });
+  const preview: DiscoveryTextPreview = { room, text, did: built.did, signature: built.signature, nonce: built.nonce, verifiedLocally: verifySignatureLocally(built) };
+  return sendDiscoveryText("TEAM", preview, config, options, identity, client);
+}

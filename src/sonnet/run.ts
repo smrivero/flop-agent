@@ -22,9 +22,10 @@ import { TechnocoreClient } from "../technocore.js";
 import { createTechnocoreClient } from "./http-debug.js";
 import type { SonnetAgentIdentity } from "./identity.js";
 import type { ContestConfig, SonnetConfig } from "./config.js";
-import { scan as scanRooms, toDiscoverySnapshot, type ObservedRoster } from "./discovery.js";
+import { scan as scanRooms, toDiscoverySnapshot, type ObservedRoster, type ScanResult } from "./discovery.js";
 import { checkRoomSetup } from "./team.js";
 import { signRoster, RosterError } from "./roster.js";
+import { joinTeamRequest, applyToTeamRequest } from "./recruit.js";
 import { proposeWord, ProposeError } from "./propose.js";
 import { readFullRoom } from "./room-export.js";
 import { tryParseSonnetMessage } from "./protocol.js";
@@ -49,6 +50,9 @@ export interface PollTickResult {
   /** New roster.v1 proposals for OUR OWN game_id (someone wants to join us),
    * not yet logged in an earlier tick. */
   newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }>;
+  /** game_ids SONNET_AUTO_RECRUIT discovered and applied to THIS tick --
+   * every other writer's team-request we hadn't already seen. */
+  autoJoinedNewTeams: string[];
   /** Set only when SONNET_AUTO_TEAM signed a roster THIS tick. */
   autoSignedRoster?: { gameId: string; requestId: string };
   /** Set only when SONNET_AUTO_WRITE successfully proposed (and had
@@ -273,6 +277,11 @@ export async function pollOnce(
     nextState = { ...nextState, pendingJoinInterests: updated };
   }
 
+  const newlyDiscoveredAndApplied = config.autoRecruit
+    ? await maybeAutoJoinNewTeams(agent, contest, config, nextState, scanResult, client)
+    : undefined;
+  if (newlyDiscoveredAndApplied) nextState = newlyDiscoveredAndApplied.state;
+
   // Same receipt-confirmation discipline as registration/team-requests:
   // sending our own sonnet.roster.v1 successfully only means the room
   // accepted the bytes, never that the referee validated it. If rejected
@@ -349,6 +358,7 @@ export async function pollOnce(
       newlySetUpRooms,
       newlyAcceptedIntoTeams,
       newRosterProposalsForOwnTeam,
+      autoJoinedNewTeams: newlyDiscoveredAndApplied?.joined ?? [],
       autoSignedRoster: autoSignedRoster?.signed,
       autoProposedWord,
       registeredWriterCount: scanResult.registrations.filter((r) => r.role === "writer").length,
@@ -356,6 +366,64 @@ export async function pollOnce(
       pendingTeamRequestCount: scanResult.teamRequests.length,
     },
   };
+}
+
+/**
+ * SONNET_AUTO_RECRUIT's write path: every OTHER writer's team-request we
+ * haven't already seen (not in team/additionalTeamRequests/deadTeamRequests/
+ * pendingJoinInterests/rosterCandidates/roster) gets a join-interest AND a
+ * sonnet.application.v1 -- sent together (see recruit.ts's
+ * applyToTeamRequest), since sonnet-game.md defines no format for this and
+ * both are only ever a best-effort attempt to be noticed by whoever's
+ * actually running that team. Capped per tick only as a sanity limit
+ * against a burst; in practice scanResult.teamRequests already reflects
+ * just the currently-visible room window, so a normal tick sees a handful
+ * of genuinely new ones at most.
+ */
+const MAX_AUTO_JOINS_PER_TICK = 25;
+
+async function maybeAutoJoinNewTeams(
+  agent: SonnetAgentIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  state: SonnetState,
+  scanResult: ScanResult,
+  client: TechnocoreClient,
+): Promise<{ state: SonnetState; joined: string[] }> {
+  const known = new Set<string>();
+  if (state.team) known.add(state.team.gameId);
+  for (const t of state.additionalTeamRequests ?? []) known.add(t.gameId);
+  for (const t of state.deadTeamRequests ?? []) known.add(t.gameId);
+  for (const i of state.pendingJoinInterests ?? []) known.add(i.gameId);
+  for (const c of state.rosterCandidates ?? []) known.add(c.gameId);
+  if (state.roster?.gameId) known.add(state.roster.gameId);
+
+  const fresh = new Map<string, string>(); // gameId -> requester DID (first seen)
+  for (const t of scanResult.teamRequests) {
+    if (t.did === agent.did || known.has(t.gameId) || fresh.has(t.gameId)) continue;
+    fresh.set(t.gameId, t.did);
+  }
+  const targets = [...fresh.entries()].slice(0, MAX_AUTO_JOINS_PER_TICK);
+  if (targets.length === 0) return { state, joined: [] };
+
+  let nextState = state;
+  const joined: string[] = [];
+  for (const [gameId, requesterDid] of targets) {
+    try {
+      const result = await joinTeamRequest(agent.identity, contest, config, gameId, requesterDid, { minIntervalMs: 0 }, client);
+      if (result.sent) {
+        nextState = { ...nextState, pendingJoinInterests: [...(nextState.pendingJoinInterests ?? []), { gameId, requesterDid, sentAtUtc: new Date().toISOString() }] };
+        joined.push(gameId);
+      }
+      await applyToTeamRequest(agent.identity, contest, config, gameId, { minIntervalMs: 0 }, client);
+    } catch (err) {
+      sonnetError("ERROR", `SONNET_AUTO_RECRUIT: failed for newly discovered game_id=${gameId}: ${(err as Error).message} -- will retry next tick`);
+    }
+  }
+  if (joined.length > 0) {
+    sonnetLog("TEAM", `SONNET_AUTO_RECRUIT: applied to ${joined.length} newly discovered game_id(s): [${joined.join(", ")}]`);
+  }
+  return { state: nextState, joined };
 }
 
 interface RosterSignCandidate {
@@ -580,6 +648,7 @@ export async function runLoop(
         "POLL",
         `tick complete: writers=${tick.registeredWriterCount} voters=${tick.registeredVoterCount} pending_team_requests=${tick.pendingTeamRequestCount} ` +
           `newly_set_up=[${tick.newlySetUpRooms.join(", ")}] newly_accepted=[${tick.newlyAcceptedIntoTeams.join(", ")}] new_roster_proposals_for_us=${tick.newRosterProposalsForOwnTeam.length}` +
+          (tick.autoJoinedNewTeams.length ? ` AUTO_JOINED=[${tick.autoJoinedNewTeams.join(", ")}]` : "") +
           (tick.autoSignedRoster ? ` AUTO_SIGNED_ROSTER=${tick.autoSignedRoster.gameId}` : "") +
           (tick.autoProposedWord ? ` AUTO_PROPOSED_WORD=${JSON.stringify(tick.autoProposedWord.word)}(seq=${tick.autoProposedWord.seq})` : ""),
       );

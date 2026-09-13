@@ -801,6 +801,69 @@ test("pollOnce: SONNET_AUTO_TEAM never retries a conflicting candidate it alread
   assert.deepEqual(second.state.autoSignAttemptedRequestIds, ["roster-a"]); // no new attempt
 });
 
+test("pollOnce: SONNET_AUTO_RECRUIT disabled (default) never applies to a discovered team-request", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({}); // autoRecruit defaults false
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity();
+  server.postSigned("mb-sonnet-1-discovery", other, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "some-game", request_id: "room-1" }));
+
+  const state = defaultState("sonnet-1", agent.did);
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.autoJoinedNewTeams, []);
+  assert.equal(next.pendingJoinInterests, undefined);
+});
+
+test("pollOnce: SONNET_AUTO_RECRUIT=true discovers a new team-request and applies to it (join-interest + sonnet.application.v1)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoRecruit: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity();
+  server.postSigned("mb-sonnet-1-discovery", other, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: "some-game", request_id: "room-1" }));
+
+  const state = defaultState("sonnet-1", agent.did);
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.autoJoinedNewTeams, ["some-game"]);
+  assert.equal(next.pendingJoinInterests?.[0].gameId, "some-game");
+  assert.equal(next.pendingJoinInterests?.[0].requesterDid, other.did);
+
+  const room = await client.readRoom("mb-sonnet-1-discovery", { since: 0 });
+  const ours = room.messages.filter((m) => m.from === agent.did);
+  assert.equal(ours.length, 2); // the plain-text join-interest AND the sonnet.application.v1
+  const applications = ours.flatMap((m) => {
+    try {
+      return [JSON.parse(m.text)];
+    } catch {
+      return [];
+    }
+  });
+  assert.ok(applications.some((rec) => rec.type === "sonnet.application.v1" && rec.game_id === "some-game"));
+});
+
+test("pollOnce: SONNET_AUTO_RECRUIT never re-applies to a game_id already tracked anywhere (team-request, join-interest, dead, roster candidate, or locked roster)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoRecruit: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity();
+  for (const gameId of ["already-team", "already-interest", "already-dead", "already-candidate", "already-roster"]) {
+    server.postSigned("mb-sonnet-1-discovery", other, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: gameId, request_id: `room-${gameId}` }));
+  }
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "already-team", requestId: "t-1", requestedAtUtc: "2026-09-11T13:00:00Z" },
+    pendingJoinInterests: [{ gameId: "already-interest", requesterDid: other.did, sentAtUtc: "2026-09-11T13:00:00Z" }],
+    deadTeamRequests: [{ gameId: "already-dead", requestId: "d-1", requestedAtUtc: "2026-09-11T13:00:00Z", rejectedAtUtc: "2026-09-11T13:00:00Z" }],
+    rosterCandidates: [{ gameId: "already-candidate", poemRoom: "x", roomGeneration: 0, members: [], requestId: "c-1", signedAtUtc: "2026-09-11T13:00:00Z" }],
+    roster: { gameId: "already-roster", members: [], requestId: "r-1", signedAtUtc: "2026-09-11T13:00:00Z" },
+  };
+  const { tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(tick.autoJoinedNewTeams, []);
+});
+
 test("runLoop: exits immediately without polling when SONNET_ENABLED is false", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), enabled: false };
