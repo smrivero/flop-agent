@@ -44,7 +44,7 @@ function poemTextSoFar(poem: AuthoritativePoemState): string {
     .join("\n");
 }
 
-const SYSTEM_PROMPT = `You are choosing the next word for a collaborative sonnet, one word per turn, written by a team of agents.
+const SYSTEM_PROMPT = `You are choosing the next word for a collaborative sonnet, one word per turn, written by a team of agents who never see each other's plans -- you only ever see the words already locked in.
 
 Rules you MUST follow:
 - You may choose ONLY one word from the "candidates" list given to you. Copy it EXACTLY
@@ -54,8 +54,12 @@ Rules you MUST follow:
 - Prefer iambic pentameter (alternating unstressed/stressed syllables) and, when the current
   line is close to a target rhyme, a word that rhymes with the given target -- both are
   literary goals, not hard requirements; never pick a nonsensical word just to satisfy them.
-- Aim for semantic coherence with the poem so far -- avoid repeating a word already used
-  unless it's a common function word (the, a, and, ...).
+- PRIORITIZE grammatical and semantic fit with "Current line so far" specifically (not just
+  the poem in general) -- read it as an unfinished sentence and pick the word that continues
+  it naturally, the way you'd complete that exact phrase in real writing. A word that "sounds
+  poetic" in isolation but doesn't fit the actual sentence being built is a bad choice.
+- Every word offered is already guaranteed to not repeat one used earlier in the poem -- you
+  never need to avoid repetition yourself; spend your full attention on fit instead.
 - confidence is your own 0-1 estimate of how good this choice is, not a probability of anything else.`;
 
 const RESPONSE_SCHEMA = {
@@ -129,15 +133,17 @@ export async function planNextWord(
 ): Promise<PlannedWord> {
   if (candidates.length === 0) throw new PoetryPlannerError("no legal candidates to choose from");
 
-  const shown = shortlist(candidates, options.maxCandidatesShown ?? 60);
+  const shown = shortlist(candidates, options.maxCandidatesShown ?? 90);
   const target = targetRhymeWord(poem, lineIndex);
   const remainingSyllables = 10 - poem.lines[lineIndex].syllables;
+  const currentLineWords = poem.lines[lineIndex].words.map((w) => w.word).join(" ");
 
   const userContent = [
     `Poem so far (14 lines, 4/4/4/2 stanzas, target rhyme scheme ABAB CDCD EFEF GG):`,
     poemTextSoFar(poem),
     ``,
-    `You are choosing a word for line ${lineIndex + 1} (rhyme letter ${RHYME_LETTER[lineIndex]}), which currently has ${poem.lines[lineIndex].syllables} of 10 syllables (${remainingSyllables} remaining).`,
+    `Current line so far (line ${lineIndex + 1}, rhyme letter ${RHYME_LETTER[lineIndex]}): "${currentLineWords || "(nothing written yet -- you are choosing the FIRST word of this line)"}"`,
+    `This is the phrase you are actually continuing -- it has ${poem.lines[lineIndex].syllables} of 10 syllables (${remainingSyllables} remaining).`,
     target ? `Target rhyme word for this line's ending (if you pick a line-closing candidate): "${target}".` : `No rhyme target is established yet for this line.`,
     ``,
     `Candidates (word:syllables${target ? ", * = rhymes with the target" : ""}):`,
