@@ -342,6 +342,17 @@ export async function pollOnce(
     }
   }
 
+  // As INITIATOR of our own team-request(s), auto-signing alone is never
+  // enough -- nobody else proposes a roster for a room we started, they just
+  // apply to it (sonnet.application.v1) and wait for US to build and post
+  // one. Confirmed live this was a real, undetected gap: 3+ real applicants
+  // sat unanswered on flopagent-s2d for 8+ hours because nothing ever
+  // proposed a roster from them; it took a manual one-off script.
+  const autoProposedOwnRoster = config.autoTeam
+    ? await maybeAutoProposeOwnRoster(agent, contest, config, nextState, scanResult, client)
+    : undefined;
+  if (autoProposedOwnRoster) nextState = autoProposedOwnRoster.state;
+
   const autoSignedRoster = config.autoTeam
     ? await maybeAutoSignRoster(agent, contest, config, nextState, scanResult.rosterProposals, client)
     : undefined;
@@ -429,6 +440,84 @@ async function maybeAutoJoinNewTeams(
 interface RosterSignCandidate {
   gameId: string;
   proposal: ObservedRoster;
+}
+
+const MIN_APPLICANTS_TO_PROPOSE_OWN_ROSTER = 3; // + us = 4, the protocol minimum
+const MAX_ROSTER_MEMBERS = 8;
+
+/**
+ * SONNET_AUTO_TEAM's write path for a room WE started (state.team /
+ * additionalTeamRequests): auto-signing alone never proposes anything for
+ * these, since nobody else initiates a roster for a room they didn't
+ * create -- they just apply (sonnet.application.v1) and wait. Once a
+ * game_id's room is set up and at least 3 OTHER writers have applied to it
+ * (4 total, the protocol minimum), build [ourDid, ...applicants] (capped at
+ * 8) and post it ourselves. Proposed at most once per game_id ever
+ * (`autoProposedOwnRosterGameIds`), regardless of outcome -- a rejection
+ * doesn't retry with a different applicant subset automatically; that's a
+ * judgment call about WHICH applicants to drop, not something safe to
+ * automate blindly.
+ *
+ * Selects applicants in first-seen order (earliest sonnet.application.v1
+ * first) -- simple and predictable, not an attempt to optimize for DID
+ * letter coverage or anything else that would need re-litigating every time
+ * the applicant pool changes.
+ */
+async function maybeAutoProposeOwnRoster(
+  agent: SonnetAgentIdentity,
+  contest: ContestConfig,
+  config: SonnetConfig,
+  state: SonnetState,
+  scanResult: ScanResult,
+  client: TechnocoreClient,
+): Promise<{ state: SonnetState; proposed?: { gameId: string; requestId: string } } | undefined> {
+  type TeamEntry = NonNullable<SonnetState["team"]>;
+  const ownEntries: TeamEntry[] = [state.team, ...(state.additionalTeamRequests ?? [])].filter((t): t is TeamEntry => t !== undefined);
+  const alreadyProposed = new Set(state.autoProposedOwnRosterGameIds ?? []);
+
+  for (const entry of ownEntries) {
+    if (entry.roomGeneration === undefined || !entry.room) continue; // room not set up yet
+    if (alreadyProposed.has(entry.gameId)) continue;
+
+    const applicantDids = [
+      ...new Set(
+        scanResult.applications
+          .filter((a) => a.gameId === entry.gameId && a.did !== agent.did)
+          .sort((a, b) => a.seq - b.seq)
+          .map((a) => a.did),
+      ),
+    ];
+    if (applicantDids.length < MIN_APPLICANTS_TO_PROPOSE_OWN_ROSTER) continue;
+
+    const members = [agent.did, ...applicantDids.slice(0, MAX_ROSTER_MEMBERS - 1)];
+    sonnetLog("ROSTER", `SONNET_AUTO_TEAM: proposing our own roster for game_id=${entry.gameId} with ${members.length} members (from ${applicantDids.length} applicant(s))`);
+
+    const proposedIds = [...alreadyProposed, entry.gameId];
+    try {
+      const result = await signRoster(
+        agent.identity,
+        contest,
+        config,
+        { gameId: entry.gameId, poemRoom: entry.room, roomGeneration: entry.roomGeneration, members },
+        scanResult.rosterProposals,
+        client,
+      );
+      if (!result.sent) return undefined; // SONNET_DRY_RUN -- don't mark attempted, retry for real later
+      const nextState: SonnetState = {
+        ...state,
+        autoProposedOwnRosterGameIds: proposedIds,
+        rosterCandidates: [
+          ...(state.rosterCandidates ?? []),
+          { gameId: entry.gameId, poemRoom: entry.room, roomGeneration: entry.roomGeneration, members, requestId: result.preview.payload.request_id, signedAtUtc: new Date().toISOString() },
+        ],
+      };
+      return { state: nextState, proposed: { gameId: entry.gameId, requestId: result.preview.payload.request_id } };
+    } catch (err) {
+      sonnetLog("CONFLICT", `SONNET_AUTO_TEAM: not proposing our own roster for game_id=${entry.gameId} -- ${err instanceof RosterError ? err.message : (err as Error).message}`);
+      return { state: { ...state, autoProposedOwnRosterGameIds: proposedIds } };
+    }
+  }
+  return undefined;
 }
 
 /**

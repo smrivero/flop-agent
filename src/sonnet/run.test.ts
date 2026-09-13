@@ -653,6 +653,72 @@ test("pollOnce: signs a SECOND roster candidate as a hedge even while a first ca
   assert.ok(next.rosterCandidates?.some((c) => c.gameId === "game-b"));
 });
 
+test("pollOnce: SONNET_AUTO_TEAM proposes OUR OWN roster once 3+ writers apply to a room we started", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const applicants = [makeTestIdentity(), makeTestIdentity(), makeTestIdentity()];
+  for (const a of applicants) {
+    server.postSigned("mb-sonnet-1-discovery", a, JSON.stringify({ type: "sonnet.application.v1", contest_id: "sonnet-1", game_id: "our-game", request_id: `apply-${a.did}` }));
+  }
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "our-game", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z", room: "d-sonnet-1-team-our-game", roomGeneration: 0 },
+  };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(tick.autoSignedRoster, undefined); // this is the propose path, not the sign path
+  assert.equal(next.rosterCandidates?.length, 1);
+  assert.equal(next.rosterCandidates?.[0].gameId, "our-game");
+  assert.deepEqual(next.rosterCandidates?.[0].members, [agent.did, ...applicants.map((a) => a.did)]);
+  assert.deepEqual(next.autoProposedOwnRosterGameIds, ["our-game"]);
+
+  const room = await client.readRoom("mb-sonnet-1-discovery", { since: 0 });
+  const ours = room.messages.find((m) => m.from === agent.did && JSON.parse(m.text).type === "sonnet.roster.v1");
+  assert.ok(ours);
+});
+
+test("pollOnce: does NOT propose our own roster with fewer than 3 applicants", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const applicants = [makeTestIdentity(), makeTestIdentity()]; // only 2 -- need 3
+  for (const a of applicants) {
+    server.postSigned("mb-sonnet-1-discovery", a, JSON.stringify({ type: "sonnet.application.v1", contest_id: "sonnet-1", game_id: "our-game", request_id: `apply-${a.did}` }));
+  }
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "our-game", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z", room: "d-sonnet-1-team-our-game", roomGeneration: 0 },
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal((next.rosterCandidates ?? []).length, 0);
+  assert.equal(next.autoProposedOwnRosterGameIds, undefined);
+});
+
+test("pollOnce: never proposes a second roster for a game_id it already auto-proposed for, even if more applicants show up", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const applicants = [makeTestIdentity(), makeTestIdentity(), makeTestIdentity(), makeTestIdentity()];
+  for (const a of applicants) {
+    server.postSigned("mb-sonnet-1-discovery", a, JSON.stringify({ type: "sonnet.application.v1", contest_id: "sonnet-1", game_id: "our-game", request_id: `apply-${a.did}` }));
+  }
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "our-game", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z", room: "d-sonnet-1-team-our-game", roomGeneration: 0 },
+    autoProposedOwnRosterGameIds: ["our-game"], // already proposed once
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal((next.rosterCandidates ?? []).length, 0);
+  const room = await client.readRoom("mb-sonnet-1-discovery", { since: 0 });
+  assert.equal(room.messages.some((m) => m.from === agent.did), false);
+});
+
 test("pollOnce: SONNET_AUTO_TEAM signs a roster for a game_id we NEVER pursued (no team-request, no join-interest) -- someone else added us", async () => {
   // Regression test for a real, live-confirmed gap: another writer can add
   // our DID to their own roster draft for a game we never touched (observed

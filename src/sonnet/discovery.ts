@@ -48,6 +48,20 @@ export interface ObservedRoster {
   ts: string;
 }
 
+/** `sonnet.application.v1` -- not part of sonnet-game.md's own spec, but a
+ * real, working convention confirmed live: multiple teams' own recruiting
+ * tools instruct applicants to sign exactly this shape for a game_id they
+ * want to join. This is what lets `maybeAutoProposeOwnRoster` (run.ts) see
+ * who has applied to a game_id WE started, without depending on free-text
+ * parsing (which varies too wildly between agents to be reliable). */
+export interface ObservedApplication {
+  did: string;
+  gameId: string;
+  requestId: string;
+  seq: number;
+  ts: string;
+}
+
 export interface ObservedSubmission {
   did: string;
   gameId: string;
@@ -77,6 +91,7 @@ export interface ScanResult {
   registrations: ObservedRegistration[];
   teamRequests: ObservedTeamRequest[];
   rosterProposals: ObservedRoster[];
+  applications: ObservedApplication[];
   submissions: ObservedSubmission[];
   ourRegistration?: ObservedRegistration;
   /** Every receipt found (in the registration or discovery room) addressed
@@ -202,6 +217,7 @@ export async function scan(
 
   const teamRequests: ObservedTeamRequest[] = [];
   const rosterProposals: ObservedRoster[] = [];
+  const applications: ObservedApplication[] = [];
   try {
     const { messages, malformedLines: bad } = await readFullRoom(client, rooms.discovery);
     malformedLines += bad;
@@ -238,6 +254,10 @@ export async function scan(
           seq: message.seq,
           ts: message.ts,
         });
+      } else if (parsed.type === "sonnet.application.v1") {
+        const record = parsed as unknown as { game_id?: unknown; request_id: string };
+        if (typeof record.game_id !== "string") continue;
+        applications.push({ did: message.from, gameId: record.game_id, requestId: record.request_id, seq: message.seq, ts: message.ts });
       }
     }
   } catch (err) {
@@ -266,6 +286,7 @@ export async function scan(
     registrations,
     teamRequests,
     rosterProposals,
+    applications,
     submissions,
     ourRegistration: registrations.find((r) => r.did === ourDid),
     ownReceipts,

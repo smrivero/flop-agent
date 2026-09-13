@@ -196,6 +196,14 @@ export interface SonnetState {
     requestId: string;
     signedAtUtc: string;
   }>;
+  /** game_ids of OUR OWN team-requests (team/additionalTeamRequests) that
+   * SONNET_AUTO_RECRUIT's auto-propose step (run.ts's
+   * maybeAutoProposeOwnRoster) has already built and posted a roster.v1 for,
+   * from real sonnet.application.v1 applicants -- proposed exactly once per
+   * game_id, ever, regardless of outcome (accepted, rejected, or ignored),
+   * so a room that already got a roster doesn't get a conflicting second
+   * one proposed by us every tick. */
+  autoProposedOwnRosterGameIds?: string[];
   /** request_ids of roster.v1 proposals run.ts's SONNET_AUTO_TEAM auto-sign
    * step has already attempted (successfully or not) -- never retried, so a
    * genuine conflict doesn't spam [SONNET][CONFLICT] every tick forever. */
