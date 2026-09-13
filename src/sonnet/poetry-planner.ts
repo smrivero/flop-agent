@@ -90,8 +90,25 @@ export interface PlannedWord {
   confidence: number;
 }
 
+function shuffle<T>(items: readonly T[]): T[] {
+  const out = [...items];
+  for (let i = out.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [out[i], out[j]] = [out[j], out[i]];
+  }
+  return out;
+}
+
+/** Shuffles first, then stable-sorts rhyme matches to the front -- without
+ * the shuffle, candidates come in generateCandidates' (effectively fixed,
+ * dictionary-order) sequence, so with no rhyme target established (most of
+ * the poem) the model sees the SAME ~60-word slice on every single turn.
+ * Confirmed live: exactly this caused the model to pick the same word 3 of
+ * its own 3 turns in one poem ("We celeste dreamers celeste reverie
+ * celeste") -- not because it liked repeating, but because it was never
+ * shown anything else to compare it against. */
 function shortlist(candidates: readonly Candidate[], limit: number): Candidate[] {
-  const sorted = [...candidates].sort((a, b) => Number(b.rhymesWithTarget ?? false) - Number(a.rhymesWithTarget ?? false));
+  const sorted = shuffle(candidates).sort((a, b) => Number(b.rhymesWithTarget ?? false) - Number(a.rhymesWithTarget ?? false));
   return sorted.slice(0, limit);
 }
 
