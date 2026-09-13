@@ -653,6 +653,34 @@ test("pollOnce: signs a SECOND roster candidate as a hedge even while a first ca
   assert.ok(next.rosterCandidates?.some((c) => c.gameId === "game-b"));
 });
 
+test("pollOnce: does NOT re-sign its own already-pending roster content just because it reappears under a new request_id (self-loop guard)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const membersA = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+
+  // Simulates OUR OWN prior countersign of game-a reappearing in the next
+  // scan under a freshly generated request_id -- exactly what a real
+  // signRoster() POST produces on its own next observation. Same
+  // game_id/room_generation/members as what's already pending below.
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    agent.identity,
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "game-a", poem_room: "d-sonnet-1-team-game-a", room_generation: 0, members: membersA, request_id: "roster-a-self-observed-again" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    rosterCandidates: [
+      { gameId: "game-a", poemRoom: "d-sonnet-1-team-game-a", roomGeneration: 0, members: membersA, requestId: "roster-a-original", signedAtUtc: "2026-09-11T13:00:00Z" },
+    ],
+  };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(tick.autoSignedRoster, undefined);
+  assert.equal(next.rosterCandidates?.length, 1); // unchanged -- no infinite self-resign
+});
+
 test("pollOnce: SONNET_AUTO_TEAM proposes OUR OWN roster once 3+ writers apply to a room we started", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };

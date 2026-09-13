@@ -577,6 +577,18 @@ async function maybeAutoSignRoster(
   // for backward-compatible state.json shapes) and every still-pending
   // `rosterCandidates` entry.
   const alreadyAttempted = new Set(state.autoSignAttemptedRequestIds ?? []);
+
+  // Content-based dedup, independent of request_id: OUR OWN prior countersign
+  // of a proposal re-appears on the next scan as a brand-new ObservedRoster
+  // (same game_id/room_generation/members, but a freshly generated
+  // request_id we never added to `alreadyAttempted`) -- without this check
+  // that self-observation looks like a fresh, never-attempted candidate and
+  // gets re-signed forever, spamming the discovery room with an identical
+  // roster.v1 every tick. Keyed on room_generation too, so a real resetup
+  // (which legitimately produces a new roster context) is still signable.
+  const alreadySignedContent = new Set(
+    (state.rosterCandidates ?? []).map((c) => `${c.gameId}|${c.roomGeneration}|${[...c.members].sort().join(",")}`),
+  );
   const candidates: RosterSignCandidate[] = rosterProposals
     .filter(
       (p) =>
@@ -584,7 +596,8 @@ async function maybeAutoSignRoster(
         p.members.length >= 4 &&
         p.members.length <= 8 &&
         new Set(p.members).size === p.members.length &&
-        !alreadyAttempted.has(p.requestId),
+        !alreadyAttempted.has(p.requestId) &&
+        !alreadySignedContent.has(`${p.gameId}|${p.roomGeneration}|${[...p.members].sort().join(",")}`),
     )
     .map((proposal) => ({ gameId: proposal.gameId, proposal }))
     .sort((a, b) => a.proposal.seq - b.proposal.seq);
