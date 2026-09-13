@@ -15,6 +15,17 @@ import type { Lexicon } from "./cmudict.js";
 import { didAllowedLetters } from "./did-words.js";
 import type { RhymeIndex } from "./rhyme.js";
 
+/** Small, common function words exempt from `excludeWords` -- a sonnet
+ * legitimately needs to reuse "the", "and", etc. many times; it's content
+ * words repeating (confirmed live: an LLM at low temperature, shown the same
+ * deterministic candidate-list prefix every turn since nothing varies it,
+ * picked the same non-function word for 3 of its own 3 turns in one poem)
+ * that actually hurts the poem. */
+const REPEATABLE_FUNCTION_WORDS = new Set([
+  "a", "an", "the", "and", "or", "but", "nor", "of", "to", "in", "on", "at", "by", "for", "with", "as",
+  "is", "was", "are", "were", "be", "it", "its", "this", "that", "these", "those", "my", "your", "our",
+]);
+
 export interface Candidate {
   word: string;
   syllables: number;
@@ -37,10 +48,14 @@ export interface GenerateCandidatesOptions {
    * to an LLM) -- 0/undefined means no cap. Rhyme-matching candidates (if
    * any) are always kept first when capping. */
   limit?: number;
+  /** Words already used elsewhere in the poem (lowercase) -- excluded here
+   * unless they're a REPEATABLE_FUNCTION_WORDS entry, so "avoid repeating a
+   * word" is a mechanical guarantee rather than a hope the LLM follows it. */
+  excludeWords?: ReadonlySet<string>;
 }
 
 export function generateCandidates(options: GenerateCandidatesOptions): Candidate[] {
-  const { lexicon, did, remainingSyllables, rhymeIndex, targetRhymeKey, limit } = options;
+  const { lexicon, did, remainingSyllables, rhymeIndex, targetRhymeKey, limit, excludeWords } = options;
   if (!Number.isInteger(remainingSyllables) || remainingSyllables < 1 || remainingSyllables > 10) {
     throw new RangeError(`remainingSyllables must be an integer 1-10, got ${JSON.stringify(remainingSyllables)}`);
   }
@@ -50,6 +65,7 @@ export function generateCandidates(options: GenerateCandidatesOptions): Candidat
 
   for (const [word, syllables] of lexicon) {
     if (syllables > remainingSyllables) continue;
+    if (excludeWords?.has(word) && !REPEATABLE_FUNCTION_WORDS.has(word)) continue;
     let ok = true;
     for (const ch of word) {
       if (ch === "'") continue;

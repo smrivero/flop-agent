@@ -50,6 +50,19 @@ test("generateCandidates: tags rhyme matches without filtering non-matches out",
   assert.equal(i?.rhymesWithTarget, false);
 });
 
+test("generateCandidates: excludeWords drops an already-used content word", () => {
+  const candidates = generateCandidates({ lexicon: LEXICON, did: DID, remainingSyllables: 10, excludeWords: new Set(["deeded"]) });
+  const words = candidates.map((c) => c.word);
+  assert.ok(!words.includes("deeded"));
+  assert.ok(words.includes("the")); // untouched, wasn't in excludeWords
+});
+
+test("generateCandidates: excludeWords does NOT drop a common function word even if already used", () => {
+  const candidates = generateCandidates({ lexicon: LEXICON, did: DID, remainingSyllables: 10, excludeWords: new Set(["the"]) });
+  const words = candidates.map((c) => c.word);
+  assert.ok(words.includes("the")); // "the" is repeatable -- a sonnet needs it many times
+});
+
 test("generateCandidates: limit caps the result, preferring rhyme matches first", () => {
   const rhymeIndex = new Map([["deeded", "X"]]);
   const candidates = generateCandidates({ lexicon: LEXICON, did: DID, remainingSyllables: 10, rhymeIndex, targetRhymeKey: "X", limit: 2 });

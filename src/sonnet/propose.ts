@@ -88,6 +88,7 @@ export async function buildProposePreview(
   const target = targetRhymeWord(poem, poem.currentLineIndex);
   const targetRhymeKey = target ? ctx.rhymeIndex.get(target) : undefined;
 
+  const usedWords = new Set(poem.lines.flatMap((line) => line.words.map((w) => w.word.toLowerCase())));
   const candidates = generateCandidates({
     lexicon: ctx.lexicon,
     did: identity.did,
@@ -95,6 +96,7 @@ export async function buildProposePreview(
     rhymeIndex: ctx.rhymeIndex,
     targetRhymeKey,
     limit: ctx.maxCandidatesShown ?? 200,
+    excludeWords: usedWords,
   });
   sonnetLog(
     "CANDIDATES",
