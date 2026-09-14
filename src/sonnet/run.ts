@@ -200,7 +200,7 @@ export async function pollOnce(
   {
     const updatedEntries = await Promise.all(
       ownTeamEntries.map(async (entry) => {
-        let next = entry;
+        let next: typeof entry | null = entry;
         if (next.roomGeneration === undefined) {
           // A single malformed/oversized game_id (e.g. scraped from someone
           // else's free-text message) must never abort the whole tick --
@@ -216,25 +216,34 @@ export async function pollOnce(
               newlySetUpRooms.push(next.gameId);
             }
           } catch (err) {
+            // See the identical check in the pendingJoinInterests loop below
+            // -- a RangeError means the game_id fails format validation
+            // permanently, so retrying it every tick forever is pointless.
+            if (err instanceof RangeError) {
+              sonnetError("ERROR", `our own game_id=${next.gameId} is permanently invalid: ${err.message} -- dropping, will never retry`);
+              return null;
+            }
             sonnetError("ERROR", `checkRoomSetup failed for our own game_id=${next.gameId}: ${(err as Error).message} -- skipping this entry for this tick`);
           }
         }
+        if (next === null) return null; // unreachable in practice (the RangeError branch above already returned) -- satisfies control-flow narrowing
+        const confirmed = next; // `const` so it stays narrowed non-null inside the closures below (a `let` doesn't)
 
         // Anyone proposing sonnet.roster.v1 for this game_id is the "someone
         // wants to join" signal -- announce each one exactly once.
-        const alreadyNotified = new Set(next.notifiedRosterRequestIds ?? []);
-        const freshProposals = scanResult.rosterProposals.filter((r) => r.gameId === next.gameId && !alreadyNotified.has(r.requestId));
+        const alreadyNotified = new Set(confirmed.notifiedRosterRequestIds ?? []);
+        const freshProposals = scanResult.rosterProposals.filter((r) => r.gameId === confirmed.gameId && !alreadyNotified.has(r.requestId));
         if (freshProposals.length > 0) {
           for (const proposal of freshProposals) {
-            sonnetLog("TEAM", `roster proposal observed for our game_id=${next.gameId}: by=${proposal.did} members=[${proposal.members.join(", ")}]`);
+            sonnetLog("TEAM", `roster proposal observed for our game_id=${confirmed.gameId}: by=${proposal.did} members=[${proposal.members.join(", ")}]`);
             newRosterProposalsForOwnTeam.push({ did: proposal.did, members: proposal.members, requestId: proposal.requestId });
           }
-          next = { ...next, notifiedRosterRequestIds: [...alreadyNotified, ...freshProposals.map((p) => p.requestId)] };
+          return { ...confirmed, notifiedRosterRequestIds: [...alreadyNotified, ...freshProposals.map((p) => p.requestId)] };
         }
-        return next;
+        return confirmed;
       }),
     );
-    const [primary, ...rest] = updatedEntries;
+    const [primary, ...rest] = updatedEntries.filter((e): e is NonNullable<typeof e> => e !== null);
     nextState = { ...nextState, team: primary, additionalTeamRequests: rest };
     if (primary?.roomGeneration !== undefined && nextState.phase === "TEAM_REQUESTED") {
       nextState = transition(nextState, "ROOM_ASSIGNED");
@@ -244,7 +253,7 @@ export async function pollOnce(
   if (nextState.pendingJoinInterests && nextState.pendingJoinInterests.length > 0) {
     const updated = await Promise.all(
       nextState.pendingJoinInterests.map(async (interest) => {
-        let next = interest;
+        let next: typeof interest | null = interest;
         if (!next.roomSetUpAtUtc) {
           // Same isolation as the ownTeamEntries loop above -- one bad
           // game_id here must not abort the tick and lose every other
@@ -257,6 +266,18 @@ export async function pollOnce(
               next = { ...next, roomSetUpAtUtc: new Date().toISOString() };
             }
           } catch (err) {
+            // A game_id that fails FORMAT validation (RangeError, from
+            // sonnetRooms()/protocol.ts) is a permanent, structural fact --
+            // no future tick will ever make it valid. Confirmed live:
+            // without dropping it here, two such entries logged this exact
+            // error every single tick, forever (one scraped from someone
+            // else's free-text message was too long/malformed to ever be a
+            // real room). A transient error (network, room legitimately not
+            // set up yet) is anything else -- keep retrying those.
+            if (err instanceof RangeError) {
+              sonnetError("ERROR", `pending join-interest game_id=${interest.gameId} is permanently invalid: ${err.message} -- dropping, will never retry`);
+              return null;
+            }
             sonnetError("ERROR", `checkRoomSetup failed for pending join-interest game_id=${interest.gameId}: ${(err as Error).message} -- skipping this entry for this tick`);
           }
         }
@@ -274,7 +295,7 @@ export async function pollOnce(
         return next;
       }),
     );
-    nextState = { ...nextState, pendingJoinInterests: updated };
+    nextState = { ...nextState, pendingJoinInterests: updated.filter((i): i is NonNullable<typeof i> => i !== null) };
   }
 
   const newlyDiscoveredAndApplied = config.autoRecruit

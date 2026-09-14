@@ -422,6 +422,44 @@ test("pollOnce: a malformed game_id in pendingJoinInterests never aborts the who
   const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
   assert.deepEqual(tick.newlyAcceptedIntoTeams, ["realgame"]);
   assert.ok(next.pendingJoinInterests?.find((i) => i.gameId === "realgame")?.acceptedAtUtc);
+  // The permanently-invalid entry is dropped outright, not kept around to
+  // fail checkRoomSetup (and log an [ERROR]) again every tick forever.
+  assert.equal(next.pendingJoinInterests?.some((i) => i.gameId.startsWith("this-game-id")), false);
+});
+
+test("pollOnce: a permanently invalid game_id (format never matches, e.g. scraped free text) is dropped, not retried forever", async () => {
+  // Regression test for a real production incident: two malformed game_ids
+  // in pendingJoinInterests (too long for the 16-char limit) logged
+  // "checkRoomSetup failed ... invalid game_id" every single tick, forever
+  // -- the try/catch isolation kept the tick alive, but nothing ever
+  // stopped retrying a format that can never become valid.
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const requester = makeTestIdentity();
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    pendingJoinInterests: [{ gameId: "cek-status-1789372508-way-too-long", requesterDid: requester.did, sentAtUtc: "2026-09-11T13:00:00Z" }],
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(next.pendingJoinInterests, []);
+});
+
+test("pollOnce: an own team-request with a permanently invalid game_id is dropped, not retried forever", async () => {
+  const agent = makeAgent();
+  const config = loadSonnetConfig({});
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    team: { gameId: "bruce-sonnet2-lead-way-too-long", requestId: "team-1", requestedAtUtc: "2026-09-11T13:00:00Z" },
+  };
+  const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(next.team, undefined);
+  assert.deepEqual(next.additionalTeamRequests ?? [], []);
 });
 
 test("pollOnce: detects being ACCEPTED into someone else's roster (our DID appears in a roster.v1 for that game_id)", async () => {
