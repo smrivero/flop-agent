@@ -445,6 +445,36 @@ test("pollOnce: a permanently invalid game_id (format never matches, e.g. scrape
   };
   const { state: next } = await pollOnce(agent, CONTEST, config, state, client);
   assert.deepEqual(next.pendingJoinInterests, []);
+  assert.ok(next.invalidGameIds?.includes("cek-status-1789372508-way-too-long"));
+});
+
+test("pollOnce: a dropped invalid game_id is NOT immediately re-discovered and re-applied to by SONNET_AUTO_RECRUIT in the same tick", async () => {
+  // Regression test for a real production incident: dropping the invalid
+  // entry from pendingJoinInterests (the fix above) made it look "new"
+  // again to maybeAutoJoinNewTeams's "already known" check, which ran LATER
+  // in the very same tick -- so it got re-applied to and re-added to
+  // pendingJoinInterests immediately, failing the exact same way next tick.
+  // AUTO_JOINED=[cek-status-1789372508, bruce-sonnet2-lead] kept appearing
+  // forever, tick after tick, even after the first fix shipped.
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoRecruit: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const other = makeTestIdentity();
+  const badGameId = "cek-status-1789372508-way-too-long";
+
+  // The SAME invalid game_id is still visible in the discovery room as an
+  // observed team-request (why it kept getting "re-discovered").
+  server.postSigned("mb-sonnet-1-discovery", other, JSON.stringify({ type: "sonnet.team-request.v1", contest_id: "sonnet-1", game_id: badGameId, request_id: "tr-1" }));
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    pendingJoinInterests: [{ gameId: badGameId, requesterDid: other.did, sentAtUtc: "2026-09-11T13:00:00Z" }],
+  };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.deepEqual(next.pendingJoinInterests, []); // dropped, not re-added
+  assert.deepEqual(tick.autoJoinedNewTeams, []); // never re-applied to
+  assert.ok(next.invalidGameIds?.includes(badGameId));
 });
 
 test("pollOnce: an own team-request with a permanently invalid game_id is dropped, not retried forever", async () => {

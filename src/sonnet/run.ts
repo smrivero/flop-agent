@@ -158,6 +158,14 @@ export async function pollOnce(
   const newlySetUpRooms: string[] = [];
   const newlyAcceptedIntoTeams: string[] = [];
   const newRosterProposalsForOwnTeam: Array<{ did: string; members: string[]; requestId: string }> = [];
+  // game_ids dropped THIS tick for permanently failing format validation
+  // (RangeError from checkRoomSetup) -- merged into nextState.invalidGameIds
+  // below. Without this permanent record, SONNET_AUTO_RECRUIT's
+  // maybeAutoJoinNewTeams (which runs later this same tick) sees the
+  // game_id is no longer "known" the instant it's dropped and immediately
+  // re-applies to it, re-adding it to pendingJoinInterests -- which then
+  // fails the exact same way next tick, forever, through a different path.
+  const invalidGameIdsFound: string[] = [];
 
   // Every team-request WE sent (the primary `team` slot plus any hedge
   // requests in `additionalTeamRequests`) gets the same treatment: check
@@ -221,6 +229,7 @@ export async function pollOnce(
             // permanently, so retrying it every tick forever is pointless.
             if (err instanceof RangeError) {
               sonnetError("ERROR", `our own game_id=${next.gameId} is permanently invalid: ${err.message} -- dropping, will never retry`);
+              invalidGameIdsFound.push(next.gameId);
               return null;
             }
             sonnetError("ERROR", `checkRoomSetup failed for our own game_id=${next.gameId}: ${(err as Error).message} -- skipping this entry for this tick`);
@@ -276,6 +285,7 @@ export async function pollOnce(
             // set up yet) is anything else -- keep retrying those.
             if (err instanceof RangeError) {
               sonnetError("ERROR", `pending join-interest game_id=${interest.gameId} is permanently invalid: ${err.message} -- dropping, will never retry`);
+              invalidGameIdsFound.push(interest.gameId);
               return null;
             }
             sonnetError("ERROR", `checkRoomSetup failed for pending join-interest game_id=${interest.gameId}: ${(err as Error).message} -- skipping this entry for this tick`);
@@ -296,6 +306,10 @@ export async function pollOnce(
       }),
     );
     nextState = { ...nextState, pendingJoinInterests: updated.filter((i): i is NonNullable<typeof i> => i !== null) };
+  }
+
+  if (invalidGameIdsFound.length > 0) {
+    nextState = { ...nextState, invalidGameIds: [...new Set([...(nextState.invalidGameIds ?? []), ...invalidGameIdsFound])] };
   }
 
   const newlyDiscoveredAndApplied = config.autoRecruit
@@ -507,6 +521,7 @@ async function maybeAutoJoinNewTeams(
   for (const c of state.rosterCandidates ?? []) known.add(c.gameId);
   if (state.roster?.gameId) known.add(state.roster.gameId);
   for (const r of state.additionalRosters ?? []) if (r.gameId) known.add(r.gameId);
+  for (const g of state.invalidGameIds ?? []) known.add(g);
 
   const fresh = new Map<string, string>(); // gameId -> requester DID (first seen)
   for (const t of scanResult.teamRequests) {

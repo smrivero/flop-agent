@@ -232,6 +232,17 @@ export interface SonnetState {
    * step has already attempted (successfully or not) -- never retried, so a
    * genuine conflict doesn't spam [SONNET][CONFLICT] every tick forever. */
   autoSignAttemptedRequestIds?: string[];
+  /** game_ids that permanently fail format validation (GAME_ID_PATTERN in
+   * protocol.ts) -- e.g. scraped from someone else's free-text message and
+   * too long, or wrong shape. Never retried, and (critically) also excluded
+   * from SONNET_AUTO_RECRUIT's "already known" check (run.ts's
+   * maybeAutoJoinNewTeams): without that second exclusion, dropping an
+   * invalid entry from pendingJoinInterests this tick just makes it look
+   * "new" again to the auto-recruit scan later the SAME tick, which
+   * re-applies and re-adds it to pendingJoinInterests, which fails the exact
+   * same way next tick -- an infinite loop through a different path than the
+   * one being guarded against. */
+  invalidGameIds?: string[];
   /** Populated once room-poller.ts / poetry-planner.ts exist (not yet implemented). */
   poem?: {
     version: number;
