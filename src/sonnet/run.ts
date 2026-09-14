@@ -312,16 +312,32 @@ export async function pollOnce(
 
   // Drop any signed-but-not-yet-promoted candidate the referee explicitly
   // rejected -- it was our own send, so a receipt for it (if any) is
-  // addressed to us and already in receiptsByRequestId.
+  // addressed to us and already in receiptsByRequestId. Also permanently
+  // remembers the CONTENT (game_id/room_generation/members) of anything
+  // rejected here -- confirmed live this matters: our own rejected post
+  // reappears on the very next scan as a brand-new ObservedRoster (same
+  // content, a fresh request_id we never generated ourselves so it was
+  // never in autoSignAttemptedRequestIds), and once it's dropped from
+  // rosterCandidates the OLD content-only dedup in maybeAutoSignRoster (which
+  // reads off the CURRENT rosterCandidates) has nothing left to compare
+  // against -- so it looked "new" again, got re-signed, re-rejected
+  // (`reason=roster: member already frozen`, a PERMANENT fact -- retrying
+  // never succeeds), forever, once per tick.
   if (nextState.rosterCandidates && nextState.rosterCandidates.length > 0) {
+    const newlyRejectedKeys: string[] = [];
     const surviving = nextState.rosterCandidates.filter((c) => {
       const receipt = receiptsByRequestId.get(c.requestId);
       if (receipt?.status !== "rejected") return true;
       sonnetLog("ROSTER", `candidate REJECTED by referee: game_id=${c.gameId} request_id=${c.requestId} reason=${receipt.reason ?? "(none given)"} -- dropping`);
+      newlyRejectedKeys.push(`${c.gameId}|${c.roomGeneration}|${[...c.members].sort().join(",")}`);
       return false;
     });
     if (surviving.length !== nextState.rosterCandidates.length) {
-      nextState = { ...nextState, rosterCandidates: surviving };
+      nextState = {
+        ...nextState,
+        rosterCandidates: surviving,
+        rejectedRosterContentKeys: [...new Set([...(nextState.rejectedRosterContentKeys ?? []), ...newlyRejectedKeys])],
+      };
     }
   }
 
@@ -663,17 +679,29 @@ async function maybeAutoSignRoster(
   const alreadySignedContent = new Set(
     (state.rosterCandidates ?? []).map((c) => `${c.gameId}|${c.roomGeneration}|${[...c.members].sort().join(",")}`),
   );
+  // PERMANENT memory of content the referee has already explicitly rejected
+  // (see state.ts's rejectedRosterContentKeys) -- unlike alreadySignedContent
+  // above, this never forgets just because the rejected candidate got
+  // dropped from rosterCandidates. A rejection reason like "member already
+  // frozen" is a fact that never changes, so this composition can never
+  // legitimately succeed; without this, it re-appears as a "new" observation
+  // (our own rejected post, under a fresh request_id) and gets re-signed,
+  // re-rejected, forever, once per tick.
+  const permanentlyRejectedContent = new Set(state.rejectedRosterContentKeys ?? []);
   const candidates: RosterSignCandidate[] = rosterProposals
-    .filter(
-      (p) =>
+    .filter((p) => {
+      const contentKey = `${p.gameId}|${p.roomGeneration}|${[...p.members].sort().join(",")}`;
+      return (
         p.members.includes(agent.did) &&
         p.members.length >= 4 &&
         p.members.length <= 8 &&
         new Set(p.members).size === p.members.length &&
         !lockedGameIds.has(p.gameId) &&
         !alreadyAttempted.has(p.requestId) &&
-        !alreadySignedContent.has(`${p.gameId}|${p.roomGeneration}|${[...p.members].sort().join(",")}`),
-    )
+        !alreadySignedContent.has(contentKey) &&
+        !permanentlyRejectedContent.has(contentKey)
+      );
+    })
     .map((proposal) => ({ gameId: proposal.gameId, proposal }))
     .sort((a, b) => a.proposal.seq - b.proposal.seq);
 

@@ -208,6 +208,18 @@ export interface SonnetState {
     requestId: string;
     signedAtUtc: string;
   }>;
+  /** Content keys (`gameId|roomGeneration|sortedMembers`) of every roster
+   * candidate the referee has EXPLICITLY REJECTED, permanently -- e.g.
+   * "roster: member already frozen" is a fact that never changes, so
+   * retrying the identical composition can never succeed. Without this,
+   * our own rejected post reappears on the next scan as a brand-new
+   * ObservedRoster (same content, a fresh request_id we never generated
+   * ourselves), and once it's dropped from rosterCandidates the transient
+   * content-dedup in maybeAutoSignRoster (which only ever looks at the
+   * CURRENT rosterCandidates) has nothing left to compare it against --
+   * so it looks new again and gets re-signed, re-rejected, forever, once
+   * per tick. This set is the permanent memory that transient one can't be. */
+  rejectedRosterContentKeys?: string[];
   /** game_ids of OUR OWN team-requests (team/additionalTeamRequests) that
    * SONNET_AUTO_RECRUIT's auto-propose step (run.ts's
    * maybeAutoProposeOwnRoster) has already built and posted a roster.v1 for,

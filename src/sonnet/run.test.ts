@@ -966,6 +966,43 @@ test("pollOnce: SONNET_AUTO_TEAM refuses a roster proposal with a duplicate DID 
   assert.equal(tick.autoSignedRoster, undefined);
 });
 
+test("pollOnce: a rejected roster candidate's CONTENT is never re-signed again, even under a brand-new request_id (permanent memory, fixes a real live infinite reject-loop)", async () => {
+  const agent = makeAgent();
+  const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
+  const server = new FakeTechnocore();
+  const referee = makeTestIdentity();
+  const client = new TechnocoreClient({ fetchImpl: server.fetch });
+  const members = [agent.did, makeTestIdentity().did, makeTestIdentity().did, makeTestIdentity().did];
+
+  // Our own prior post (request_id "roster-1") gets rejected this tick, for
+  // a reason that's a PERMANENT fact ("member already frozen" never
+  // changes)...
+  await server.postSigned(
+    "mb-sonnet-1-discovery",
+    referee,
+    JSON.stringify({ type: "sonnet.receipt.v1", contest_id: "sonnet-1", request_id: "roster-1", sender_did: agent.did, status: "rejected", reason: "roster: member already frozen" }),
+  );
+  // ...and the exact same content reappears as ANOTHER observed proposal
+  // under a DIFFERENT request_id (confirmed live: our own rejected post
+  // re-observed, or someone re-broadcasting the same doomed composition).
+  server.postSigned(
+    "mb-sonnet-1-discovery",
+    makeTestIdentity(),
+    JSON.stringify({ type: "sonnet.roster.v1", contest_id: "sonnet-1", game_id: "hepyar", poem_room: "d-sonnet-1-team-hepyar", room_generation: 0, members, request_id: "roster-2-different-id" }),
+  );
+
+  const state = {
+    ...defaultState("sonnet-1", agent.did),
+    rosterCandidates: [
+      { gameId: "hepyar", poemRoom: "d-sonnet-1-team-hepyar", roomGeneration: 0, members, requestId: "roster-1", signedAtUtc: "2026-09-11T13:00:00Z" },
+    ],
+  };
+  const { state: next, tick } = await pollOnce(agent, CONTEST, config, state, client);
+  assert.equal(tick.autoSignedRoster, undefined); // never re-signed
+  assert.equal((next.rosterCandidates ?? []).length, 0);
+  assert.ok(next.rejectedRosterContentKeys?.includes(`hepyar|0|${[...members].sort().join(",")}`));
+});
+
 test("pollOnce: a REJECTED roster receipt clears state.roster so a different candidate can be signed next tick", async () => {
   const agent = makeAgent();
   const config: SonnetConfig = { ...loadSonnetConfig({}), autoTeam: true, dryRun: false };
