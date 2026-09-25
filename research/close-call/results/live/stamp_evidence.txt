@@ -1,0 +1,23 @@
+settled trades matched to a stamped message: 1287
+  settled in the sweep given by its stamp: 1226
+  settled in a LATER sweep than its stamp: 10  earlier: 51
+sweeps the referee posted >5 min after their boundary: [(24, 23.0), (25, 20.9), (26, 17.0), (27, 13.5), (28, 12.5), (29, 11.0), (30, 11.8), (31, 10.9), (32, 8.5), (33, 23.4), (34, 23.6), (35, 22.1), (36, 26.8), (37, 30.2), (38, 29.5), (39, 29.1), (40, 33.9), (41, 38.7), (42, 41.7), (43, 37.2), (44, 32.9), (45, 28.5), (46, 24.2), (47, 19.8), (48, 15.5), (49, 11.2), (50, 7.0)]
+decisive: stamped after boundary n-1 but before the referee PUBLISHED sweep n-1: 328
+  -> {'settled at its stamp sweep': 273, 'other': 47, 'settled in n-1 (by publish time)': 8}
+  id=padcgjtm0c2c   stamped 15:30:17  boundary n-1=42@15:30 published@16:11:40  -> settled in sweep 43 (stamp rule says 43), until=43
+  id=padcgjtm0c2c   stamped 15:30:21  boundary n-1=42@15:30 published@16:11:40  -> settled in sweep 43 (stamp rule says 43), until=43
+  id=pbcwqiz7s1c7   stamped 15:30:22  boundary n-1=42@15:30 published@16:11:40  -> settled in sweep 43 (stamp rule says 43), until=43
+  id=pbcwqiz7s1c7   stamped 15:30:23  boundary n-1=42@15:30 published@16:11:40  -> settled in sweep 43 (stamp rule says 43), until=43
+  id=734fcad35f34b5 stamped 15:30:53  boundary n-1=42@15:30 published@16:11:40  -> settled in sweep 43 (stamp rule says 43), until=436
+  id=sean-l1-b3e9   stamped 15:30:59  boundary n-1=42@15:30 published@16:11:40  -> settled in sweep 26 (stamp rule says 43), until=310
+
+Using the FIRST stamped copy of each id (reposts removed): 1198 {'same': 1189, 'later': 8, 'earlier': 1}
+  id=muse-long-02     room=jh-nvda-desk       stamped 13:33:15.163 (+195.2s after boundary 18) stamp-sweep=19 settled=33 until=40
+  id=flop_1790349585_ room=kc-c1-desk         stamped 15:28:19.268 (+199.3s after boundary 41) stamp-sweep=42 settled=45 until=48
+  id=flop_1790350235_ room=kc-c1-desk         stamped 15:40:52.474 (+52.5s after boundary 44) stamp-sweep=45 settled=47 until=49
+  id=flop_1790350858_ room=kc-c1-desk         stamped 15:53:06.491 (+186.5s after boundary 46) stamp-sweep=47 settled=49 until=51
+  id=flop_1790351853_ room=kc-c1-desk         stamped 16:00:04.859 (+4.9s after boundary 48) stamp-sweep=49 settled=51 until=53
+  id=ladder-S0        room=jh-nvda-desk       stamped 13:57:19.743 (+139.7s after boundary 23) stamp-sweep=24 settled=36 until=2000
+  id=clE2E348764      room=d-clawnker-c1-desk stamped 15:06:07.594 (+67.6s after boundary 37) stamp-sweep=38 settled=41 until=2555
+  id=tzo-179034056933 room=cc-tzo3ra          stamped 12:52:57.177 (+177.2s after boundary 10) stamp-sweep=11 settled=10 until=13
+  id=ccd3fnh4bajh     room=cc-tzo3ra          stamped 12:56:00.049 (+60.0s after boundary 11) stamp-sweep=12 settled=18 until=23

@@ -1,0 +1,8 @@
+{
+  "source": "https://github.com/flop-labs/technocore-close-call-challenge",
+  "commit": "66c1da36538e4b1c685417d2f66922906b13fea0",
+  "manifest_sha256": "bae09812e25eb6f1369c611f24964f7ea0acafddfc45301a16f33f941296dafa",
+  "referee_seed_package": "bae09812e25eb6f1369c611f24964f7ea0acafddfc45301a16f33f941296dafa",
+  "vendored_at": "2026-09-25T15:42:00Z",
+  "note": "Unmodified snapshot (git archive of the commit above). Do not edit: src/close-call/fold.ts refuses to run if close_call_fold.py or manifest.json hashes change."
+}

@@ -1,0 +1,196 @@
+/**
+ * All `closecall:*` configuration, read once from process.env (same convention as
+ * src/sonnet/config.ts and src/mentions/config.ts: nothing else in this feature
+ * reads process.env).
+ *
+ * MODES. Default is `paper`. `observe` and `dry-run` are read-only too. `live`
+ * needs TWO deliberate settings -- CLOSECALL_MODE=live AND
+ * CLOSECALL_LIVE_ENABLED=<LIVE_ACK, exactly> -- and if either is missing the
+ * process refuses to start (no write, ever). Even with both, THIS BUILD refuses:
+ * the live writer is not connected (see live/README and guard.test.ts).
+ *
+ * Persistent layout (never deleted by deploys): data/close-call/
+ *   close-call.sqlite3   state, journal, alerts        logs/     JSON logs (rotated)
+ *   keys/                future key files (700 / 600)   backups/  DB + encrypted key backups
+ *   closecall.lock       single-instance lock
+ */
+
+import { resolve } from "node:path";
+
+export class CloseCallConfigError extends Error {}
+
+export type Mode = "paper" | "observe" | "dry-run" | "live";
+export type EstimatorSource = "ref" | "hl" | "combined";
+export type UntilPolicy = "this-sweep" | "next-sweep";
+export type ConfirmationPolicy = "STRICT" | "PROTOCOL" | "PROBE";
+export type StaleMode = "adaptive" | "TRADE" | "REDUCE" | "HALT_NEW_ENTRIES";
+
+/** The exact acknowledgement CLOSECALL_LIVE_ENABLED must carry for live mode to even be considered. */
+export const LIVE_ACK = "I-UNDERSTAND-CLOSECALL-LIVE-SIGNS-AND-POSTS-REAL-MESSAGES";
+
+export interface StrategyKConfig {
+  keyCount: number;
+  /** New pair when the price is `threshold` beyond the last used low/high (0.0025 = 0.25%). */
+  threshold: number;
+  /** Extra distance past the fee-neutral price, as a fraction (0.001 = 0.1%). */
+  priceMargin: number;
+  /** Size so the funds check survives a close this far from the estimate (0.003 = 0.3%). */
+  qtyMargin: number;
+  /** Cash kept unspent by each side, as a fraction of its cash (0 = all-in). */
+  reserve: number;
+  untilPolicy: UntilPolicy;
+}
+
+export interface StalePolicyConfig {
+  mode: StaleMode;
+  /** adaptive: referee age_s at or above this -> REDUCE (wider margins). */
+  reduceAgeS: number;
+  /** adaptive: referee age_s at or above this -> HALT_NEW_ENTRIES. */
+  haltAgeS: number;
+  /** adaptive: publication delay (minutes) at or above this -> HALT_NEW_ENTRIES. */
+  haltDelayMin: number;
+  /** adaptive: |Hyperliquid - referee ref| above this (bps) while stale -> HALT_NEW_ENTRIES. */
+  haltDivergenceBps: number;
+}
+
+export interface CloseCallConfig {
+  mode: Mode;
+  technocoreBaseUrl: string;
+  hyperliquidInfoUrl: string;
+  hyperliquidCoin: string;
+  vendorRoot: string;
+  dataDir: string;
+  dbPath: string;
+  rawLogDir: string;
+  logDir: string;
+  keysDir: string;
+  backupDir: string;
+  lockPath: string;
+  python: string;
+  refereePollMs: number;
+  hlPollMs: number;
+  decisionLeadMs: number;
+  estimator: EstimatorSource;
+  hlStaleMs: number;
+  refereeStaleAgeS: number;
+  strategy: StrategyKConfig;
+  stalePriceMargin: number;
+  staleQtyMargin: number;
+  stalePolicy: StalePolicyConfig;
+  confirmationPolicy: ConfirmationPolicy;
+  /** Safe mode: halt execution when the referee's last post is older than this (seconds since it was received). */
+  haltRefereeSilenceS: number;
+  /** Safe mode: halt execution when Hyperliquid's last trade is older than this. */
+  haltHlStaleMs: number;
+  roomRefreshDays: number;
+  diskLowMb: number;
+  health: { enabled: boolean; host: string; port: number };
+  logs: { maxFileMb: number; maxTotalMb: number; retentionDays: number };
+  alerts: { webhookUrl: string | null; telegramBotToken: string | null; telegramChatId: string | null; minIntervalS: number };
+  paperKeyPrefix: string;
+}
+
+function num(env: NodeJS.ProcessEnv, name: string, def: number, min: number, max: number): number {
+  const raw = env[name];
+  if (raw === undefined || raw.trim() === "") return def;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || v < min || v > max) {
+    throw new CloseCallConfigError(`${name} must be a number in [${min}, ${max}], got ${JSON.stringify(raw)}`);
+  }
+  return v;
+}
+
+function oneOf<T extends string>(env: NodeJS.ProcessEnv, name: string, allowed: readonly T[], def: T): T {
+  const raw = env[name]?.trim();
+  if (!raw) return def;
+  if (!(allowed as readonly string[]).includes(raw)) {
+    throw new CloseCallConfigError(`${name} must be one of ${allowed.join(" | ")}, got ${JSON.stringify(raw)}`);
+  }
+  return raw as T;
+}
+
+function bool(env: NodeJS.ProcessEnv, name: string, def: boolean): boolean {
+  const raw = env[name]?.trim().toLowerCase();
+  if (!raw) return def;
+  return raw === "true" || raw === "1" || raw === "yes";
+}
+
+export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = process.cwd()): CloseCallConfig {
+  const modeRaw = env.CLOSECALL_MODE?.trim() || "paper";
+  if (!["observe", "paper", "dry-run", "live"].includes(modeRaw)) {
+    throw new CloseCallConfigError(`CLOSECALL_MODE must be paper | observe | dry-run | live, got ${JSON.stringify(modeRaw)}`);
+  }
+  if (modeRaw === "live" && env.CLOSECALL_LIVE_ENABLED !== LIVE_ACK) {
+    throw new CloseCallConfigError("CLOSECALL_MODE=live without CLOSECALL_LIVE_ENABLED set to the exact acknowledgement: refusing to start (NO WRITE).");
+  }
+  if (modeRaw !== "live" && env.CLOSECALL_LIVE_ENABLED) {
+    throw new CloseCallConfigError("CLOSECALL_LIVE_ENABLED is set but CLOSECALL_MODE is not live: remove it so the two can never disagree.");
+  }
+  const keyCount = num(env, "CLOSECALL_KEY_COUNT", 100, 2, 100);
+  if (keyCount % 2 !== 0) throw new CloseCallConfigError("CLOSECALL_KEY_COUNT must be even (keys trade in pairs)");
+  const dataDir = resolve(cwd, env.CLOSECALL_DATA_DIR?.trim() || "data/close-call");
+  const healthHost = env.CLOSECALL_HEALTH_HOST?.trim() || "127.0.0.1";
+  if (healthHost === "0.0.0.0" && !bool(env, "CLOSECALL_HEALTH_ALLOW_PUBLIC", false)) {
+    throw new CloseCallConfigError("CLOSECALL_HEALTH_HOST=0.0.0.0 needs CLOSECALL_HEALTH_ALLOW_PUBLIC=true; use an SSH tunnel instead.");
+  }
+  return {
+    mode: modeRaw as Mode,
+    technocoreBaseUrl: env.CLOSECALL_TECHNOCORE_URL?.trim() || env.TECHNOCORE_URL?.trim() || "https://technocore.chat",
+    hyperliquidInfoUrl: env.CLOSECALL_HL_INFO_URL?.trim() || "https://api.hyperliquid.xyz/info",
+    hyperliquidCoin: "xyz:NVDA",
+    vendorRoot: resolve(cwd, env.CLOSECALL_VENDOR_ROOT?.trim() || "vendor/technocore-close-call"),
+    dataDir,
+    dbPath: resolve(cwd, env.CLOSECALL_DB_PATH?.trim() || resolve(dataDir, "close-call.sqlite3")),
+    rawLogDir: resolve(cwd, env.CLOSECALL_RAW_DIR?.trim() || resolve(dataDir, "logs")),
+    logDir: resolve(cwd, env.CLOSECALL_LOG_DIR?.trim() || resolve(dataDir, "logs")),
+    keysDir: resolve(cwd, env.CLOSECALL_KEYS_DIR?.trim() || resolve(dataDir, "keys")),
+    backupDir: resolve(cwd, env.CLOSECALL_BACKUP_DIR?.trim() || resolve(dataDir, "backups")),
+    lockPath: resolve(cwd, env.CLOSECALL_LOCK_PATH?.trim() || resolve(dataDir, "closecall.lock")),
+    python: env.CLOSECALL_PYTHON?.trim() || "python3",
+    refereePollMs: num(env, "CLOSECALL_REFEREE_POLL_MS", 10_000, 2_000, 120_000),
+    hlPollMs: num(env, "CLOSECALL_HL_POLL_MS", 3_000, 1_000, 60_000),
+    decisionLeadMs: num(env, "CLOSECALL_DECISION_LEAD_MS", 20_000, 3_000, 240_000),
+    estimator: oneOf(env, "CLOSECALL_ESTIMATOR", ["ref", "hl", "combined"] as const, "combined"),
+    hlStaleMs: num(env, "CLOSECALL_HL_STALE_MS", 60_000, 1_000, 3_600_000),
+    refereeStaleAgeS: num(env, "CLOSECALL_REFEREE_STALE_AGE_S", 300, 10, 3_600),
+    strategy: {
+      keyCount,
+      threshold: num(env, "CLOSECALL_THRESHOLD", 0.0025, 0.0005, 0.1),
+      priceMargin: num(env, "CLOSECALL_PRICE_MARGIN", 0.001, 0, 0.04),
+      qtyMargin: num(env, "CLOSECALL_QTY_MARGIN", 0.003, 0, 0.05),
+      reserve: num(env, "CLOSECALL_RESERVE", 0, 0, 0.5),
+      untilPolicy: oneOf(env, "CLOSECALL_UNTIL_POLICY", ["this-sweep", "next-sweep"] as const, "this-sweep"),
+    },
+    stalePriceMargin: num(env, "CLOSECALL_STALE_PRICE_MARGIN", 0.004, 0, 0.04),
+    staleQtyMargin: num(env, "CLOSECALL_STALE_QTY_MARGIN", 0.012, 0, 0.05),
+    stalePolicy: {
+      mode: oneOf(env, "CLOSECALL_STALE_POLICY", ["adaptive", "TRADE", "REDUCE", "HALT_NEW_ENTRIES"] as const, "adaptive"),
+      reduceAgeS: num(env, "CLOSECALL_STALE_REDUCE_AGE_S", 60, 10, 86_400),
+      haltAgeS: num(env, "CLOSECALL_STALE_HALT_AGE_S", 300, 10, 86_400),
+      haltDelayMin: num(env, "CLOSECALL_STALE_HALT_DELAY_MIN", 45, 1, 1_440),
+      haltDivergenceBps: num(env, "CLOSECALL_STALE_HALT_DIVERGENCE_BPS", 50, 1, 5_000),
+    },
+    confirmationPolicy: oneOf(env, "CLOSECALL_CONFIRMATION_POLICY", ["STRICT", "PROTOCOL", "PROBE"] as const, "STRICT"),
+    haltRefereeSilenceS: num(env, "CLOSECALL_HALT_REFEREE_SILENCE_S", 3_600, 60, 86_400),
+    haltHlStaleMs: num(env, "CLOSECALL_HALT_HL_STALE_MS", 600_000, 10_000, 86_400_000),
+    roomRefreshDays: num(env, "CLOSECALL_ROOM_REFRESH_DAYS", 5, 1, 6),
+    diskLowMb: num(env, "CLOSECALL_DISK_LOW_MB", 500, 10, 1_000_000),
+    health: {
+      enabled: bool(env, "CLOSECALL_HEALTH_ENABLED", true),
+      host: healthHost,
+      port: num(env, "CLOSECALL_HEALTH_PORT", 8787, 1024, 65_535),
+    },
+    logs: {
+      maxFileMb: num(env, "CLOSECALL_LOG_MAX_FILE_MB", 20, 1, 1_000),
+      maxTotalMb: num(env, "CLOSECALL_LOG_MAX_TOTAL_MB", 500, 10, 100_000),
+      retentionDays: num(env, "CLOSECALL_LOG_RETENTION_DAYS", 14, 1, 365),
+    },
+    alerts: {
+      webhookUrl: env.CLOSECALL_ALERT_WEBHOOK_URL?.trim() || null,
+      telegramBotToken: env.CLOSECALL_ALERT_TELEGRAM_BOT_TOKEN?.trim() || null,
+      telegramChatId: env.CLOSECALL_ALERT_TELEGRAM_CHAT_ID?.trim() || null,
+      minIntervalS: num(env, "CLOSECALL_ALERT_MIN_INTERVAL_S", 900, 0, 86_400),
+    },
+    paperKeyPrefix: "CC",
+  };
+}

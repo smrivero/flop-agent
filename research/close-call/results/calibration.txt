@@ -1,0 +1,4 @@
+5m: n=5030 ann.vol weekday=29.9% weekend=11.0%  kurtosis=23.8  max|ret|=1.10%
+1h: n=4800 ann.vol weekday=43.5% weekend=16.8%  kurtosis=18.6  max|ret|=4.88%
+9-day windows (1h, 765): |S/open-1| median=4.0% p90=8.7%  range median=9.1%  best-oracle max(S/min-1,1-S/max) median=6.8% p90=10.8%
+1m: std=0.039%  p99|ret|=0.142%  max=0.50%

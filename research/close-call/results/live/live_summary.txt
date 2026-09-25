@@ -1,0 +1,28 @@
+fetched_at 2026-09-25T13:54:08Z
+room sizes: price 23 flow 22 positions 22 pnl 22 state 22
+seed: {'price': '226.14', 'trade': {'tid': 626256716983248, 'time': '2026-09-25T11:59:42.666000Z'}, 'package': 'bae09812e25eb6f1369c611f24964f7ea0acafddfc45301a16f33f941296dafa', 'limits': ['214.84', '237.44'], 'for': 1}
+last price post: {'age_s': 2, 'applied': '225.12', 'file': 'a19db871a3f053f1609f86ec1f2c6ba57ebc9f20536a3b37cdd8ce9c6805d9e3', 'for': 23, 'global': '224.92', 'limits': ['213.78', '236.28'], 'n': 22, 'ref': {'px': '225.03', 'tid': 745739478454287, 'time': '2026-09-25T13:49:57.723000Z'}, 't': 'price'}
+state last: {'file': 'a19db871a3f053f1609f86ec1f2c6ba57ebc9f20536a3b37cdd8ce9c6805d9e3', 'n': 22, 'owners': 235095, 'rooms': 35, 'root': '7195e58a6be8aa19e509493f45f8e5195b2b9ac8a9e5287f4430cdabceb07f0a', 't': 'state'}
+flow sweeps 1 .. 22 | settled 893 | void 93 {'settled': 16, 'funds': 73, 'expired': 3, 'limits': 1}
+mints listed in posts 1090 max per post 66 | rooms registered ['aakz-c1', 'aakz-c2', 'aakz-c3', 'archmage-desk', 'aurora-c1', 'bae-c1', 'boz-desk', 'cc-hayes-desk', 'cc-tzo3ra', 'd-c1-desk-qkyv', 'd-cluetrack', 'd-narrative', 'd-proofpacket', 'flop-bracket-desk', 'flop-nvda-desk', 'floppy-63fe0071', 'hermes-c1-desk', 'hermes-ops-desk', 'hx-did-gameplay', 'jh-nvda-desk', 'kc-c1-desk', 'krampus-desk-c1', 'mb-desk-1', 'mb-p-11d2cc256190a78f02', 'mb-p-4705eca2c0591aa955', 'mb-p-60da0cb3c002785a34', 'mb-p-a791eb821b12947507', 'mb-p-b5a50252f3c35e45b3', 'mb-p-bb04c25e706fac2480', 'mb-p-fe0fb47b6a0103c0ee', 'n101-b', 'n101-desk', 'nvda-desk-966e', 'qxlab-desk']
+missed ranges [[['close1', 188639, 190784]]]
+per-sweep settled: [0, 2, 2, 2, 26, 1, 7, 44, 10, 10, 12, 4, 23, 29, 33, 15, 6, 205, 164, 14, 5, 279]
+owners by sweep: [0, 370, 405, 1911, 3164, 5380, 6447, 7618, 9842, 13032, 23186, 29994, 43261, 64652, 84919, 108676, 127577, 145059, 169220, 191031, 212905, 235095]
+positions last: {'n': 22, 'open': '23596.06', 'longs': 560, 'shorts': 885} top entries 10
+positions over time (n,open,longs,shorts): [(15, '7682.80', 186, 186), (16, '8146.45', 198, 197), (17, '8360.99', 203, 202), (18, '12801.93', 308, 406), (19, '16412.23', 391, 570), (20, '16842.59', 402, 581), (21, '17050.23', 407, 586), (22, '23596.06', 560, 885)]
+pnl last: mark 224.92 top entries 25 #1-3 [71.87, 63.91, 63.91] min shown 63.91
+pnl distribution of shown top: [(64, 24), (72, 1)]
+most common |position| in top: [(44.35, 4), (44.12, 4), (44.22, 2)]
+undocumented price fields: ['age_s', 'applied', 'for'] | documented but missing: []
+undocumented flow fields: ['omitted'] | documented but missing: []
+undocumented positions fields: [] | documented but missing: []
+undocumented pnl fields: [] | documented but missing: []
+undocumented state fields: [] | documented but missing: []
+undocumented seed fields: ['for', 'limits']
+age_s by sweep: [1, 16, 0, 300, 600, 7, 2, 0, 0, 300, 5, 2]
+applied vs ref.px: [(19, '225.20', '226.65', 20), (20, '226.65', '226.65', 21), (21, '226.65', '225.12', 22), (22, '225.12', '225.03', 23)]
+applied == previous sweep's ref.px (or seed): 22/22
+limits == [ceil(0.95*ref.px), floor(1.05*ref.px)] for the NEXT sweep ('for'): 22/22
+global vs ref: [(19, '225.26', '226.65'), (20, '225.39', '226.65'), (21, '229.57', '225.12'), (22, '224.92', '225.03')]
+flow 'omitted' values: [(2, {'mints': 304}), (4, {'mints': 1441}), (5, {'mints': 1197}), (6, {'mints': 2150}), (7, {'mints': 1002}), (8, {'mints': 1122}), (9, {'mints': 2163}), (10, {'mints': 3127}), (11, {'mints': 10099}), (12, {'mints': 6747}), (13, {'mints': 13207}), (14, {'mints': 21335}), (15, {'mints': 20212}), (16, {'mints': 23699}), (17, {'mints': 18838}), (18, {'mints': 17466, 'settled': 2}), (19, {'mints': 24133, 'settled': 3}), (20, {'mints': 21762}), (21, {'mints': 21811}), (22, {'mints': 22190, 'settled': 21, 'void': 242})]
+stale refs (age_s>=300): [(14, 300, '2026-09-25T13:04:59.820000Z'), (15, 600, '2026-09-25T13:04:59.820000Z'), (20, 300, '2026-09-25T13:34:59.035000Z')]

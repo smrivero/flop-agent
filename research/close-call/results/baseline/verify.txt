@@ -1,0 +1,1 @@
+Verified 15 artifacts against manifest.json.

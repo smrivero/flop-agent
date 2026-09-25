@@ -1,0 +1,89 @@
+/**
+ * Safe mode. Execution (anything that would produce an intent or a write) stops
+ * while any halt is active; the observer keeps running regardless.
+ *
+ * Two severities:
+ *   transient  the condition is re-evaluated every tick and the halt clears itself
+ *              when it resolves (referee/Hyperliquid stale, disk low);
+ *   grave      stays until an operator clears it by hand with the code shown in
+ *              `closecall:status` (`closecall:unhalt --code <code>`): reconciliation
+ *              mismatch, DB corruption, room ownership inconsistency, unrecoverable
+ *              nonce conflict, an operation whose state cannot be resolved.
+ *
+ * Stored in meta `halts` as {kind: Halt}, so every process (CLI, service) sees it.
+ */
+
+import { createHash } from "node:crypto";
+import type { Alerts } from "./alerts.js";
+import { ccLog } from "./logger.js";
+import { getMeta, healthEvent, now, setMeta, type CcDb } from "./store.js";
+
+export type HaltKind =
+  | "reconcile_mismatch" | "db_corruption" | "room_ownership" | "nonce_conflict" | "ambiguous_operation"
+  | "referee_stale" | "hyperliquid_stale" | "disk_low" | "manual";
+
+export const GRAVE: readonly HaltKind[] = ["reconcile_mismatch", "db_corruption", "room_ownership", "nonce_conflict", "ambiguous_operation", "manual"];
+
+export interface Halt { kind: HaltKind; severity: "transient" | "grave"; reason: string; code: string; at: string }
+
+export function activeHalts(db: CcDb): Record<string, Halt> {
+  const raw = getMeta(db, "halts");
+  const halts = raw ? (JSON.parse(raw) as Record<string, Halt>) : {};
+  const legacy = getMeta(db, "paper_halted");               // before v2, paper halts lived here
+  if (legacy && !halts.reconcile_mismatch) {
+    halts.reconcile_mismatch = { kind: "reconcile_mismatch", severity: "grave", reason: legacy, code: codeFor(legacy, "legacy"), at: "legacy" };
+  }
+  return halts;
+}
+
+export function isHalted(db: CcDb): boolean {
+  return Object.keys(activeHalts(db)).length > 0;
+}
+
+export function haltSummary(db: CcDb): string | null {
+  const h = Object.values(activeHalts(db));
+  return h.length ? h.map((x) => `HALTED: ${x.kind}: ${x.reason}${x.severity === "grave" ? ` (manual: unhalt --code ${x.code})` : ""}`).join(" | ") : null;
+}
+
+function codeFor(reason: string, at: string): string {
+  return createHash("sha256").update(`${reason}|${at}`).digest("hex").slice(0, 8);
+}
+
+export function halt(db: CcDb, kind: HaltKind, reason: string, alerts?: Alerts): Halt {
+  const halts = activeHalts(db);
+  if (halts[kind]) return halts[kind];
+  const at = now();
+  const h: Halt = { kind, severity: GRAVE.includes(kind) ? "grave" : "transient", reason, code: codeFor(reason, at), at };
+  halts[kind] = h;
+  setMeta(db, "halts", JSON.stringify(halts));
+  healthEvent(db, "halt", h);
+  ccLog("HALT", { kind, severity: h.severity, code: h.code }, `HALTED: ${reason}`);
+  void alerts?.raise({ event: "execution_halted", severity: h.severity === "grave" ? "critical" : "warning", message: `HALTED: ${kind}: ${reason}`, key: kind });
+  return h;
+}
+
+/** Clear a transient halt whose condition has resolved. Refuses grave halts. */
+export function clearTransient(db: CcDb, kind: HaltKind, alerts?: Alerts): boolean {
+  const halts = activeHalts(db);
+  const h = halts[kind];
+  if (!h || h.severity !== "transient") return false;
+  delete halts[kind];
+  setMeta(db, "halts", JSON.stringify(halts));
+  healthEvent(db, "resume", { kind });
+  ccLog("SAFE MODE", { kind }, "transient halt cleared: condition resolved");
+  void alerts?.raise({ event: "execution_resumed", severity: "info", message: `resumed after ${kind}`, key: kind });
+  return true;
+}
+
+/** Manual recovery for grave halts: the operator must quote the halt's code. */
+export function unhalt(db: CcDb, code: string): Halt | null {
+  const halts = activeHalts(db);
+  const entry = Object.entries(halts).find(([, h]) => h.code === code);
+  if (!entry) return null;
+  delete halts[entry[0]];
+  setMeta(db, "halts", JSON.stringify(halts));
+  if (entry[0] === "reconcile_mismatch") setMeta(db, "paper_halted", "");
+  healthEvent(db, "unhalt", { kind: entry[0], code });
+  ccLog("SAFE MODE", { kind: entry[0], code }, "halt cleared manually");
+  return entry[1];
+}

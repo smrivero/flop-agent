@@ -1,0 +1,30 @@
+close1 ring covers sweeps 60 .. 67 | referee flows up to 65
+room registration messages in ring: 28
+  room=d-xray-8a9c                  stamped sweep 60 seq 783292 by ...1nZv8AdD | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-unity-95f2                 stamped sweep 60 seq 783337 by ...4Ygagrus | owner registered LATER sweep 67 | listed in flow.rooms: NO
+  room=d-dawn-d2af                  stamped sweep 60 seq 783370 by ...R8HfJ1iC | owner msg not in ring (registered earlier?) | listed in flow.rooms: NO
+  room=d-zulu-3cc8                  stamped sweep 60 seq 783410 by ...Z8w95SMD | owner msg not in ring (registered earlier?) | listed in flow.rooms: NO
+  room=bae-c1                       stamped sweep 61 seq 785504 by ...Etv2A5FQ | owner msg not in ring (registered earlier?) | listed in flow.rooms: 21 (listed BEFORE this msg: earlier registration)
+  room=kaifu-close1-dae7984692f72598 stamped sweep 62 seq 786278 by ...4kBDfhSb | owner registered SAME sweep | listed in flow.rooms: 62
+  room=kaifu-close1-dae7984692f72598 stamped sweep 62 seq 786640 by ...4kBDfhSb | owner registered SAME sweep | listed in flow.rooms: 62
+  room=d-unity-e2f4                 stamped sweep 62 seq 786851 by ...ThphYiq6 | owner msg not in ring (registered earlier?) | listed in flow.rooms: NO
+  room=d-jade-4c4f                  stamped sweep 62 seq 786944 by ...S8WXw3gs | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-ember-77e5                 stamped sweep 62 seq 786974 by ...HdJsRK4b | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-ember-d2a8                 stamped sweep 62 seq 787059 by ...jiVWwfi2 | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-kite-67db                  stamped sweep 62 seq 787152 by ...yW689cXY | owner msg not in ring (registered earlier?) | listed in flow.rooms: NO
+  room=bae-c1                       stamped sweep 62 seq 787229 by ...Etv2A5FQ | owner msg not in ring (registered earlier?) | listed in flow.rooms: 21 (listed BEFORE this msg: earlier registration)
+  room=d-cipher-39ef                stamped sweep 62 seq 787303 by ...NEHxtr6e | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-onyx-6f16                  stamped sweep 62 seq 787430 by ...To5ru6mR | owner registered LATER sweep 67 | listed in flow.rooms: NO
+  room=d-tango-0eb3                 stamped sweep 62 seq 787533 by ...X3vv12rZ | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-hotel-db46                 stamped sweep 63 seq 787649 by ...zqCTazAZ | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-stone-3c03                 stamped sweep 63 seq 787810 by ...Fve4gbeo | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-xray-8a9c                  stamped sweep 63 seq 788048 by ...1nZv8AdD | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=d-nova-4d00                  stamped sweep 63 seq 788108 by ...9V4F7TGQ | owner registered LATER sweep 66 | listed in flow.rooms: NO
+  room=mabolla-task-relay           stamped sweep 63 seq 788126 by ...VMo3fCsG | owner registered sweep 61 (earlier) | listed in flow.rooms: 63
+  room=d-sierra-333e                stamped sweep 63 seq 788227 by ...ozgYANyn | owner registered LATER sweep 65 | listed in flow.rooms: NO
+  room=kaifu-close1-dae7984692f72598 stamped sweep 63 seq 788441 by ...4kBDfhSb | owner registered sweep 62 (earlier) | listed in flow.rooms: 62 (listed BEFORE this msg: earlier registration)
+  room=bae-c1                       stamped sweep 63 seq 788672 by ...Etv2A5FQ | owner msg not in ring (registered earlier?) | listed in flow.rooms: 21 (listed BEFORE this msg: earlier registration)
+  room=bae-c1                       stamped sweep 64 seq 790482 by ...Etv2A5FQ | owner msg not in ring (registered earlier?) | listed in flow.rooms: 21 (listed BEFORE this msg: earlier registration)
+  room=kaifu-close1-dae7984692f72598 stamped sweep 64 seq 790600 by ...4kBDfhSb | owner registered sweep 62 (earlier) | listed in flow.rooms: 62 (listed BEFORE this msg: earlier registration)
+  room=bae-c1                       stamped sweep 65 seq 792263 by ...Etv2A5FQ | owner msg not in ring (registered earlier?) | listed in flow.rooms: 21 (listed BEFORE this msg: earlier registration)
+  room=bae-c1                       stamped sweep 66 seq 793863 by ...Etv2A5FQ | owner msg not in ring (registered earlier?) | listed in flow.rooms: 21 (listed BEFORE this msg: earlier registration)

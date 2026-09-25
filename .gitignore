@@ -21,3 +21,11 @@ data/sonnet/
 
 *.log
 .DS_Store
+
+# Close Call: state, logs, keys and backups live here on the VPS. Never commit.
+data/close-call/
+# Close Call research: regenerable with research/close-call/scripts (24 MB)
+research/close-call/results/sim_runs.csv
+research/close-call/results/*.log
+__pycache__/
+*.pyc

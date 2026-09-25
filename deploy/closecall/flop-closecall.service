@@ -1,0 +1,82 @@
+# Close Call (FLOP close-1) -- 24/7 PAPER service.
+# Installed by scripts/install-closecall-service.sh; do not edit on the server, re-run the installer.
+#
+# Layout (the installer creates it):
+#   /opt/flop-closecall            code, owned by root, read-only for the service (deploy-closecall.sh)
+#   /etc/flop-closecall/closecall.env   config, root:flopcc 0640, never in git, never overwritten by the installer
+#   /var/lib/flop-closecall        data: sqlite, logs, keys/, backups/, lock  (flopcc, 0700, StateDirectory)
+#   /usr/local/lib/flop-closecall/node   a copy of the node binary (root's nvm dir is not readable by flopcc)
+
+[Unit]
+Description=FLOP Close Call agent (paper by default; live is refused in this build)
+Documentation=file:///opt/flop-closecall/deploy/closecall/DEPLOY.md
+After=network-online.target
+Wants=network-online.target
+# Crash loop guard: more than 10 starts in 10 minutes -> systemd stops trying (see `systemctl status`).
+StartLimitIntervalSec=600
+StartLimitBurst=10
+
+[Service]
+Type=simple
+User=flopcc
+Group=flopcc
+WorkingDirectory=/opt/flop-closecall
+EnvironmentFile=/etc/flop-closecall/closecall.env
+# Belt and braces: the unit pins the data dir even if the env file forgets it.
+Environment=CLOSECALL_DATA_DIR=/var/lib/flop-closecall
+Environment=NODE_ENV=production
+# The code dir is read-only for the service: do not try to write __pycache__ next to the vendored fold.
+Environment=PYTHONDONTWRITEBYTECODE=1
+# `run` follows CLOSECALL_MODE (paper by default). live is refused with exit 3 in this build.
+ExecStart=/usr/local/lib/flop-closecall/node --import tsx src/close-call/cli.ts run
+Restart=always
+RestartSec=15
+# Config errors (2), live refused (3) and lock held (4) are not fixed by restarting.
+RestartPreventExitStatus=2 3 4
+
+# Graceful stop: SIGTERM -> the loop finishes the current step, writes clean_stop, releases the lock.
+KillSignal=SIGTERM
+TimeoutStopSec=60
+SendSIGKILL=yes
+
+# Files are created 0600 / dirs 0700 (sqlite, WAL, logs, lock).
+UMask=0077
+StateDirectory=flop-closecall
+StateDirectoryMode=0700
+
+# Resources (paper run measured ~70-100 MB RSS).
+MemoryMax=768M
+MemoryHigh=512M
+CPUQuota=80%
+TasksMax=64
+LimitNOFILE=4096
+
+# Hardening
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/flop-closecall
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+# AF_UNIX is needed for the abstract-socket process lock.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+SystemCallArchitectures=native
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=flop-closecall
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,23 @@
+test_a_discount_handed_to_another_key_is_paid_back (test_fold.FoldTests) ... ok
+test_a_price_a_jump_left_behind_is_paid_back (test_fold.FoldTests) ... ok
+test_a_trade_at_the_close_pays_one_percent_a_side (test_fold.FoldTests) ... ok
+test_funds_count_trades_already_applied_this_sweep (test_fold.FoldTests) ... ok
+test_funds_cover_the_clawback_too (test_fold.FoldTests) ... ok
+test_id_once_expiry_taker_and_lock (test_fold.FoldTests) ... ok
+test_limits_are_inclusive_and_measured_from_the_reference (test_fold.FoldTests) ... ok
+test_malformed_inputs_are_refused (test_fold.FoldTests) ... ok
+test_only_the_clawback_rule_is_configured (test_fold.FoldTests) ... ok
+test_sample_season_matches_expected_output (test_fold.FoldTests) ... ok
+test_self_trade_pays_twice_and_moves_nothing (test_fold.FoldTests) ... ok
+test_short_can_end_below_zero (test_fold.FoldTests) ... ok
+test_symmetric_collateral_and_exact_zero_sum (test_fold.FoldTests) ... ok
+test_the_harvest_nets_nothing (test_fold.FoldTests) ... ok
+test_ties_share_the_places_they_span (test_fold.FoldTests) ... ok
+test_commands_succeed (test_package.PackageTests) ... ok
+test_generated_files_and_manifest_match_sources (test_package.PackageTests) ... ok
+test_missing_corrupt_and_escaping_artifacts_fail_verification (test_package.PackageTests) ... ok
+
+----------------------------------------------------------------------
+Ran 18 tests in 0.282s
+
+OK
