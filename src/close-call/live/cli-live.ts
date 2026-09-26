@@ -146,7 +146,7 @@ async function main(argv: string[]): Promise<number> {
     // ---- everything below runs only after the reviewed go-live change ----
     if (cfg.mode !== "live") { process.stderr.write("bootstrap needs CLOSECALL_MODE=live and the exact CLOSECALL_LIVE_ENABLED ack\n"); return 3; }
     if (!cfg.room) { process.stderr.write("CLOSECALL_ROOM is not set\n"); return 2; }
-    const lock = await acquireLock(cfg.liveDbPath + ".lock", "close-call live bootstrap");
+    const lock = await acquireLock(cfg.lockPath, "close-call live bootstrap")   // the SAME lock as the live service: never both at once;
     setLogSink(cfg.logDir);
     try {
       const limits = await fetchLimits(cfg.technocoreBaseUrl);

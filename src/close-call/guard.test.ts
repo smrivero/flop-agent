@@ -101,3 +101,9 @@ test("paper mode cannot reach a signer: the paper CLI and service never import l
     assert.ok(!/from "\.\/live\//.test(t) && !/testing\//.test(t), `${f} imports live/ or testing/`);
   }
 });
+
+test("live bootstrap and live service share ONE lock (never both writing the live state)", () => {
+  const live = readFileSync(join(DIR, "live/cli-live.ts"), "utf8");
+  const locks = [...live.matchAll(/acquireLock\(([^,]+),/g)].map((m) => m[1].trim());
+  assert.ok(locks.length >= 2 && locks.every((l) => l === "cfg.lockPath"), JSON.stringify(locks));
+});
