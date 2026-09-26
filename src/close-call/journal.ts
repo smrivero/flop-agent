@@ -50,6 +50,17 @@ export interface WriteOp {
 export class TransportTimeout extends Error {}
 
 export interface TransportResponse { status: number; text: string }
+/**
+ * technocore.chat reads go through Cloudflare (`s-maxage=5, stale-while-revalidate=25`): a read right after a write
+ * can return the value from up to ~30 s before. Every read-back must see the origin, so each GET carries a unique
+ * query parameter (a cache MISS; technocore ignores unknown parameters). 26 Sep: a stale read of room-allow right
+ * after rewriting it halted the bootstrap with a false room_ownership.
+ */
+let freshSeq = 0;
+export function fresh(url: string): string {
+  return `${url}${url.includes("?") ? "&" : "?"}fresh=${Date.now().toString(36)}${(++freshSeq).toString(36)}`;
+}
+
 export interface RoomMessage { seq: number; from: string; text: string; nonce?: string; ts?: string }
 
 export interface Transport {

@@ -38,6 +38,8 @@ export interface SimOptions {
   listMints?: boolean;
   /** false: the referee's flow lists no settled id (the live lists are truncated). */
   listSettled?: boolean;
+  /** Edge cache: after a room-allow REWRITE, this many reads still return the old value (technocore's Cloudflare). */
+  staleAllowReads?: number;
   /** The official fold for the staging trade (fold.ts isolatedTradeFold), as in the real bootstrap. */
   foldTest?: BootstrapDeps["foldTest"];
   faults?: boolean;
@@ -89,7 +91,15 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
   };
   const addKeys = (strategyTotal: number) => { addRole("admin", 1); addRole("staging", 2); addRole("strategy", strategyTotal); };
   const realPost = srv.post.bind(srv);
+  const realReadNote = srv.readNote.bind(srv);
+  let stale: { value: string; left: number } | null = null;
+  srv.readNote = async (ns, key) => {
+    if (ns === "room-allow" && stale && stale.left > 0) { stale.left--; return stale.value; }
+    return realReadNote(ns, key);
+  };
   srv.post = async (path, body) => {
+    const old = path.startsWith("/kv/room-allow/") ? srv.notes.get(path.slice(4)) : undefined;
+    if (old !== undefined && o.staleAllowReads) stale = { value: old, left: o.staleAllowReads };
     const k = srv.posts + 1;
     if (o.rate429At?.includes(k)) srv.failNext("429");
     else if (o.killAt?.includes(k)) srv.failNext("kill");

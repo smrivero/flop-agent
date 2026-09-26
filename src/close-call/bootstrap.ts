@@ -117,6 +117,17 @@ export class Bootstrap {
     return { phase, action: "halted", detail: r.halted, writes: 0 };
   }
 
+  /** Read a note back after writing it: a mismatch is re-read (up to ~30 s: edge caches) before it counts. */
+  private async readBack(ns: "room-owners" | "room-allow", expected: string): Promise<string | null> {
+    let got: string | null = null;
+    for (let i = 0; i < 6; i++) {
+      if (i) await (this.d.sleep ?? realSleep)(5_000);
+      got = await this.d.transport.readNote(ns, this.d.room);
+      if (got === expected) return got;
+    }
+    return got;
+  }
+
   private ownerRecord(id: string): OwnerMessageRecord | undefined {
     const raw = getMeta(this.d.db, `owner_msg:${id}`);
     return raw ? (JSON.parse(raw) as OwnerMessageRecord) : undefined;
@@ -218,7 +229,7 @@ export class Bootstrap {
         const w = await this.write({ opKey: `claim:${room}`, kind: "note-owners", signerId: owner.id, room, value: owner.did, ifAbsent: true }, "claim");
         if (!("attempt_id" in w)) return w;
       }
-      const back = await this.d.transport.readNote("room-owners", room);
+      const back = await this.readBack("room-owners", owner.did);
       if (back !== owner.did) return this.stop("room_ownership", `room-owners/${room} reads ${back} after our claim`, "claim");
       transitionRoom(db, room, "CLAIMED", { kind: "owner-note", owner: back }, owner.did);
       return { phase: "claim", action: "wrote", detail: `${room} claimed by ${owner.id}`, writes: held === null ? 1 : 0 };
@@ -234,7 +245,7 @@ export class Bootstrap {
       // No `if` compare-and-set: it would repeat the whole old list in the body; only CC-ADMIN can sign this note and we read it just before.
       const w = await this.write({ opKey: `allow:${room}:${sha256Hex(desired).slice(0, 16)}`, kind: "note-allow", signerId: owner.id, room, value: desired }, "allow");
       if (!("attempt_id" in w)) return w;
-      const back = await this.d.transport.readNote("room-allow", room);
+      const back = await this.readBack("room-allow", desired);
       if (back !== desired) return this.stop("room_ownership", `room-allow/${room} does not read back as written`, "allow");
       setMeta(db, "room_allow_seen", JSON.stringify(back.split(" ")));
       if (r.status === "CLAIMED") transitionRoom(db, room, "ALLOWLIST_PENDING", { kind: "allow-sent", dids: staging.length + strategy.length });

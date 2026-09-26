@@ -2,6 +2,7 @@
  * LIVE ONLY. The live-side CLI, separate from the paper CLI (cli.ts never imports this file).
  *
  *   status                               live DB: keys, room, backup gate, pending writes, halts (no network)
+ *   unhalt --code <code>                 clear a GRAVE halt in the LIVE DB (the code is in `live status`)
  *   keygen --total N --i-understand-these-are-real-keys
  *                                        generate CC001..CC<N> (only missing ones). Refused unless the backup gate passes.
  *   restore-verify <decrypted keys dir>  (on the Mac) check a decrypted backup and print its VERIFY CODE
@@ -30,7 +31,7 @@ import { acquireLock, LockHeldError } from "../lock.js";
 import { ccLog, setLogSink, setQuiet } from "../logger.js";
 import { RefereeObserver } from "../observer.js";
 import { getRoom } from "../room.js";
-import { disarm, halt, haltSummary, rearm, writerState } from "../safety.js";
+import { disarm, halt, haltSummary, rearm, unhalt, writerState } from "../safety.js";
 import { openCloseCallDb } from "../store.js";
 import { openReadonly } from "../monitor.js";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -193,6 +194,14 @@ async function main(argv: string[]): Promise<number> {
       pending_writes: (db.prepare("SELECT COUNT(*) n FROM write_attempts WHERE state NOT IN ('CONFIRMED','FAILED')").get() as { n: number }).n,
       halted: haltSummary(db) });
     return 0;
+  }
+
+  if (cmd === "unhalt") {
+    const code = arg("--code");
+    if (!code) { process.stderr.write("usage: live unhalt --code <code from live status>\n"); return 2; }
+    const h = unhalt(db, code);
+    out(h ? { cleared: h, live_db: cfg.liveDbPath, halted: haltSummary(db) } : { error: "no active halt with that code", halted: haltSummary(db) });
+    return h ? 0 : 1;
   }
 
   if (cmd === "keygen") {

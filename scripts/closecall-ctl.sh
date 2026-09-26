@@ -8,7 +8,7 @@
 # LIVE (env /etc/flop-closecall/closecall-live.env, data /var/lib/flop-closecall-live) -- never the paper state:
 #   flop-closecall live-check [--offline]                 THE gate: every live precondition, read only
 #   flop-closecall --live watch | status | backup | keys --gate | keys --backup-canary | keys --backup-verify ...
-#   flop-closecall live status | keygen --role admin|staging|strategy --total N --i-understand-these-are-real-keys
+#   flop-closecall live status | unhalt --code C | keygen --role admin|staging|strategy --total N --i-understand-these-are-real-keys
 #   flop-closecall live bootstrap --dry-run [...] | bootstrap [--loop]      (the real bootstrap refuses until connected)
 # Service commands (run/paper/observe/live run) are refused here: use systemctl.
 set -euo pipefail
@@ -30,6 +30,8 @@ cd "$APP"
 ENTRY=src/close-call/cli.ts; ARGS=("$@")
 if [ "$cmd" = "live" ]; then ENV_FILE=$LIVE_ENV; FORCE_DATA=""; ENTRY=src/close-call/live/cli-live.ts; ARGS=("${@:2}"); fi
 if [ "$cmd" = "live-check" ]; then ENV_FILE=$LIVE_ENV; FORCE_DATA=""; ENTRY=src/close-call/live/cli-live.ts; ARGS=(check "${@:2}"); fi
+# --live unhalt must clear the halt in the LIVE DB (live.sqlite3), never open the paper DB name in the live dir
+if [ "$cmd" = "unhalt" ] && [ "$ENV_FILE" = "$LIVE_ENV" ]; then ENTRY=src/close-call/live/cli-live.ts; fi
 [ -r "$ENV_FILE" ] || { echo "no $ENV_FILE (install it first)" >&2; exit 2; }
 exec setpriv --reuid=flopcc --regid=flopcc --init-groups -- \
   env -i PATH=/usr/bin:/bin HOME=/var/lib/flop-closecall TERM="${TERM:-dumb}" ${NO_COLOR+NO_COLOR=1} FORCE_DATA="$FORCE_DATA" CLOSECALL_ENV_FILE="$ENV_FILE" \

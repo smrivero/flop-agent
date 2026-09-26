@@ -12,7 +12,7 @@ import { verifyEd25519 } from "../identity.js";
 import { backupGate, ensureCanary, recordBackup, recordVerification, verifyCode } from "./backup-gate.js";
 import { Bootstrap } from "./bootstrap.js";
 import { sweepTime } from "./contest.js";
-import { WriteJournal } from "./journal.js";
+import { fresh, WriteJournal } from "./journal.js";
 import { ensurePaperKeys, keyId, listKeys } from "./keys.js";
 import { generateKeys, KeygenRefused, loadSigners, verifyRestoredKeyDir } from "./live/keygen.js";
 import { makerSigningString, newTradeId, takerSigningString, type Terms } from "./protocol.js";
@@ -183,6 +183,27 @@ test("staging trade: fold settled but the referee lists it void -> grave reconci
   } finally {
     foldTest.stop();
   }
+});
+
+test("edge cache: room-allow reads back STALE right after the rewrite (26 Sep) -> re-read, no false room_ownership halt", async () => {
+  const r = await simulateBootstrap(contest(), { stages: [0, 4], startSweep: 300, staleAllowReads: 2 });
+  assert.ok(r.ok, JSON.stringify([r.final.halted, r.checks.filter((c) => !c.ok)]));
+  assert.equal(activeHalts(r.world.db).room_ownership, undefined);
+  assert.equal(r.server.allowDids, 6);
+});
+
+test("edge cache that never catches up still halts (a real mismatch is not retried forever)", async () => {
+  const r = await simulateBootstrap(contest(), { stages: [0, 4], startSweep: 300, staleAllowReads: 50 });
+  assert.equal(r.ok, false);
+  assert.match(r.final.halted ?? "", /room-allow\/.* does not read back as written/);
+});
+
+test("every technocore GET is a cache miss: a unique fresh= parameter on each URL", () => {
+  const a = fresh("https://technocore.chat/kv/room-allow/d-x");
+  const b = fresh("https://technocore.chat/kv/room-allow/d-x");
+  assert.notEqual(a, b);
+  assert.match(a, /\/kv\/room-allow\/d-x\?fresh=/);
+  assert.match(fresh("https://technocore.chat/r/d-x?format=json&limit=1"), /\?format=json&limit=1&fresh=/);
 });
 
 test("bootstrap dry-run with faults: lost requests, timeouts after commit, 429s, a crash after planning, CC-ADMIN missed by the referee", async () => {

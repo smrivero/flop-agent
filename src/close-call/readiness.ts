@@ -23,6 +23,7 @@ import { openReadonly } from "./monitor.js";
 import { liveStrategyKeys } from "./paper.js";
 import { activeHalts, writerState } from "./safety.js";
 import { getMeta } from "./store.js";
+import { fresh } from "./journal.js";
 import { REFEREE_DID } from "./protocol.js";
 import { REFEREE_PACKAGE_SHA256, verifyVendor } from "./fold.js";
 
@@ -226,7 +227,7 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
       if (cfg.room && admin) {
         // Every read is status-aware: a 404 on a note is the semantic state ABSENT, never a value to parse.
         const readNote = async (ns: string) => {
-          const res = await f(`${cfg.technocoreBaseUrl}/kv/${ns}/${cfg.room}`, { signal: AbortSignal.timeout(10_000) });
+          const res = await f(fresh(`${cfg.technocoreBaseUrl}/kv/${ns}/${cfg.room}`), { signal: AbortSignal.timeout(10_000) });
           if (res.status === 404) { await res.text(); return null; }
           if (!res.ok) throw new Error(`${ns}: HTTP ${res.status}`);
           const t = await res.text();
@@ -234,7 +235,7 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
           return (i >= 0 ? t.slice(i + 2) : t).split("\n")[0].trim() || null;
         };
         const srv = await timed(async () => {
-          const res = await f(`${cfg.technocoreBaseUrl}/r/${cfg.room}?format=json&limit=1`, { signal: AbortSignal.timeout(10_000) });
+          const res = await f(fresh(`${cfg.technocoreBaseUrl}/r/${cfg.room}?format=json&limit=1`), { signal: AbortSignal.timeout(10_000) });
           if (!res.ok) throw new Error(`room read: HTTP ${res.status}`);
           const view = JSON.parse(await res.text()) as { last_seq?: number; generation?: number };
           return { owner: await readNote("room-owners"), allow: await readNote("room-allow"), nonce: await readNote("room-nonce"),
@@ -250,7 +251,7 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
         add("room generation", !!rs && rs.generationOk && (rs.state !== "VIRGIN" || mode === "bootstrap"),
           srv.error ? `read failed: ${srv.error}` : rs!.generationDetail);
         // Notes share /kv/room-nonce/<room>: the server counter must not be ahead of our last signed note.
-        const rn = await timed(async () => { const res = await f(`${cfg.technocoreBaseUrl}/kv/room-nonce/${cfg.room}`, { signal: AbortSignal.timeout(10_000) }); if (!res.ok) return null; const t = await res.text(); const i = t.indexOf("\n\n"); return (i >= 0 ? t.slice(i + 2) : t).split("\n")[0].trim(); });
+        const rn = await timed(async () => { const res = await f(fresh(`${cfg.technocoreBaseUrl}/kv/room-nonce/${cfg.room}`), { signal: AbortSignal.timeout(10_000) }); if (!res.ok) return null; const t = await res.text(); const i = t.indexOf("\n\n"); return (i >= 0 ? t.slice(i + 2) : t).split("\n")[0].trim(); });
         const localNote = (db.prepare("SELECT MAX(CAST(last_nonce AS INTEGER)) m FROM nonces WHERE scope = ?").get(`note:${cfg.room}`) as { m: number | null }).m;
         if (rn.value && /^\d+$/.test(rn.value) && localNote !== null) {
           add("note nonce (room-nonce)", BigInt(rn.value) <= BigInt(localNote), `server ${rn.value}, ours ${localNote}`);

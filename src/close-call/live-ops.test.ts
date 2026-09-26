@@ -262,7 +262,7 @@ function virginNet(db: CcDb, room: string, base: typeof fetch): typeof fetch {
   return (async (url: string, init?: RequestInit) => {
     const u = String(url);
     for (const ns of ["room-owners", "room-allow", "room-nonce"]) {
-      if (u.endsWith(`/kv/${ns}/${room}`)) return new Response(`[untrusted note content follows]\n\n404: no note ${ns}/${room}\nsee https://technocore.chat/llms.txt for the note API and namespaces\n`, { status: 404 });
+      if (u.split("?")[0].endsWith(`/kv/${ns}/${room}`)) return new Response(`[untrusted note content follows]\n\n404: no note ${ns}/${room}\nsee https://technocore.chat/llms.txt for the note API and namespaces\n`, { status: 404 });
     }
     if (u.includes(`/r/${room}?format=json`) && u.includes("limit=1")) return new Response(JSON.stringify({ room, count: 0, first_seq: null, last_seq: 0, generation: 0, messages: [] }), { status: 200 });
     if (u.includes(`/r/${room}`)) return new Response(JSON.stringify({ room, count: 0, first_seq: null, last_seq: 0, generation: 0, messages: [] }), { status: 200 });
