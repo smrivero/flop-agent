@@ -187,3 +187,17 @@ test("bootstrap plan: limits read from the server (not hardcoded), 103 writes wi
   assert.equal(p.timing.pureWriteSeconds, 52, "104 writes at 120/min");
   assert.equal(bootstrapPlan({ ...limits, writesPerMinPerIp: 300 }, 100, 0).timing.pureWriteSeconds, 21);
 });
+
+test("Close Call runtime manifest: its own deps (Node 24 needs better-sqlite3 >= 13), scripts pinned, never the shared package.json", () => {
+  const rt = JSON.parse(readFileSync(join(process.cwd(), "deploy/closecall/package.json"), "utf8")) as { dependencies: Record<string, string>; allowScripts: Record<string, boolean>; engines: { node: string } };
+  assert.match(rt.dependencies["better-sqlite3"], /^1[3-9]\.\d+\.\d+$/, "pinned, 13+ (11.x/12.x abort in Statement::~Statement on Node >= 24.19)");
+  assert.match(rt.dependencies.tsx, /^\d+\.\d+\.\d+$/, "pinned");
+  assert.equal(rt.allowScripts[`better-sqlite3@${rt.dependencies["better-sqlite3"]}`], false, "prebuilt N-API binary ships in the package: no node-gyp");
+  assert.ok(Object.keys(rt.allowScripts).every((k) => k === "fsevents" || /@\d+\.\d+\.\d+$/.test(k)), "every allowed entry is version-pinned");
+  assert.match(rt.engines.node, />=24\.19/);
+  const lock = JSON.parse(readFileSync(join(process.cwd(), "deploy/closecall/package-lock.json"), "utf8")) as { packages: Record<string, { version?: string }> };
+  assert.equal(lock.packages["node_modules/better-sqlite3"].version, rt.dependencies["better-sqlite3"]);
+  const inst = readFileSync(join(process.cwd(), "scripts/install-closecall-service.sh"), "utf8");
+  assert.match(inst, /v24\.21\.0/);
+  assert.match(inst, /ln -sfn "\$RT" "\$APP\/node_modules"/);
+});

@@ -1,0 +1,18 @@
+{
+  "name": "flop-closecall-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Runtime dependencies of the Close Call service ONLY (/opt/flop-closecall, Node 24.21.0). Kept apart from the repo's package.json, which Node 20.15 workers share: better-sqlite3 13 (N-API) is required on Node >= 24.19, where 11.x/12.x abort in Statement::~Statement during GC, and it needs Node >= 22.",
+  "engines": {
+    "node": ">=24.19.0 <25"
+  },
+  "dependencies": {
+    "better-sqlite3": "13.0.3",
+    "tsx": "4.23.12"
+  },
+  "allowScripts": {
+    "better-sqlite3@13.0.3": false,
+    "esbuild@0.28.2": true,
+    "fsevents": false
+  }
+}

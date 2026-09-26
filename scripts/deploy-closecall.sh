@@ -24,5 +24,5 @@ rsync "${RSYNC_FLAGS[@]}" \
 [ "${DRY_RUN:-0}" = "1" ] && { echo "dry run: nothing changed"; exit 0; }
 
 # Remote: install deps with root's nvm node, then re-run the idempotent installer (does not start/restart).
-ssh "$TARGET" "bash -lc 'set -e; export NVM_DIR=/root/.nvm; . \$NVM_DIR/nvm.sh >/dev/null; cd $VPS_PATH && npm ci --no-audit --no-fund && bash scripts/install-closecall-service.sh'"
+ssh "$TARGET" "bash -lc 'set -e; export NVM_DIR=/root/.nvm; . \$NVM_DIR/nvm.sh >/dev/null; nvm use 24.21.0 >/dev/null && cd $VPS_PATH/deploy/closecall && npm ci --no-audit --no-fund && cd $VPS_PATH && NODE_SRC=\$(command -v node) bash scripts/install-closecall-service.sh'"
 echo "deployed to $TARGET:$VPS_PATH. Restart when ready: ssh $TARGET systemctl restart flop-closecall"

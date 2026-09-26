@@ -31,6 +31,23 @@ Nothing here has been run. Every block is written to be pasted as-is.
 **Single instance:**
 - An O_EXCL pidfile plus a Linux abstract socket. A second `run` exits 4, and the wrapper refuses `run` altogether.
 
+## 0. Runtime: Node 24.21.0 + its own dependencies
+
+- Close Call runs **only** on Node 24.21.0; the TCLK workers keep nvm's default (20.15). Every command
+  below runs `nvm use 24.21.0` first, and the installer refuses any other `node`.
+- Close Call has its **own** dependency set, `deploy/closecall/package.json` + lock:
+  better-sqlite3 13.0.3 and tsx 4.23.12.
+  - It is kept apart from the repo's `package.json`, which the Node 20 workers share.
+  - better-sqlite3 11.x/12.x **abort** on Node ≥ 24.19. The failure is `Assertion failed: (env) != nullptr`
+    in `Statement::~Statement` during GC. It was seen on the VPS on 26 Sep and reproduced locally.
+  - 13.x (N-API) fixes it and needs Node ≥ 22.
+- Install it with `cd /opt/flop-closecall/deploy/closecall && npm ci`. The installer then points
+  `/opt/flop-closecall/node_modules` at it (a symlink).
+- npm 11 `allowScripts` in that manifest, all pinned:
+  - `esbuild@0.28.2` allowed;
+  - `better-sqlite3@13.0.3` denied, because the prebuilt binary ships in the package and node-gyp is not needed;
+  - `fsevents` denied.
+
 ## 1. First deploy (Mac)
 
 ```bash
