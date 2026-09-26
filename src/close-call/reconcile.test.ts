@@ -43,3 +43,20 @@ test("L1: a sweep whose five posts have not all arrived is INCOMPLETE, never OK"
   const out = reconcileReferee(db);
   assert.ok(!out.some((r) => r.n === 4 && r.status === "OK"));
 });
+
+test("L1: the rooms count is a note, never a halt -- deletions by technocore.chat and truncated lists (26 Sep, sweeps 206-297)", () => {
+  const { db } = season();
+  const listed = JSON.stringify(Array.from({ length: 152 }, (_, i) => `room${i}`));
+  db.prepare("UPDATE sweeps SET rooms = 153, rooms_new = ? WHERE n = 2").run(listed);   // 152 registered at sweep 2
+  db.prepare("UPDATE sweeps SET rooms = 76 WHERE n = 3").run();                          // sweep 206: 153 -> 76, new 0
+  const r3 = checkSweep(db, 3);
+  assert.equal(r3.status, "OK");
+  assert.match(r3.notes!.join(), /77 deleted by technocore.chat/);
+  const out = reconcileReferee(db);
+  assert.ok(!out.some((r) => r.status === "MISMATCH"), JSON.stringify(out));
+  assert.equal(haltSummary(db), null);
+  db.prepare("UPDATE sweeps SET rooms = 154 WHERE n = 3").run();                         // sweep 222: one more than listed
+  const again = checkSweep(db, 3);
+  assert.equal(again.status, "OK");
+  assert.match(again.notes!.join(), /1 more than listed/);
+});

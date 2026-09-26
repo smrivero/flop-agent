@@ -8,7 +8,7 @@
  *   room-acceptance  a room registered by this DID appears in flow.rooms. The referee only lists rooms
  *                    registered by owners (25 Sep, sweeps 60-67: 13/13 registrations by not-yet-owners
  *                    unlisted, 3/3 by owners listed, one of them with the owner registered in the SAME
- *                    sweep), and flow.rooms is never truncated (L1 rooms-delta check holds every sweep).
+ *                    sweep), flow.rooms can be truncated in a burst (26 Sep, sweep 222), so only PRESENCE counts as evidence.
  *                    Inference from observed behaviour, not a documented guarantee.
  *   probe            a probe trade of ours listed in flow.settled. Not adversary-proof if the probe id was
  *                    ever published unsettled (probe.test.ts case D) -- such a probe is rejected here.

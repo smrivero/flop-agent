@@ -44,7 +44,7 @@ const KEY_EDGES: Record<KeyStatus, KeyStatus[]> = {
  *   flow.mints        the DID is listed in a d-close1-flow post's `mints` (explicit referee statement)
  *   room-acceptance   a room registered by this DID was listed in flow.rooms (the referee only lists rooms
  *                     registered by owners -- observed 25 Sep: 13/13 non-owner registrations unlisted, 3/3
- *                     owner ones listed; flow.rooms is never truncated)
+ *                     owner ones listed; only presence in flow.rooms counts, absence proves nothing)
  *   protocol          a signed owner message, in a registered room, stamped before a sweep the referee has
  *                     published, outside every missed range, with no contrary evidence
  *   probe             a probe trade of ours involving the DID is listed in flow.settled

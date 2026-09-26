@@ -8,7 +8,11 @@
  *   applied    price.applied == price(n-1).ref.px (the seed for n = 1)
  *   limits     price.limits == [ceil(0.95*ref), floor(1.05*ref)] for sweep for == n+1
  *   owners     state.owners(n) - state.owners(n-1) == listed mints + omitted.mints
- *   rooms      state.rooms(n) - state.rooms(n-1) == new rooms in flow (1 at n = 1: close1)
+ *   rooms      NOT a halting check (a note only). The count drops whenever technocore.chat deletes idle
+ *              rooms ("a room technocore.chat deletes leaves the list", rules §5; 26 Sep, sweeps 206-297:
+ *              153 -> 76 -> 22 ...), and a burst of registrations can exceed what the 4,096-char flow post
+ *              lists (sweep 222: +136 with 135 listed). Other players' rooms never touch our books, so an
+ *              unexplained change is recorded and logged, never a MISMATCH. It halted paper for 7.5 h once.
  *   global     unchanged when nothing settled
  *   mark       pnl.mark == price.global
  * The state `root` itself cannot be recomputed: its algorithm and the per-sweep files it
@@ -32,7 +36,7 @@ interface Row {
   price_json: string | null; flow_json: string | null; positions_json: string | null; pnl_json: string | null; state_json: string | null;
 }
 
-export interface L1Result { n: number; status: "OK" | "MISMATCH" | "INCOMPLETE"; failed: string[]; checks: number }
+export interface L1Result { n: number; status: "OK" | "MISMATCH" | "INCOMPLETE"; failed: string[]; checks: number; notes?: string[] }
 
 function fileOf(json: string | null): string | null {
   if (!json) return null;
@@ -50,6 +54,7 @@ export function checkSweep(db: CcDb, n: number, windowMicro = 50_000n): L1Result
     return { n, status: "INCOMPLETE", failed: [`previous sweep ${n - 1} not fully observed`], checks: 0 };
   }
   const failed: string[] = [];
+  const notes: string[] = [];
   let checks = 0;
   const check = (name: string, ok: boolean, detail: string) => { checks++; if (!ok) failed.push(`${name}: ${detail}`); };
   const omitted = JSON.parse(row.omitted ?? "{}") as Record<string, number>;
@@ -67,12 +72,15 @@ export function checkSweep(db: CcDb, n: number, windowMicro = 50_000n): L1Result
   check("owners", row.owners !== null && row.owners - prevOwners === mints, `owners ${prevOwners} -> ${row.owners}, mints ${mints}`);
   const newRooms = (JSON.parse(row.rooms_new ?? "[]") as string[]).length;
   const prevRooms = n === 1 ? 1 : prev!.rooms ?? 0;
-  check("rooms", row.rooms !== null && row.rooms - prevRooms === newRooms, `rooms ${prevRooms} -> ${row.rooms}, new ${newRooms}`);
+  const roomsExpected = prevRooms + newRooms + (omitted.rooms ?? 0);
+  if (row.rooms !== null && row.rooms !== roomsExpected) {
+    notes.push(`rooms ${prevRooms} -> ${row.rooms}, new ${newRooms}${omitted.rooms ? ` (+${omitted.rooms} omitted)` : ""}: ${row.rooms < roomsExpected ? `${roomsExpected - row.rooms} deleted by technocore.chat` : `${row.rooms - roomsExpected} more than listed`}`);
+  }
   const settled = (row.settled_listed ?? 0) + (omitted.settled ?? 0);
   const prevGlobal = n === 1 ? seed?.price ?? null : prev!.global;
   if (settled === 0 && prevGlobal && row.global) check("global", toMicro(row.global) === toMicro(prevGlobal), `no trades but global ${prevGlobal} -> ${row.global}`);
   if (row.mark && row.global) check("mark", toMicro(row.mark) === toMicro(row.global), `mark ${row.mark} vs global ${row.global}`);
-  return { n, status: failed.length ? "MISMATCH" : "OK", failed, checks };
+  return { n, status: failed.length ? "MISMATCH" : "OK", failed, checks, notes };
 }
 
 /** Check every fully observed sweep not yet checked OK; logs and records each result. */
@@ -92,8 +100,8 @@ export function reconcileReferee(db: CcDb, opts: { recheck?: boolean; haltOnMism
       continue;
     }
     out.push(r);
-    recordReconcile(db, n, "L1-referee", r.status === "OK" ? "OK" : "MISMATCH", { checks: r.checks, failed: r.failed });
-    ccLog(r.status === "OK" ? "RECONCILE OK" : "RECONCILE MISMATCH", { level: "L1 referee", n, checks: r.checks, failed: r.failed.length ? r.failed : undefined });
+    recordReconcile(db, n, "L1-referee", r.status === "OK" ? "OK" : "MISMATCH", { checks: r.checks, failed: r.failed, notes: r.notes?.length ? r.notes : undefined });
+    ccLog(r.status === "OK" ? "RECONCILE OK" : "RECONCILE MISMATCH", { level: "L1 referee", n, checks: r.checks, failed: r.failed.length ? r.failed : undefined, notes: r.notes?.length ? r.notes : undefined });
     highest = n;
     if (r.status === "MISMATCH" && opts.haltOnMismatch !== false) {
       halt(db, "reconcile_mismatch", `L1 referee mismatch at sweep ${n}: ${r.failed.join("; ")}`);
