@@ -71,12 +71,17 @@ export async function collectLive(db: Db, cfg: CloseCallConfig, contest: Contest
 
   // room (what the RoomKeeper / bootstrap recorded; the monitor does not call technocore)
   const rh = (() => { try { return JSON.parse(meta(db, "room_health") ?? "null") as { ok: boolean; why?: string; at: string; last_seq?: number } | null; } catch { return null; } })();
+  const serverAllow = (() => { try {
+    const lr = JSON.parse(meta(db, "last_readiness") ?? "null") as { rows: ReadinessRow[] } | null;
+    const m = lr?.rows.find((x) => x.name === "room on server")?.value.match(/allow-list (\d+) DIDs/);
+    return m ? Number(m[1]) : 0;
+  } catch { return 0; } })();
   const rs = cfg.room ? q<{ status: string; owner_did: string | null }>(db, "SELECT status, owner_did FROM rooms_state WHERE name = ?", cfg.room) : undefined;
   const admin = role("admin")[0];
   const room = {
     name: cfg.room, exists: rh ? (rh.ok ? (rh.last_seq ?? 1) > 0 : false) : null,
     owner: rs?.owner_did ? (admin && rs.owner_did === admin.did ? `${admin.id}` : `${rs.owner_did.slice(0, 16)}…`) : null,
-    allowCount: allowSeen.size || null, expectedWriters: role("staging").length + strategy.length, status: rs?.status ?? (cfg.room ? "UNCREATED" : "not set"),
+    allowCount: Math.max(allowSeen.size, serverAllow) || null, expectedWriters: role("staging").length + strategy.length, status: rs?.status ?? (cfg.room ? "UNCREATED" : "not set"),
     lastRefresh: meta(db, "room_refresh_at"), generation: cfg.room ? meta(db, `room_generation:${cfg.room}`) : null,
     missing: rh ? !rh.ok : false, checkedAt: rh?.at ?? null, why: rh && !rh.ok ? rh.why ?? null : null,
   };

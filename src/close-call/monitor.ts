@@ -323,7 +323,9 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
 
   // ---- security
   const pendingWrites = q<{ n: number }>(exec, "SELECT COUNT(*) n FROM write_attempts WHERE state NOT IN ('CONFIRMED','FAILED')")?.n ?? null;
-  const nonceErrors = q<{ n: number }>(exec, "SELECT COUNT(*) n FROM write_attempts WHERE response LIKE '%nonce%' OR error LIKE '%nonce%'")?.n ?? null;
+  // Refusals that name the nonce (409 "nonce must exceed", ...). A 2xx receipt also carries a "nonce" field: not an error.
+  const nonceErrors = q<{ n: number }>(exec, `SELECT COUNT(*) n FROM write_attempts WHERE (http_status IS NULL OR http_status >= 400)
+    AND (response LIKE '%nonce%' OR error LIKE '%nonce%')`)?.n ?? null;
   const security: MonitorData["security"] = {
     executor: running ? h?.executor ?? (live ? "live" : "paper") : "stopped", writes: live && writerState(cfg).armed ? "ENABLED" : "DISABLED",
     halted: db ? halts.length > 0 : null, safeMode: !db ? "N/A" : halts.length ? "YES" : "NO",
@@ -411,7 +413,7 @@ export function ago(s: number | null): string {
 
 type Block = string[];
 
-export function render(d: MonitorData, opts: { color: boolean; width: number }): string {
+export function render(d: MonitorData, opts: { color: boolean; width: number; compact?: boolean }): string {
   const p = paint(opts.color);
   const LW = 19;
   const row = (label: string, value: string) => `${label.padEnd(LW)}${value}`;
@@ -586,6 +588,30 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
       row("nonce reconcile", v(a.nonceReconcileS === null ? null : ago(a.nonceReconcileS))), row("backup verify", v(a.backupVerifyS === null ? null : ago(a.backupVerifyS)))] : []),
   ]);
 
+  if (opts.compact) {
+    // One screen: what matters while trading. The live detail blocks collapse into one LIVE block.
+    const keep = /^(CONTEST|POSITIONS|STRATEGY K|TRADES|SAFETY|ERRORS|RECONCILE)/;
+    const kept = blocks.filter((b) => keep.test(stripAnsi(b[0])));
+    if (d.live) {
+      const L = d.live;
+      const J = L.journal.counts;
+      const bad = [...L.readiness.local, ...L.readiness.network].filter((x) => !x.ok);
+      kept.push([p.bold("LIVE"),
+        row("readiness", L.readiness.pass ? p.ok("PASS") : p.err(`FAIL ${bad[0]?.name ?? ""}`.slice(0, 26))),
+        row("keys READY", `${L.flags.READY}/${L.classes.admin.length + L.classes.staging.length + L.classes.strategy.count}${L.flags.ERROR ? p.err(` ERROR ${L.flags.ERROR}`) : ""}`),
+        row("room", `${L.room.status === "READY" ? p.ok("READY") : p.warn(L.room.status)} ${v(L.room.allowCount)}/${L.room.expectedWriters} ${L.room.missing ? p.err("MISSING") : ""}`),
+        row("nonces", L.nonces.status === "OK" && (L.nonces.mismatch ?? "0") === "0" ? p.ok("OK") : p.err(`${L.nonces.status} ${L.nonces.mismatch ?? ""}`.slice(0, 26))),
+        row("backup", L.backup.ok && L.backup.restoreOk && !L.backup.keysNewer ? p.ok("OK") : p.err("CHECK")),
+        row("journal", `pend ${L.journal.pending > 0 ? p.warn(String(L.journal.pending)) : "0"} unk ${L.journal.unknown > 0 ? p.err(String(L.journal.unknown)) : "0"} set ${J.SETTLED} void ${J.VOID} n/a ${J.NOT_APPLIED + J.NOT_POSTED}`),
+        row("last trade", `${v(L.journal.lastId)} ${v(L.journal.lastState)}`),
+        row("last POST", `${v(L.journal.lastPost?.slice(11, 19))} ${p.dim(`ref ${v(L.journal.lastReferee?.slice(11, 19))}`)}`),
+        row("clock", `${L.clock.ntp === false ? p.err("NTP NO") : "NTP"} ${v(L.clock.skew).replace(/ \(.*$/, "").replace("skew vs technocore ", "")}`),
+      ]);
+    }
+    blocks.length = 0;
+    blocks.push(...kept);
+  }
+
   // ---- header
   const at = new Date(d.at);
   const local = at.toLocaleTimeString("en-GB", { hour12: false });
@@ -645,7 +671,7 @@ export function useColor(argv: string[], stream: NodeJS.WriteStream = process.st
   return argv.includes("--color") || !!stream.isTTY;
 }
 
-export async function watch(src: MonitorSources, opts: { intervalS: number; color: boolean }): Promise<void> {
+export async function watch(src: MonitorSources, opts: { intervalS: number; color: boolean; compact?: boolean }): Promise<void> {
   const out = process.stdout;
   let stop = false;
   const restore = () => { if (out.isTTY) out.write("\x1b[?25h\x1b[0m\n"); };
@@ -661,7 +687,7 @@ export async function watch(src: MonitorSources, opts: { intervalS: number; colo
       const sd = (src.systemd ?? readSystemd)();
       const data = await collect({ ...src, now: undefined, systemd: () => sd, prev });
       if (sd?.cpuNs !== null && sd?.cpuNs !== undefined) prev = { at: data.at, cpuNs: sd.cpuNs };
-      frame = render(data, { color: opts.color, width: out.columns || 100 }) + `\n\n${opts.color ? "\x1b[2m" : ""}refresh ${opts.intervalS}s · Ctrl+C to quit · read only${opts.color ? "\x1b[0m" : ""}`;
+      frame = render(data, { color: opts.color, width: out.columns || 100, compact: opts.compact }) + `\n\n${opts.color ? "\x1b[2m" : ""}refresh ${opts.intervalS}s · Ctrl+C to quit · read only${opts.color ? "\x1b[0m" : ""}`;
     } catch (e) {
       frame = `CLOSE CALL monitor: could not collect (${(e as Error).message}); retrying`;
     }

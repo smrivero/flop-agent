@@ -494,6 +494,7 @@ export class RoomKeeper {
     if (mustBeAllowed.some((d) => !got.has(d)) || [...got].some((d) => !ourDids.has(d))) {
       return bad(`room-allow/${room} no longer matches our keys (${got.size} DIDs)`);
     }
+    setMeta(db, "room_allow_seen", JSON.stringify([...got]));
     const view = await transport.readRoom(room, 0);
     if (view.last_seq === 0) return bad(`${room} has no messages any more (deleted by technocore.chat?)`);
     // The room's epoch: a deleted-and-recreated room is a DIFFERENT room for the referee (unregistered).

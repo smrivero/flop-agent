@@ -274,6 +274,27 @@ test("LIVE ready: LIVE title, WRITES ENABLED, readiness PASS, classes, backup, r
   assert.ok(!out.includes("FAKE KEYS") && !out.includes("paper strategy state"));
 });
 
+test("LIVE --compact fits one screen; confirmed receipts are not nonce errors; allowed writers from the server read (26 Sep)", async () => {
+  const x = liveDir();
+  // 105 CONFIRMED writes whose 2xx receipts carry a "nonce" field, and one real 409 nonce refusal
+  const ins = x.db.prepare(`INSERT INTO write_attempts (attempt_id, op_key, kind, room, signer_id, nonce, payload_sha256, body, state, http_status, response, tries, created_at, updated_at)
+    VALUES (?, ?, 'owner', 'r', 'CC001', '1', 'x', '{}', ?, ?, ?, 1, ?, ?)`);
+  for (let i = 0; i < 105; i++) ins.run(`a${i}`, `op${i}`, "CONFIRMED", 200, `{"seq":${i},"nonce":"179044${i}"}`, now(), now());
+  ins.run("bad", "opbad", "FAILED", 409, "409 nonce must exceed /kv/room-nonce", now(), now());
+  x.db.prepare("UPDATE meta SET value = ? WHERE key = 'room_allow_seen'").run(JSON.stringify(["a", "b"]));
+  const lr = JSON.parse((x.db.prepare("SELECT value FROM meta WHERE key = 'last_readiness'").get() as { value: string }).value);
+  lr.rows.find((r: { name: string }) => r.name === "room on server").value = "OURS: owner CC-ADMIN, allow-list 102 DIDs, nonce 1, messages 103";
+  x.db.prepare("UPDATE meta SET value = ? WHERE key = 'last_readiness'").run(JSON.stringify(lr));
+  const full = await text(liveSrc(x));
+  assert.match(full, /nonce errors\s+1\b/, "only the 409 counts");
+  assert.match(full, /writers\s+102 allowed \/ 102 expected/);
+  const compact = render(await collect(liveSrc(x)), { color: false, width: 150, compact: true });
+  const lines = compact.split("\n");
+  assert.ok(lines.length <= 40, `compact is ${lines.length} lines`);
+  for (const s of ["CLOSE CALL — LIVE", "TRADES (REAL)", "SAFETY", "STRATEGY K", "POSITIONS", "LIVE", "readiness", "PASS", "journal", "102/102"]) assert.ok(compact.includes(s), `missing ${s}\n${compact}`);
+  for (const s of ["KEY CLASSES", "ENVIRONMENT", "LIVE JOURNAL", "  CREATED"]) assert.ok(!compact.includes(s), `compact still has ${s}`);
+});
+
 test("LIVE candidate: writer disarmed (config or kill switch) -> LIVE CANDIDATE, WRITES DISABLED, readiness FAIL", async () => {
   const x = liveDir({ strategy: 4 });
   const a = await text(liveSrc(x, { CLOSECALL_LIVE_WRITER: "disarmed" }));

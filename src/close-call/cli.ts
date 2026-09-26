@@ -7,7 +7,7 @@
  *   paper | observe | dry-run   explicit forms of the same
  * Read-only views (no lock; safe beside the running service):
  *   status [--json]    terminal monitor snapshot (monitor.ts); --json = the machine snapshot
- *   watch [--interval N] [--no-color]   the same monitor, redrawn every N s (default 5); Ctrl+C quits
+ *   watch [--interval N] [--no-color] [--compact]   the same monitor, redrawn every N s (default 5); --compact fits one screen
  *   health  positions  leaderboard  keys [--validate]  pending  report
  * Maintenance:
  *   reconcile          re-run L1 on every stored sweep and replay the paper books (L2)
@@ -126,12 +126,12 @@ async function main(argv: string[]): Promise<number> {
     const color = useColor(argv);
     const src = { cfg, contest };
     if (cmd === "status") {
-      out(render(await collect(src), { color, width: process.stdout.columns || Number(arg("--width") ?? 100) }));
+      out(render(await collect(src), { color, width: process.stdout.columns || Number(arg("--width") ?? 100), compact: argv.includes("--compact") }));
       return 0;
     }
     const interval = Number(arg("--interval") ?? "5");
     if (!Number.isFinite(interval) || interval < 1 || interval > 300) { process.stderr.write("--interval must be 1..300 seconds\n"); return 2; }
-    await watch(src, { intervalS: interval, color });
+    await watch(src, { intervalS: interval, color, compact: argv.includes("--compact") });
     return 0;
   }
 
