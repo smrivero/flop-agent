@@ -44,7 +44,7 @@ export interface MonitorData {
   hl: { px: N<string>; ageS: N<number>; time: N<string>; stale: "OK" | "STALE" | "HALT" | "N/A"; vsRefBps: N<number>; vsCloseBps: N<number>; feedAgeS: N<number> };
   env: { dataDir: string; db: string; node: string; sqlite: string; writerArmed: boolean; writerReason: string; policy: string; estimator: string };
   keys: { total: number; by: Record<string, number>; kind: "FAKE" | "REAL" | "N/A" };
-  positions: { sweep: N<number>; long: N<number>; short: N<number>; flat: N<number>; longQty: N<number>; shortQty: N<number>; cash: N<number>;
+  positions: { sweep: N<number>; markSweep: N<number>; mark: N<string>; long: N<number>; short: N<number>; flat: N<number>; longQty: N<number>; shortQty: N<number>; cash: N<number>;
     collateral: N<number>; fees: N<number>; realized: N<number>; markPnl: N<number>; top: { id: string; side: string; entry: N<string>; qty: number; score: number }[] };
   leaderboard: { sweep: N<number>; global: { who: string; score: string }[]; ours: { id: string; score: number }[]; rank: string };
   strategy: { status: string; threshold: number; lo: N<number>; hi: N<number>; nextLo: N<number>; nextHi: N<number>; pairsUsed: N<number>; pairsUnused: N<number>;
@@ -245,15 +245,20 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
   // ---- positions (latest snapshot of the book; only open keys are snapshotted)
   const book = live ? "live" : "paper";
   const pSweep = q<{ m: number | null }>(exec, "SELECT MAX(n) m FROM positions WHERE book = ?", book)?.m ?? null;
-  const prow = pSweep === null ? [] : qa<{ key_id: string; cash: string; position: string; fees: string; value: string | null; entry_px: string | null }>(exec,
-    `SELECT p.key_id, p.cash, p.position, p.fees, p.value, k.entry_px FROM positions p LEFT JOIN keys k ON k.id = p.key_id WHERE p.n = ? AND p.book = ?`, pSweep, book);
+  const prow0 = pSweep === null ? [] : qa<{ key_id: string; cash: string; position: string; fees: string; value: string | null; mark: string | null; entry_px: string | null }>(exec,
+    `SELECT p.key_id, p.cash, p.position, p.fees, p.value, p.mark, k.entry_px FROM positions p LEFT JOIN keys k ON k.id = p.key_id WHERE p.n = ? AND p.book = ?`, pSweep, book);
+  // The service snapshots the book only on sweeps where something settles: re-mark it at the latest close
+  // (an open position's value is linear in the mark: value(m) = value(m0) + position * (m - m0)).
+  const markRow = q<{ n: number; ref_px: string }>(db, "SELECT n, ref_px FROM sweeps WHERE ref_px IS NOT NULL ORDER BY n DESC LIMIT 1");
+  const prow = prow0.map((r) => (r.value !== null && r.mark !== null && markRow
+    ? { ...r, value: String(Number(r.value) + Number(r.position) * (Number(markRow.ref_px) - Number(r.mark))) } : r));
   const longs = prow.filter((r) => Number(r.position) > 0);
   const shorts = prow.filter((r) => Number(r.position) < 0);
   const sum = (xs: number[]) => +xs.reduce((a, b) => a + b, 0).toFixed(2);
   const scored = prow.map((r) => ({ id: r.key_id, side: Number(r.position) > 0 ? "LONG" : "SHORT", entry: r.entry_px, qty: Math.abs(Number(r.position)),
     score: +((Number(r.value ?? 10_000) - 10_000).toFixed(2)) })).sort((a, b) => b.score - a.score);
   const positions: MonitorData["positions"] = {
-    sweep: pSweep, long: exec ? longs.length : null, short: exec ? shorts.length : null, flat: exec && total ? total - longs.length - shorts.length : null,
+    sweep: pSweep, markSweep: markRow && pSweep !== null ? markRow.n : null, mark: markRow && pSweep !== null ? markRow.ref_px : null, long: exec ? longs.length : null, short: exec ? shorts.length : null, flat: exec && total ? total - longs.length - shorts.length : null,
     longQty: exec ? sum(longs.map((r) => Number(r.position))) : null, shortQty: exec ? sum(shorts.map((r) => -Number(r.position))) : null,
     cash: prow.length ? sum(prow.map((r) => Number(r.cash))) : null,
     collateral: prow.length && prow.every((r) => r.entry_px) ? sum(prow.map((r) => Math.abs(Number(r.position)) * Number(r.entry_px))) : null,
@@ -471,7 +476,7 @@ export function render(d: MonitorData, opts: { color: boolean; width: number; co
   ]);
 
   const ps = d.positions;
-  blocks.push([p.bold(`POSITIONS${d.trades.simulated ? " (paper)" : ""}`) + p.dim(ps.sweep !== null ? ` @${ps.sweep}` : ""),
+  blocks.push([p.bold(`POSITIONS${d.trades.simulated ? " (paper)" : ""}`) + p.dim(ps.sweep !== null ? ` @${ps.sweep}${ps.mark !== null && ps.markSweep !== ps.sweep ? ` marked @${ps.markSweep} ${ps.mark}` : ""}` : ""),
     row("long keys", v(ps.long)), row("short keys", v(ps.short)), row("flat keys", v(ps.flat)),
     row("long qty", v(ps.longQty)), row("short qty", v(ps.shortQty)),
     row("cash (open)", v(ps.cash)), row("collateral", v(ps.collateral)), row("fees", v(ps.fees)),
