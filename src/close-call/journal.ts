@@ -48,7 +48,7 @@ export interface WriteOp {
 export class TransportTimeout extends Error {}
 
 export interface TransportResponse { status: number; text: string }
-export interface RoomMessage { seq: number; from: string; text: string; nonce?: string }
+export interface RoomMessage { seq: number; from: string; text: string; nonce?: string; ts?: string }
 
 export interface Transport {
   post(path: string, body: unknown): Promise<TransportResponse>;
@@ -179,10 +179,32 @@ export class WriteJournal {
       const counter = await this.transport.readNote("room-nonce", op.room);
       return { present: value !== null && value === req.body.value && !!counter && BigInt(counter) >= BigInt(req.body.nonce), serverNonce: counter ? BigInt(counter) : 0n };
     }
-    const view = await this.transport.readRoom(op.room, 0);
-    const mine = view.messages.filter((m) => m.from === req.body.did);
+    const mine = await this.readMine(op.room, req.body.did);
     const serverNonce = mine.reduce((mx, m) => (m.nonce && BigInt(m.nonce) > mx ? BigInt(m.nonce) : mx), 0n);
     return { present: mine.some((m) => m.text === req.body.text), serverNonce };
+  }
+
+  /** Every message by `did` still in the room's history, paging forward (busy rooms like close1 hold thousands). */
+  private async readMine(room: string, did: string, maxPages = 100): Promise<RoomMessage[]> {
+    const mine: RoomMessage[] = [];
+    let since = 0;
+    for (let page = 0; page < maxPages; page++) {
+      const view = await this.transport.readRoom(room, since);
+      mine.push(...view.messages.filter((m) => m.from === did));
+      if (!view.messages.length || view.messages.length < 200) return mine;
+      since = view.messages[view.messages.length - 1].seq;
+    }
+    throw new Error(`read-back of ${room} did not reach the end in ${maxPages} pages`);
+  }
+
+  /** Where a CONFIRMED message landed: its seq and server timestamp (needed as mint evidence). */
+  async locate(row: AttemptRow): Promise<RoomMessage | null> {
+    const op = this.opOf(row);
+    if (op.kind === "note-owners" || op.kind === "note-allow") return null;
+    const req = this.request(row);
+    const mine = (await this.readMine(op.room, req.body.did)).filter((m) => m.text === req.body.text);
+    // Same text can appear more than once (a deliberate repost): the nonce identifies THIS attempt.
+    return mine.find((m) => m.nonce === req.body.nonce) ?? (mine.length === 1 ? mine[0] : null);
   }
 
   /** Resolve an UNKNOWN / SENDING / refused row without ever creating a duplicate. */

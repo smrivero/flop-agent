@@ -85,3 +85,19 @@ test("the CLI exposes no register, room or trade command", () => {
     assert.ok(!/register|trade|claim|LIVE_ENABLED|MODE=live/.test(k + v), `${k}: ${v}`);
   }
 });
+
+test("the live writer exists but is NOT connected: cli-live refuses the real bootstrap", () => {
+  const live = readFileSync(join(DIR, "live/cli-live.ts"), "utf8");
+  assert.match(live, /export const LIVE_WRITER_CONNECTED = false;/, "flipping this is the go-live change and must be reviewed");
+  assert.match(live, /if \(!LIVE_WRITER_CONNECTED\) \{[\s\S]{0,200}NO WRITE[\s\S]{0,80}return 3;/);
+  for (const { rel, text } of runtime()) {
+    assert.ok(!/HttpTransport|loadSigners|generateKeys|loadFileSigner/.test(code(text)), `${rel} reaches live-only code`);
+  }
+});
+
+test("paper mode cannot reach a signer: the paper CLI and service never import live/, keygen, or a key file", () => {
+  for (const f of ["cli.ts", "run.ts", "paper.ts", "bootstrap.ts"]) {
+    const t = readFileSync(join(DIR, f), "utf8");
+    assert.ok(!/from "\.\/live\//.test(t) && !/testing\//.test(t), `${f} imports live/ or testing/`);
+  }
+});

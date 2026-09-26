@@ -11,7 +11,14 @@ if [ "${LOCAL:-0}" = "1" ]; then
   [ -n "$FILE" ] || { echo "usage: LOCAL=1 $0 <backup.sqlite3 | secrets.tar.age>" >&2; exit 2; }
   case "$FILE" in *.tar.age)
     : "${AGE_IDENTITY:?set AGE_IDENTITY to your age identity file}"
-    age -d -i "$AGE_IDENTITY" "$FILE" | tar -tvf - && echo "secrets archive decrypts and lists: $FILE (not extracted)"
+    RT=$(mktemp -d); chmod 700 "$RT"; trap 'rm -rf "$RT"' EXIT
+    age -d -i "$AGE_IDENTITY" "$FILE" | tar -C "$RT" -xf -
+    KD="$RT/var/lib/flop-closecall/keys"
+    [ -d "$KD" ] || { echo "no var/lib/flop-closecall/keys in the archive" >&2; exit 1; }
+    [ -f "$RT/etc/flop-closecall/closecall.env" ] && echo "env file present in the archive"
+    npx tsx src/close-call/live/cli-live.ts restore-verify "$KD"
+    echo "decrypted copy deleted on exit. Paste the VERIFY CODE on the VPS:"
+    echo "  flop-closecall keys --backup-verify --archive $(basename "$FILE") --code <VERIFY CODE>"
     exit 0;; esac
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
   cp "$FILE" "$TMP/restore.sqlite3"

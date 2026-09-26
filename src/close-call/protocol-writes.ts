@@ -16,6 +16,7 @@
  */
 
 import { createHash } from "node:crypto";
+import { makerSigningString, takerSigningString, tradeMessageText, TRADE_ID_RE, type Terms } from "./protocol.js";
 
 export const NAME_RE = /^[a-z0-9][a-z0-9_-]{0,47}$/;
 export const NONCE_RE = /^[0-9]{1,19}$/;
@@ -77,3 +78,29 @@ export function buildSignedNote(signer: Signer, ns: typeof OWNERS_NS | typeof AL
 }
 
 export const sha256Hex = (s: string) => createHash("sha256").update(s, "utf8").digest("hex");
+
+// ------------------------------------------------------------------ trades (both signatures, then ONE message)
+
+
+export interface SignedTrade { terms: Terms; makerSig: string; takerSig: string; text: string }
+
+/**
+ * Maker signs `close-1|terms|<canonical terms>`, taker signs `close-1|accept|<canonical terms>|<taker did>`
+ * (both verified against 64 real trades, protocol.test.ts). We always name the taker: a "taker":"any"
+ * trade could be countersigned by anyone who sees it.
+ */
+export function buildSignedTrade(maker: Signer, taker: Signer, terms: Terms): SignedTrade {
+  check(TRADE_ID_RE.test(terms.id), `bad trade id ${terms.id}`);
+  check(terms.maker === maker.did, "terms.maker is not the maker signer's did");
+  check(terms.taker === taker.did, "terms.taker must name our taker key (never \"any\")");
+  check(terms.side === "buy" || terms.side === "sell", "side must be buy | sell");
+  check(/^\d+\.\d{2}$/.test(terms.px) && /^\d+\.\d{2}$/.test(terms.qty), "px and qty must have exactly two decimals");
+  check(Number(terms.qty) >= 0.1, "qty must be at least 0.10");
+  check(Number.isInteger(terms.until) && terms.until > 0, "until must be a sweep number");
+  const makerSig = maker.sign(makerSigningString(terms));
+  const takerSig = taker.sign(takerSigningString(terms, taker.did));
+  check(SIG_RE.test(makerSig) && SIG_RE.test(takerSig), "signer returned a malformed signature");
+  const text = tradeMessageText(terms, taker.did, makerSig, takerSig);
+  check(text.length <= MAX_MESSAGE_CHARS, "trade message exceeds the message cap");
+  return { terms, makerSig, takerSig, text };
+}

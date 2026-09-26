@@ -72,7 +72,7 @@ export class MockTechnocore implements Transport {
     this.lastNonce.set(k, BigInt(b.nonce));
     const msgs = this.rooms.get(room) ?? [];
     const seq = msgs.length + 1;
-    msgs.push({ seq, from: b.did, text, nonce: b.nonce });
+    msgs.push({ seq, from: b.did, text, nonce: b.nonce, ts: new Date(t).toISOString() });
     this.rooms.set(room, msgs);
     return { status: 200, text: JSON.stringify({ ok: true, seq }) };
   }
@@ -100,7 +100,7 @@ export class MockTechnocore implements Transport {
   }
 
   async readRoom(room: string, since: number) {
-    const msgs = (this.rooms.get(room) ?? []).filter((m) => m.seq > since);
+    const msgs = (this.rooms.get(room) ?? []).filter((m) => m.seq > since).slice(0, 200);
     return { first_seq: msgs[0]?.seq ?? null, last_seq: this.rooms.get(room)?.length ?? 0, messages: msgs };
   }
 

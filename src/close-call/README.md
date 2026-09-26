@@ -1,19 +1,28 @@
 # Close Call (close-1) — observe / paper / dry-run, 24/7 paper service
 
-`src/close-call/` follows the FLOP Close Call contest and paper-trades Strategy K with fake keys. **This build
-cannot write to Technocore.**
-- The write machinery (journal, pure protocol-write builders, probe and room planners) is exercised only
-  against the in-memory `testing/mock-technocore.ts`.
-- The real signer and HTTP transport live in `live/` and are imported by nothing; `guard.test.ts` fails if
-  anything outside `live/` or tests reaches them.
-- `CLOSECALL_MODE=live` needs `CLOSECALL_LIVE_ENABLED=<exact ack>` too, and even then the CLI refuses
-  (exit 3, "NO WRITE").
+`src/close-call/` follows the FLOP Close Call contest and paper-trades Strategy K with fake keys. The live
+writer is **implemented but not connected: this build cannot write to Technocore.**
+- Implemented: key generation, signing, nonces, room claim, allow-list, owner and room registration, maker
+  and taker signatures, trade publishing, the persistent write journal, and idempotent retry/recovery
+  (`bootstrap.ts`, `journal.ts`, `protocol-writes.ts`, `live/`).
+- It runs only against the in-memory `testing/mock-technocore.ts`, in tests and `closecall:bootstrap-dry-run`.
+- `live/cli-live.ts` refuses the real bootstrap while `LIVE_WRITER_CONNECTED = false` (exit 3, "NO WRITE").
+  Flipping it is the reviewed go-live change, and it still needs `CLOSECALL_MODE=live` plus the exact
+  `CLOSECALL_LIVE_ENABLED` ack plus the backup gate.
+- Paper mode cannot reach any of it: `cli.ts`, `run.ts` and `paper.ts` never import `live/`, and
+  `guard.test.ts` fails if any runtime file does.
+
+**Keys.** Close Call uses its own new keys CC001..CC100.
+- Any did:key may register once, any time until the lock, and each owner gets 10,000 POLF.
+- The project's A/B identities are **not** used for Close Call and are **not** a limitation here. That
+  restriction belonged to the Sonnet challenge.
 
 VPS deployment, monitoring and backups: [`deploy/closecall/DEPLOY.md`](../../deploy/closecall/DEPLOY.md).
 
 It shares nothing with mentions/radar, debate, tclk or sonnet. It has its own SQLite file, its own env
 prefix, its own vendored package and its own `closecall:*` scripts. It does not import `src/technocore.ts`
-or `src/identity.ts`; only a test uses `identity.ts` to verify real public signatures.
+or `src/identity.ts` from runtime code; only `live/`, `testing/` and tests use `identity.ts` (did:key
+encoding, verification and, in `live/keygen.ts`, generation).
 
 ## Commands
 
@@ -124,7 +133,8 @@ UNUSED -> GENERATED -> REGISTER_PENDING -> MINT_EXPECTED -> [PROBE_PENDING ->] M
 (any -> ERROR)
 ```
 
-`MINT_CONFIRMED` needs evidence the configured policy accepts (`CLOSECALL_CONFIRMATION_POLICY`, default STRICT):
+`MINT_CONFIRMED` needs evidence the configured policy accepts (`CLOSECALL_CONFIRMATION_POLICY`). The default is **PROTOCOL**, the operator's choice for live; STRICT and
+PROBE stay available for diagnosis and fallback:
 
 | source | meaning | STRICT | PROTOCOL | PROBE |
 |---|---|---|---|---|
@@ -247,16 +257,76 @@ Plus 2 writes per ownership refresh (every 5 days) and optional probes.
   - PROBE adds 1–2 more.
   - Choosing a policy is the operator's decision.
 
+## Live preparation (implemented, not connected)
+
+**Backup gate (`backup-gate.ts`).** No real key is generated, and no live write happens, until an
+age-encrypted backup of exactly the current key files has been decrypted and checked on the operator's Mac.
+The VPS knows only the age **public** key.
+
+1. `closecall-backup.sh`:
+   - creates `keys/BACKUP-CANARY` once;
+   - runs `tar(keys/, env) | age -r <recipient>` into `secrets-<ts>.tar.age`;
+   - records `secrets-<ts>.manifest.json` with the archive sha256, every key file's sha256 and the
+     canary's sha256.
+2. Mac: `LOCAL=1 AGE_IDENTITY=… closecall-restore-check.sh secrets-….tar.age`
+   - decrypts into a private temp dir;
+   - reloads and self-tests every key (seed → did, sign → verify);
+   - prints a **VERIFY CODE** (canary + digest of the key-file set);
+   - deletes the decrypted copy.
+3. VPS: `flop-closecall keys --backup-verify --archive … --code …`.
+   - Only someone who decrypted the archive knows the canary.
+   - The gate stays open only while the archive is unchanged and the key files on disk are **exactly** the
+     verified set. New keys close the gate until they are backed up and verified too.
+
+**Key generation (`live/keygen.ts`, `flop-closecall live keygen --total N --i-understand-these-are-real-keys`).**
+- It generates only the missing ids up to N.
+- Each key is a `{did, seedHex}` file created with O_EXCL (never overwritten), 0600 in a 0700 dir, fsynced,
+  then reloaded and self-tested.
+- The live DB (`live.sqlite3`, separate from the paper DB) stores did + path only.
+- It refuses a paper DB and refuses without the gate.
+
+**Bootstrap (`bootstrap.ts`).**
+- It runs one idempotent `step()` at a time, re-deriving its position from the DB and the server.
+- Every write goes through the journal: persisted and signed before the network, read back before any
+  resend. An UNKNOWN write is resolved by read-back on the spot, and anything still ambiguous halts.
+
+| # | step | evidence to move on |
+|---|---|---|
+| 1 | claim `room-owners/<room>` = CC001 (if_absent; only while the room is empty) | note reads back = CC001 |
+| 2 | allow-list = CC002..CCN (one note; grows when keys are added) | note reads back exactly; a foreign DID halts |
+| 3 | CC001 `owner` in close1 | message located (seq, ts) |
+| 4 | CC001 MINT_CONFIRMED | PROTOCOL: stamped sweep published, not in `missed` (a missed message is reposted, max 3) |
+| 5 | `room` of our room in close1, by CC001 | message located |
+| 6 | room in `flow.rooms` | REGISTER_CONFIRMED → READY |
+| 7 | CC002..CCN `owner` in **our** room, paced to `CLOSECALL_WRITE_BUDGET_FRACTION` of the live write limit | each located |
+| 8 | each key MINT_CONFIRMED → READY | PROTOCOL evidence |
+| 9 | test trade 0.10 CC001→CC002 (taker named, both signatures) in our room | settled in flow; void/expired/ambiguous halt for a manual look |
+
+After that, every `CLOSECALL_ROOM_REFRESH_DAYS` it re-signs both notes with their current values. Before
+doing so it reads them, and any foreign value halts.
+
+**Dry-run.** `npm run closecall:bootstrap-dry-run` (or `flop-closecall live bootstrap --dry-run --faults --miss-first`)
+runs the real state machine, journal and signing code against the in-memory server and a simulated referee
+that follows the published rules. It uses throwaway in-memory keys; mints are never listed, as seen live.
+- Measured: 2 keys = 6 POSTs; 2 → 100 keys = 99 more (one allow rewrite + 98 owners).
+- With faults (lost requests, timeouts after commit, a crash after planning, CC001's message missed by the
+  referee): no duplicate, every write CONFIRMED, test trade settled once.
+- Under STRICT with unlisted mints, CC001 waits indefinitely and nothing else is written.
+
 ## Plan to production
 
-Done: paper service hardening (lock, journal, safe mode, health, alerts, logs, backups), the systemd unit, and
-the deploy/install/backup scripts, none of them executed.
+Done:
+- paper service on the VPS;
+- live writer implemented and tested offline, **not connected**.
 
-Still to do:
+Gate to live:
 
-1. Deploy paper to the VPS (`deploy/closecall/DEPLOY.md`) and run ≥ 24 h. Watch halts, error bps, voids,
-   L1/L2 and memory.
-2. Choose the mint confirmation policy (STRICT / PROTOCOL / PROBE).
-3. Separately reviewed: wire `live/` into the CLI behind the double switch, generate real keys offline, and
-   set up the encrypted key backup **before** the first key exists.
-4. Run the bootstrap one step at a time, with the user's go-ahead for each step.
+1. 24 h paper on the VPS, clean on uptime, gaps, reconcile, estimated_close, stale data, triggers,
+   settled/void, memory and SQLite/log growth.
+2. age key pair on the Mac, recipient in the env, then backup → Mac restore-check → `keys --backup-verify`.
+3. Reviewed go-live change (`LIVE_WRITER_CONNECTED = true`), `CLOSECALL_ROOM` chosen, `CLOSECALL_MODE=live`
+   plus the ack.
+4. **2 real keys** → backup + verify → bootstrap until the 0.10 test trade settles → validate against the
+   referee.
+5. Keys up to **100** → backup + verify → bootstrap (allow-list rewrite + 98 owners) → mints.
+6. Only then, Strategy K on real keys.

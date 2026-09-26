@@ -3,7 +3,8 @@
  *
  *   data/close-call/keys/          mode 700, owned by the service user
  *   data/close-call/keys/CCnnn.json  mode 600, owned by the service user
- *   data/close-call/backups/keys-*.tar.gz.age|.gpg   an ENCRYPTED backup newer than the newest key file
+ *   data/close-call/backups/secrets-*.tar.age (or keys-*.age|.gpg)   an ENCRYPTED backup newer than the newest key file
+ *   data/close-call/keys/BACKUP-CANARY   backup-verification canary (backup-gate.ts), 600
  *
  * `closecall:keys --validate` prints this report. Plaintext archives of the key directory are
  * reported as a problem, never as a backup.
@@ -39,8 +40,9 @@ export function validateKeyDir(dir: string, backupDir: string, uid = typeof proc
   for (const name of readdirSync(dir)) {
     const f = statSync(join(dir, name));
     if (!f.isFile()) continue;
-    newest = Math.max(newest, f.mtimeMs);
     const ok = (f.mode & 0o077) === 0;
+    if (name === "BACKUP-CANARY") { if (!ok) problems.push(`${name}: mode ${mode(f.mode)} (must be 600)`); continue; }
+    newest = Math.max(newest, f.mtimeMs);
     const ownerOk = uid === null || f.uid === uid;
     r.files.push({ name, mode: mode(f.mode), ok, ownerOk });
     if (!ok) problems.push(`${name}: mode ${mode(f.mode)} (must be 600)`);
@@ -48,7 +50,7 @@ export function validateKeyDir(dir: string, backupDir: string, uid = typeof proc
     if (!/^CC\d{3}\.json$/.test(name)) problems.push(`${name}: unexpected file in the key directory`);
   }
   if (existsSync(backupDir)) {
-    const all = readdirSync(backupDir).filter((f) => f.startsWith("keys-"));
+    const all = readdirSync(backupDir).filter((f) => /^(keys|secrets)-/.test(f) && !f.endsWith(".manifest.json"));
     r.backup.plaintextFound = all.filter((f) => !/\.(age|gpg)$/.test(f));
     const enc = all.filter((f) => /\.(age|gpg)$/.test(f)).map((f) => ({ f, t: statSync(join(backupDir, f)).mtimeMs })).sort((a, b) => b.t - a.t);
     if (enc[0]) {

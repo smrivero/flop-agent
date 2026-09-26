@@ -43,6 +43,7 @@
     "closecall:observe": "tsx src/close-call/cli.ts observe",
     "closecall:dry-run": "tsx src/close-call/cli.ts dry-run",
     "closecall:status": "tsx src/close-call/cli.ts status",
+    "closecall:watch": "tsx src/close-call/cli.ts watch",
     "closecall:health": "tsx src/close-call/cli.ts health",
     "closecall:positions": "tsx src/close-call/cli.ts positions",
     "closecall:leaderboard": "tsx src/close-call/cli.ts leaderboard",
@@ -54,6 +55,8 @@
     "closecall:restore-check": "tsx src/close-call/cli.ts restore-check",
     "closecall:unhalt": "tsx src/close-call/cli.ts unhalt",
     "closecall:bootstrap-plan": "tsx src/close-call/cli.ts bootstrap-plan",
+    "closecall:live": "tsx src/close-call/live/cli-live.ts",
+    "closecall:bootstrap-dry-run": "tsx src/close-call/live/cli-live.ts bootstrap --dry-run",
     "test": "node --import tsx --test src/*.test.ts src/mentions/*.test.ts src/mentions/ai/*.test.ts src/debate/*.test.ts src/verifier/*.test.ts src/tclk/*.test.ts src/tclk-marketplace/*.test.ts src/protocol-watcher/*.test.ts src/protocol-watcher/normalize/*.test.ts src/protocol-watcher/extract/*.test.ts src/protocol-watcher/summary/*.test.ts src/protocol-watcher/notify/*.test.ts src/sonnet/*.test.ts src/close-call/*.test.ts src/close-call/strategy/*.test.ts",
     "test:sonnet": "node --import tsx --test src/sonnet/*.test.ts",
     "test:closecall": "node --import tsx --test src/close-call/*.test.ts src/close-call/strategy/*.test.ts"
@@ -70,5 +73,10 @@
     "@types/node": "^20.14.0",
     "tsx": "^4.16.2",
     "typescript": "^5.5.4"
+  },
+  "allowScripts": {
+    "better-sqlite3@11.10.0": true,
+    "esbuild@0.28.2": true,
+    "fsevents": false
   }
 }

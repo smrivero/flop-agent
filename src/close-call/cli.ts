@@ -6,7 +6,9 @@
  *                live is refused in this build even when both live settings are present.
  *   paper | observe | dry-run   explicit forms of the same
  * Read-only views (no lock; safe beside the running service):
- *   status  health  positions  leaderboard  keys [--validate]  pending  report
+ *   status [--json]    terminal monitor snapshot (monitor.ts); --json = the machine snapshot
+ *   watch [--interval N] [--no-color]   the same monitor, redrawn every N s (default 5); Ctrl+C quits
+ *   health  positions  leaderboard  keys [--validate]  pending  report
  * Maintenance:
  *   reconcile          re-run L1 on every stored sweep and replay the paper books (L2)
  *   backup             consistent online SQLite backup into data/close-call/backups/
@@ -15,7 +17,7 @@
  * Options: --minutes N (service commands stop after N minutes), --json.
  */
 
-import { existsSync, readdirSync, statSync, unlinkSync } from "node:fs";
+import { existsSync, readdirSync, readFileSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 import { CloseCallConfigError, loadCloseCallConfig } from "./config.js";
@@ -26,6 +28,8 @@ import { HyperliquidObserver } from "./hyperliquid.js";
 import { listKeys } from "./keys.js";
 import { validateKeyDir } from "./keystore.js";
 import { bootstrapPlan, fetchLimits } from "./limits.js";
+import { backupGate, ensureCanary, recordBackup, recordVerification } from "./backup-gate.js";
+import { collect, render, useColor, watch } from "./monitor.js";
 import { acquireLock, LockHeldError } from "./lock.js";
 import { ccLog, setLogSink } from "./logger.js";
 import { RefereeObserver } from "./observer.js";
@@ -38,7 +42,17 @@ import { snapshot } from "./status.js";
 import { backupDb, openCloseCallDb, SCHEMA_VERSION } from "./store.js";
 
 export const COMMANDS = ["run", "paper", "observe", "dry-run", "status", "health", "positions", "leaderboard", "keys", "pending", "report",
-  "reconcile", "backup", "restore-check", "unhalt", "bootstrap-plan"] as const;
+  "reconcile", "backup", "restore-check", "unhalt", "bootstrap-plan", "watch"] as const;
+
+/** KEY=VALUE lines of the service env file, if readable (the monitor uses it when run by hand). */
+function serviceEnv(path = "/etc/flop-closecall/closecall.env"): Record<string, string> {
+  try {
+    return Object.fromEntries(readFileSync(path, "utf8").split("\n").map((l) => l.trim()).filter((l) => l && !l.startsWith("#") && l.includes("="))
+      .map((l) => [l.slice(0, l.indexOf("=")).trim(), l.slice(l.indexOf("=") + 1).trim().replace(/^"(.*)"$/, "$1")]));
+  } catch {
+    return {};
+  }
+}
 
 const out = (v: unknown) => process.stdout.write((typeof v === "string" ? v : JSON.stringify(v, null, 2)) + "\n");
 
@@ -50,6 +64,9 @@ async function main(argv: string[]): Promise<number> {
   }
   const arg = (name: string) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
   const env = { ...process.env };
+  // Monitor run by hand on the VPS (`npm run closecall:watch` as root): read the service's env file so it
+  // looks at the same data dir. Only fills variables that are not already set; never writes anything.
+  if ((cmd === "watch" || cmd === "status") && !env.CLOSECALL_DATA_DIR) Object.assign(env, { ...serviceEnv(), ...env });
   if (cmd === "paper" || cmd === "observe" || cmd === "dry-run") env.CLOSECALL_MODE = cmd;   // an explicit command always wins; `run` follows CLOSECALL_MODE
   const cfg = loadCloseCallConfig(env);
   const contest = loadContest(cfg.vendorRoot);
@@ -98,10 +115,24 @@ async function main(argv: string[]): Promise<number> {
     return integrity === "ok" ? 0 : 1;
   }
 
+  // Read-only monitor: never opens the DB for writing (no migration, no lock).
+  if (cmd === "watch" || (cmd === "status" && !argv.includes("--json"))) {
+    const color = useColor(argv);
+    const src = { cfg, contest };
+    if (cmd === "status") {
+      out(render(await collect(src), { color, width: process.stdout.columns || Number(arg("--width") ?? 100) }));
+      return 0;
+    }
+    const interval = Number(arg("--interval") ?? "5");
+    if (!Number.isFinite(interval) || interval < 1 || interval > 300) { process.stderr.write("--interval must be 1..300 seconds\n"); return 2; }
+    await watch(src, { intervalS: interval, color });
+    return 0;
+  }
+
   const db = openCloseCallDb(cfg.dbPath);
   try {
     switch (cmd) {
-      case "status": out(snapshot(db)); return 0;
+      case "status": out(snapshot(db)); return 0;           // --json: the machine-readable snapshot
       case "health": {
         const rt: RuntimeState = { startedAt: Date.now(), observer: "stopped", observerLastOkAt: null, strategy: "disabled", executor: "disabled", lastError: null, reconnects: 0, timeouts: 0 };
         const h = health(db, cfg, contest, rt);
@@ -122,6 +153,32 @@ async function main(argv: string[]): Promise<number> {
         return 0;
       }
       case "keys": {
+        // Backup gate (backup-gate.ts). State lives in the LIVE database; no key content is read except to hash it.
+        if (argv.includes("--backup-canary") || argv.includes("--record-backup") || argv.includes("--backup-verify") || argv.includes("--gate")) {
+          const live = openCloseCallDb(cfg.liveDbPath);
+          try {
+            const g = { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient };
+            if (argv.includes("--backup-canary")) { out(ensureCanary(cfg.keysDir)); return 0; }
+            if (argv.includes("--record-backup")) {
+              if (!cfg.backupAgeRecipient) { process.stderr.write("CLOSECALL_BACKUP_AGE_RECIPIENT is not set\n"); return 2; }
+              const m = recordBackup(cfg.keysDir, arg("--record-backup")!, cfg.backupAgeRecipient, Number(arg("--started")));
+              ccLog("BACKUP", { archive: m.archive, keys: m.files.length }, "encrypted key backup recorded: verify it on the Mac, then keys --backup-verify");
+              out({ archive: m.archive, keys: m.files.length, files_digest: m.files_digest });
+              return 0;
+            }
+            if (argv.includes("--backup-verify")) {
+              const v = recordVerification(live, cfg.backupDir, arg("--archive") ?? "", arg("--code") ?? "");
+              ccLog("BACKUP", { archive: v.archive, keys: v.files.length }, "backup verified by the operator's restore check");
+              out({ verified: v.archive, keys: v.files.length, gate: backupGate(live, g) });
+              return 0;
+            }
+            const r = backupGate(live, g);
+            out(r);
+            return r.ok ? 0 : 1;
+          } finally {
+            live.close();
+          }
+        }
         if (argv.includes("--validate")) {
           const r = validateKeyDir(cfg.keysDir, cfg.backupDir);
           out(r);

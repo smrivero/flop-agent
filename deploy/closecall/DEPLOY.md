@@ -74,7 +74,20 @@ A restart is safe:
 - on start, the fold replays the paper book and reconciles;
 - a restart after a crash raises a `process_restart` alert (`clean_stop=0`).
 
-## 4. Monitoring from the Mac
+## 4. Monitoring
+
+**On the VPS (recommended): the terminal monitor.** It is read only: SQLite readonly, `/health`, `systemctl show`, never Technocore/Hyperliquid, never a write.
+
+```bash
+flop-closecall watch
+```
+
+- `flop-closecall watch --interval 2` refreshes every 2 s (default 5); Ctrl+C quits.
+- `flop-closecall status` prints one snapshot; `status --json` gives the machine snapshot.
+- Same from the code dir: `cd /opt/flop-closecall && npm run closecall:watch` (it reads `/etc/flop-closecall/closecall.env` for the data dir).
+- `--no-color` or `NO_COLOR=1` for plain text.
+
+### From the Mac (optional)
 
 | what | command |
 |---|---|
@@ -131,7 +144,7 @@ ssh root@srv792559 'flop-closecall status | head -30 && flop-closecall unhalt --
 - The age identity (private) lives only on your Mac; the VPS holds only the recipient (public).
 - Losing the owner keys means a winner cannot sign the prize claim. The encrypted off-host copy is mandatory **before** any real key exists.
 
-**One-time setup on the Mac.** Do this only when real keys are close. It needs `brew install age`.
+**One-time setup on the Mac.** It is required before the first real key exists, and it needs `brew install age`.
 
 ```bash
 mkdir -p ~/.config/age && age-keygen -o ~/.config/age/flop-closecall.txt && chmod 600 ~/.config/age/flop-closecall.txt && grep 'public key' ~/.config/age/flop-closecall.txt
@@ -163,7 +176,8 @@ On the Mac, for a pulled SQLite copy:
 cd ~/Documents/GitHub/flop/flop-agent && LOCAL=1 bash scripts/closecall-restore-check.sh "$(ls -1t ~/flop-closecall-backups/close-call-*.sqlite3 | head -1)"
 ```
 
-On the Mac, for the secrets archive (lists its contents, extracts nothing):
+On the Mac, for the secrets archive. It decrypts into a private temp dir, checks every key, prints the
+**VERIFY CODE** and deletes the copy:
 
 ```bash
 cd ~/Documents/GitHub/flop/flop-agent && LOCAL=1 AGE_IDENTITY=~/.config/age/flop-closecall.txt bash scripts/closecall-restore-check.sh "$(ls -1t ~/flop-closecall-backups/secrets-*.tar.age | head -1)"
@@ -174,6 +188,40 @@ cd ~/Documents/GitHub/flop/flop-agent && LOCAL=1 AGE_IDENTITY=~/.config/age/flop
 ```bash
 systemctl stop flop-closecall && cp -a /var/lib/flop-closecall/close-call.sqlite3 /var/lib/flop-closecall/backups/pre-restore-$(date -u +%Y%m%dT%H%M%SZ).sqlite3 && rm -f /var/lib/flop-closecall/close-call.sqlite3-wal /var/lib/flop-closecall/close-call.sqlite3-shm && install -m 0600 -o flopcc -g flopcc /var/lib/flop-closecall/backups/close-call-<STAMP>.sqlite3 /var/lib/flop-closecall/close-call.sqlite3 && flop-closecall restore-check /var/lib/flop-closecall/close-call.sqlite3 && systemctl start flop-closecall
 ```
+
+## 5b. Backup gate: required before any real key
+
+`keygen` and every live write stay refused until this passes. You run it once now, and again after each
+key generation.
+
+1. **VPS:** a backup with the recipient already in the env.
+
+```bash
+bash /opt/flop-closecall/scripts/closecall-backup.sh && flop-closecall keys --gate
+```
+
+2. **Mac:** pull the backup and check it.
+
+```bash
+mkdir -p ~/flop-closecall-backups && chmod 700 ~/flop-closecall-backups && rsync -av root@srv792559:/var/lib/flop-closecall/backups/ ~/flop-closecall-backups/ && cd ~/Documents/GitHub/flop/flop-agent && LOCAL=1 AGE_IDENTITY=~/.config/age/flop-closecall.txt bash scripts/closecall-restore-check.sh "$(ls -1t ~/flop-closecall-backups/secrets-*.tar.age | head -1)"
+```
+
+3. **VPS:** paste the archive name and the VERIFY CODE printed on the Mac.
+
+```bash
+flop-closecall keys --backup-verify --archive secrets-<STAMP>.tar.age --code <VERIFY CODE> && flop-closecall live status
+```
+
+`live status` must show `backup_gate.ok: true`.
+
+## 5c. Live preparation (the writer is NOT connected)
+
+| what | command (VPS) |
+|---|---|
+| live DB, keys, room, gate, pending, halts | `flop-closecall live status` |
+| full bootstrap simulation (in memory, throwaway keys, faults) | `flop-closecall live bootstrap --dry-run --faults --miss-first` |
+| real bootstrap | `flop-closecall live bootstrap` refuses (exit 3) in this build |
+| generate real keys (gate required; do **not** run yet) | `flop-closecall live keygen --total 2 --i-understand-these-are-real-keys` |
 
 ## 6. Stop / uninstall
 

@@ -21,7 +21,7 @@ import { join } from "node:path";
 export type CloseCallLogCategory =
   | "START" | "MODE" | "CONFIG" | "LOCK" | "FOLD" | "OBSERVE" | "SWEEP" | "PRICE" | "HL" | "STALE" | "GAP" | "MISSED"
   | "STATE" | "LEADERBOARD" | "RECONCILE OK" | "RECONCILE MISMATCH" | "STRATEGY" | "RISK" | "PAPER INTENT" | "PAPER RESULT"
-  | "PAPER SUMMARY" | "ESTIMATE" | "KEYS" | "ROOM" | "PROBE" | "EXECUTOR" | "HEALTH" | "ALERT" | "HALT" | "SAFE MODE" | "ERROR";
+  | "PAPER SUMMARY" | "ESTIMATE" | "KEYS" | "ROOM" | "PROBE" | "EXECUTOR" | "BOOTSTRAP" | "BACKUP" | "HEALTH" | "ALERT" | "HALT" | "SAFE MODE" | "ERROR";
 
 export type Level = "debug" | "info" | "warn" | "error";
 

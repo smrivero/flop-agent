@@ -88,6 +88,14 @@ export interface CloseCallConfig {
   logs: { maxFileMb: number; maxTotalMb: number; retentionDays: number };
   alerts: { webhookUrl: string | null; telegramBotToken: string | null; telegramChatId: string | null; minIntervalS: number };
   paperKeyPrefix: string;
+  /** Real keys and the live bootstrap keep their own database: a paper DB (fake keys) never holds a real key. */
+  liveDbPath: string;
+  /** Our owned trading room (`d-...`), or null until the operator picks one. */
+  room: string | null;
+  /** age public key (age1...) the key backup is encrypted to. Its identity (private) lives only on the operator's Mac. */
+  backupAgeRecipient: string | null;
+  /** Fraction of the live per-IP write limit the bootstrap may use (the IP is shared with other bots). */
+  writeBudgetFraction: number;
 }
 
 function num(env: NodeJS.ProcessEnv, name: string, def: number, min: number, max: number): number {
@@ -170,7 +178,8 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
       haltDelayMin: num(env, "CLOSECALL_STALE_HALT_DELAY_MIN", 45, 1, 1_440),
       haltDivergenceBps: num(env, "CLOSECALL_STALE_HALT_DIVERGENCE_BPS", 50, 1, 5_000),
     },
-    confirmationPolicy: oneOf(env, "CLOSECALL_CONFIRMATION_POLICY", ["STRICT", "PROTOCOL", "PROBE"] as const, "STRICT"),
+    // PROTOCOL is the operator's choice for live (26 Sep). STRICT and PROBE stay available for diagnosis / fallback.
+    confirmationPolicy: oneOf(env, "CLOSECALL_CONFIRMATION_POLICY", ["STRICT", "PROTOCOL", "PROBE"] as const, "PROTOCOL"),
     haltRefereeSilenceS: num(env, "CLOSECALL_HALT_REFEREE_SILENCE_S", 3_600, 60, 86_400),
     haltHlStaleMs: num(env, "CLOSECALL_HALT_HL_STALE_MS", 600_000, 10_000, 86_400_000),
     roomRefreshDays: num(env, "CLOSECALL_ROOM_REFRESH_DAYS", 5, 1, 6),
@@ -192,5 +201,25 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
       minIntervalS: num(env, "CLOSECALL_ALERT_MIN_INTERVAL_S", 900, 0, 86_400),
     },
     paperKeyPrefix: "CC",
+    liveDbPath: resolve(cwd, env.CLOSECALL_LIVE_DB_PATH?.trim() || resolve(dataDir, "live.sqlite3")),
+    room: roomName(env.CLOSECALL_ROOM),
+    backupAgeRecipient: ageRecipient(env.CLOSECALL_BACKUP_AGE_RECIPIENT),
+    writeBudgetFraction: num(env, "CLOSECALL_WRITE_BUDGET_FRACTION", 0.25, 0.01, 0.9),
   };
+}
+
+function roomName(raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  if (!/^d-[a-z0-9][a-z0-9_-]{0,45}$/.test(v)) throw new CloseCallConfigError(`CLOSECALL_ROOM must be an ownable d- room name (a-z0-9_-), got ${JSON.stringify(v)}`);
+  if (v.startsWith("d-close1")) throw new CloseCallConfigError("CLOSECALL_ROOM must not look like a referee room (d-close1*)");
+  return v;
+}
+
+function ageRecipient(raw: string | undefined): string | null {
+  const v = raw?.trim();
+  if (!v) return null;
+  if (!/^age1[02-9ac-hj-np-z]{58}$/.test(v)) throw new CloseCallConfigError("CLOSECALL_BACKUP_AGE_RECIPIENT must be an age public key (age1..., 62 chars); the private identity never goes on the VPS");
+  if (/AGE-SECRET-KEY/i.test(v)) throw new CloseCallConfigError("that is an age SECRET key: it must never be on the VPS");
+  return v;
 }
