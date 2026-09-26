@@ -1,0 +1,10 @@
+{
+  "room": "d-close1-price",
+  "seq": 1,
+  "generation": 1,
+  "ts": "2026-09-25T12:05:22.575364Z",
+  "from_did": "did:key:z6MkowHQwsx9xr84WbWN3YCnKutyBnBXkT1ChKY4uEAAMzte",
+  "nonce": "1790337922535",
+  "sig": "j3_asvvwrt67C13PdoA2Q1p0QfO24av1hvkC_2Nc5FJet9dKey97CFuKv1ZW9G7Ki4hxw86K-2dfhIjAjhlsCw",
+  "text": "{\"for\":1,\"limits\":[\"214.84\",\"237.44\"],\"package\":\"bae09812e25eb6f1369c611f24964f7ea0acafddfc45301a16f33f941296dafa\",\"price\":\"226.14\",\"rooms\":[\"d-close1-flow\",\"d-close1-state\",\"d-close1-price\",\"d-close1-positions\",\"d-close1-pnl\"],\"season\":\"close-1\",\"t\":\"seed\",\"trade\":{\"tid\":626256716983248,\"time\":\"2026-09-25T11:59:42.666000Z\"}}"
+}

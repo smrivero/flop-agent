@@ -3,6 +3,8 @@
  *
  *   status                               live DB: keys, room, backup gate, pending writes, halts (no network)
  *   unhalt --code <code>                 clear a GRAVE halt in the LIVE DB (the code is in `live status`)
+ *   import-seed --from <paper DB>        one-time: the referee's signed seed post (rotated out of technocore's ring),
+ *                                        verified on its own, from the paper DB opened read-only. Nothing else copied.
  *   keygen --total N --i-understand-these-are-real-keys
  *                                        generate CC001..CC<N> (only missing ones). Refused unless the backup gate passes.
  *   restore-verify <decrypted keys dir>  (on the Mac) check a decrypted backup and print its VERIFY CODE
@@ -35,7 +37,7 @@ import { disarm, halt, haltSummary, rearm, unhalt, writerState } from "../safety
 import { openCloseCallDb } from "../store.js";
 import { openReadonly } from "../monitor.js";
 import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { simulateBootstrap } from "../testing/bootstrap-sim.js";
 import { foldConfig } from "../paper.js";
 import { banner, runLoop } from "../run.js";
@@ -43,6 +45,7 @@ import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
 import { liveReadiness, renderReadiness } from "./readiness.js";
 import { renderDrill, restoreDrill } from "./restore-drill.js";
+import { importSeed, seedImportProvenance, SeedImportRefused } from "./import-seed.js";
 import { generateKeys, KeygenRefused, loadSigners, verifyRestoredKeyDir } from "./keygen.js";
 
 
@@ -202,6 +205,21 @@ async function main(argv: string[]): Promise<number> {
     const h = unhalt(db, code);
     out(h ? { cleared: h, live_db: cfg.liveDbPath, halted: haltSummary(db) } : { error: "no active halt with that code", halted: haltSummary(db) });
     return h ? 0 : 1;
+  }
+
+  if (cmd === "import-seed") {
+    const from = arg("--from");
+    if (!from) { process.stderr.write("usage: live import-seed --from /var/lib/flop-closecall/close-call.sqlite3\n"); return 2; }
+    if (resolve(from) === resolve(cfg.liveDbPath)) { process.stderr.write("--from must be the PAPER DB, not the live DB\n"); return 2; }
+    try {
+      out({ ...importSeed(db, resolve(from), contest, cfg.vendorRoot), provenance: seedImportProvenance(db) });
+      return 0;
+    } catch (e) {
+      if (!(e instanceof SeedImportRefused)) throw e;
+      if (/DIFFERENT seed/.test(e.message) && /live DB/.test(e.message)) halt(db, "manual", `import-seed: ${e.message}`);
+      process.stderr.write(`[CLOSECALL][SEED] REFUSED: ${e.message}. Nothing written.\n`);
+      return 3;
+    }
   }
 
   if (cmd === "keygen") {
