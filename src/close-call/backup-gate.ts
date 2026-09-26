@@ -28,7 +28,7 @@ import { basename, join } from "node:path";
 import { getMeta, setMeta, type CcDb } from "./store.js";
 
 export const CANARY_FILE = "BACKUP-CANARY";
-export const KEY_FILE_RE = /^CC\d{3}\.json$/;
+export const KEY_FILE_RE = /^CC(\d{3}|-TEST-\d{3}|-ADMIN)\.json$/;
 
 export interface FileHash { name: string; sha256: string }
 export interface BackupManifest {

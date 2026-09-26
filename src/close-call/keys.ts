@@ -72,6 +72,8 @@ export interface KeyRecord {
   minted_sweep: number | null;
   mint_evidence: string | null;
   probe_trade_id?: string | null;
+  /** Live keys only: admin = room owner (never trades), staging = test trades, strategy = CC001..CC100. */
+  role?: KeyRole | null;
   status: KeyStatus;
   strategy_role: StrategyRole;
   pair_index: number | null;
@@ -96,6 +98,16 @@ const B58 = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 
 export function keyId(i: number, prefix = "CC"): string {
   return `${prefix}${String(i).padStart(3, "0")}`;
+}
+
+export type KeyRole = "admin" | "staging" | "strategy";
+/** Ids per role: CC-ADMIN, CC-TEST-001.., CC001..CC100. */
+export function roleKeyId(role: KeyRole, i: number): string {
+  return role === "admin" ? "CC-ADMIN" : role === "staging" ? `CC-TEST-${String(i).padStart(3, "0")}` : keyId(i);
+}
+export const LIVE_KEY_ID_RE = /^CC(\d{3}|-TEST-\d{3}|-ADMIN)$/;
+export function keysByRole(db: CcDb, role: KeyRole): KeyRecord[] {
+  return (db.prepare("SELECT * FROM keys WHERE fake = 0 AND role = ? ORDER BY id").all(role) as KeyRecord[]);
 }
 
 /** Deterministic, unique, VALID-shaped did:key for paper trading only. There is no private key for it. */

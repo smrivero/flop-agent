@@ -18,6 +18,8 @@ export interface HlTrade { px: string; tid: string; timeMs: number }
 export class HyperliquidObserver {
   latest: HlTrade | null = null;
   errors = 0;
+  /** Last SUCCESSFUL poll (feed health). A quiet market has an old last trade but a healthy feed. */
+  feedOkAt: number | null = null;
 
   constructor(private db: CcDb, private infoUrl: string, private coin: string, private fetchImpl: typeof fetch = fetch) {}
 
@@ -40,6 +42,8 @@ export class HyperliquidObserver {
           this.latest = { px: t.px, tid: String(t.tid), timeMs: t.time };
         }
       }
+      this.feedOkAt = nowMs;
+      try { this.db.prepare("INSERT INTO meta (key, value) VALUES ('hl_feed_ok_at', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(String(nowMs)); } catch { /* read-only DB (tests) */ }
       return this.latest;
     } catch (e) {
       this.errors++;
@@ -48,8 +52,14 @@ export class HyperliquidObserver {
     }
   }
 
+  /** Age of the last xyz:NVDA TRADE. Old on a quiet market; says nothing about the feed. */
   ageMs(nowMs = Date.now()): number | null {
     return this.latest ? nowMs - this.latest.timeMs : null;
+  }
+
+  /** Age of the last successful poll: THIS is the feed's health (stale policy, safety halts, estimator). */
+  feedAgeMs(nowMs = Date.now()): number | null {
+    return this.feedOkAt === null ? null : nowMs - this.feedOkAt;
   }
 
   /** Last trade we observed strictly before `boundaryMs` (the referee's rule for a sweep close). */

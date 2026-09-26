@@ -13,8 +13,11 @@
  *   probe            a probe trade of ours listed in flow.settled. Not adversary-proof if the probe id was
  *                    ever published unsettled (probe.test.ts case D) -- such a probe is rejected here.
  *   protocol         our signed owner message, byte-exact, in a room registered before its stamp, stamped
- *                    no later than the lock, in a sweep the referee has published, outside every missed
- *                    range the referee reported, with no contrary evidence (a not_owner void of ours).
+ *                    no later than the lock, in a sweep the referee has published (flow AND state posts),
+ *                    outside every missed range the referee reported, the state post's owner count grew
+ *                    by at least as many as OUR registrations stamped for that sweep, and no contrary
+ *                    evidence (a not_owner void of ours). Time alone never counts; truncated mint lists
+ *                    do not matter (nothing here reads flow.mints).
  */
 
 import { lastClosedSweep, sweepForTime, type Contest } from "./contest.js";
@@ -49,7 +52,7 @@ export function roomAcceptanceEvidence(db: CcDb, room: string, registrantConfirm
   return n === null ? null : { source: "room-acceptance", sweep: n, detail: `room ${room}, registered by this key, listed in flow.rooms` };
 }
 
-export function protocolEvidence(db: CcDb, contest: Contest, msg: OwnerMessageRecord, ourTradeIds: string[] = []): { evidence: MintEvidence | null; blockers: string[] } {
+export function protocolEvidence(db: CcDb, contest: Contest, msg: OwnerMessageRecord, ourTradeIds: string[] = [], ourInSameSweep = 1): { evidence: MintEvidence | null; blockers: string[] } {
   const blockers: string[] = [];
   if (msg.text !== ownerMessageText(msg.did)) blockers.push("owner message text is not the exact registration shape");
   const stamp = sweepForTime(contest, Date.parse(msg.ts));
@@ -61,6 +64,12 @@ export function protocolEvidence(db: CcDb, contest: Contest, msg: OwnerMessageRe
     else if (listed >= stamp) blockers.push(`room ${msg.room} counts only after sweep ${listed}; message stamped for sweep ${stamp}`);
   }
   if (!all.some((f) => f.n >= stamp)) blockers.push(`the referee has not published sweep ${stamp} yet`);
+  // Corroboration from the state post: the owner count must have grown by at least our registrations.
+  const st = db.prepare("SELECT n, owners FROM sweeps WHERE n IN (?, ?) AND owners IS NOT NULL").all(stamp - 1, stamp) as { n: number; owners: number }[];
+  const cur = st.find((x) => x.n === stamp);
+  const prev = st.find((x) => x.n === stamp - 1);
+  if (!cur || (stamp > 1 && !prev)) blockers.push(`state posts for sweeps ${stamp - 1}/${stamp} not both seen: owner growth unverified`);
+  else if (cur.owners - (prev?.owners ?? 0) < ourInSameSweep) blockers.push(`owners grew by ${cur.owners - (prev?.owners ?? 0)} at sweep ${stamp}, fewer than our ${ourInSameSweep} registrations`);
   for (const f of all) {
     for (const [room, a, b] of f.missed ?? []) {
       if (room === msg.room && msg.seq >= a && msg.seq <= b) blockers.push(`seq ${msg.seq} of ${room} is inside a range the referee missed (sweep ${f.n})`);
@@ -90,7 +99,7 @@ export function probeEvidence(db: CcDb, probeIds: string[], exposedUnsettled: Se
 /** Assess one key under a policy. Never promotes by time alone. */
 export function assessMint(db: CcDb, contest: Contest, p: {
   did: string; policy: ConfirmationPolicyName; ownerMessage?: OwnerMessageRecord; registeredRoom?: string;
-  probeIds?: string[]; probeExposedUnsettled?: Set<string>; ourTradeIds?: string[];
+  probeIds?: string[]; probeExposedUnsettled?: Set<string>; ourTradeIds?: string[]; ourInSameSweep?: number;
 }): MintAssessment {
   const available: MintEvidence[] = [];
   const blockers: string[] = [];
@@ -102,7 +111,7 @@ export function assessMint(db: CcDb, contest: Contest, p: {
   }
   let expected: MintEvidence | null = null;
   if (p.ownerMessage) {
-    const pr = protocolEvidence(db, contest, p.ownerMessage, p.ourTradeIds);
+    const pr = protocolEvidence(db, contest, p.ownerMessage, p.ourTradeIds, p.ourInSameSweep ?? 1);
     blockers.push(...pr.blockers);
     if (pr.evidence) { available.push(pr.evidence); expected = pr.evidence; }
   }

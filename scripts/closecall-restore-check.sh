@@ -13,12 +13,26 @@ if [ "${LOCAL:-0}" = "1" ]; then
     : "${AGE_IDENTITY:?set AGE_IDENTITY to your age identity file}"
     RT=$(mktemp -d); chmod 700 "$RT"; trap 'rm -rf "$RT"' EXIT
     age -d -i "$AGE_IDENTITY" "$FILE" | tar -C "$RT" -xf -
-    KD="$RT/var/lib/flop-closecall/keys"
-    [ -d "$KD" ] || { echo "no var/lib/flop-closecall/keys in the archive" >&2; exit 1; }
-    [ -f "$RT/etc/flop-closecall/closecall.env" ] && echo "env file present in the archive"
+    KD=$(ls -d "$RT"/var/lib/flop-closecall*/keys 2>/dev/null | head -1)
+    [ -n "$KD" ] && [ -d "$KD" ] || { echo "no keys directory in the archive" >&2; exit 1; }
     npx tsx src/close-call/live/cli-live.ts restore-verify "$KD"
+    # Disaster-recovery drill: rebuild the live data dir from this archive alone (+ the pulled backups folder)
+    # and run the readiness gate OFFLINE against it. Nothing is written anywhere but this temp dir.
+    DB=$(ls -1t "$RT"/var/lib/flop-closecall*/backups/close-call-*.sqlite3 2>/dev/null | head -1)
+    ENVF=$(ls "$RT"/etc/flop-closecall/closecall-live.env 2>/dev/null || true)
+    if [ -n "$DB" ] && [ -n "$ENVF" ]; then
+      D="$RT/drill"; install -d -m 700 "$D" "$D/backups"
+      cp -a "$KD" "$D/keys"; install -m 600 "$DB" "$D/live.sqlite3"
+      cp -a "$(dirname "$FILE")"/secrets-*.tar.age "$(dirname "$FILE")"/secrets-*.manifest.json "$D/backups/" 2>/dev/null || true
+      echo "== restore drill: live-check --offline on the rebuilt state =="
+      ( set -a; . "$ENVF"; set +a
+        CLOSECALL_DATA_DIR="$D" CLOSECALL_DB_PATH="$D/live.sqlite3" CLOSECALL_LIVE_DB_PATH="$D/live.sqlite3" CLOSECALL_LOCK_PATH="$D/live.lock" \
+          npx tsx src/close-call/live/cli-live.ts check --offline ) || true
+    else
+      echo "(no live DB snapshot / env in this archive: key check only)"
+    fi
     echo "decrypted copy deleted on exit. Paste the VERIFY CODE on the VPS:"
-    echo "  flop-closecall keys --backup-verify --archive $(basename "$FILE") --code <VERIFY CODE>"
+    echo "  flop-closecall --live keys --backup-verify --archive $(basename "$FILE") --code <VERIFY CODE>"
     exit 0;; esac
   TMP=$(mktemp -d); trap 'rm -rf "$TMP"' EXIT
   cp "$FILE" "$TMP/restore.sqlite3"

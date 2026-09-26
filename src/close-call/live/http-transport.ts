@@ -26,6 +26,12 @@ export class HttpTransport implements Transport {
     return JSON.parse((await res.text()).replace(/"nonce":\s*(\d+)/g, '"nonce":"$1"'));
   }
 
+  async readTail(room: string): Promise<{ messages: RoomMessage[] }> {
+    const res = await this.fetchImpl(`${this.baseUrl}/r/${room}?format=json&limit=200`, { signal: AbortSignal.timeout(this.timeoutMs) });
+    if (!res.ok) throw new Error(`read ${room}: ${res.status}`);
+    return JSON.parse((await res.text()).replace(/"nonce":\s*(\d+)/g, '"nonce":"$1"'));
+  }
+
   async readNote(ns: string, key: string): Promise<string | null> {
     const res = await this.fetchImpl(`${this.baseUrl}/kv/${ns}/${key}`, { signal: AbortSignal.timeout(this.timeoutMs) });
     if (res.status === 404) return null;

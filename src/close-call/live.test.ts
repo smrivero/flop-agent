@@ -138,35 +138,37 @@ test("signed trade: maker and taker signatures verify; taker must be named; qty 
   assert.throws(() => buildSignedTrade(t, m, terms), /maker/);
 });
 
-test("bootstrap dry-run: 2 keys, then 100, PROTOCOL, mints never listed -- one write per op, test trade settles once", async () => {
-  const r = await simulateBootstrap(contest(), { stages: [2, 100], startSweep: 300 });
+test("bootstrap dry-run: admin + staging first, then 100 strategy keys; PROTOCOL with mints never listed; one write per op", async () => {
+  const r = await simulateBootstrap(contest(), { stages: [0, 100], startSweep: 300 });
   assert.ok(r.ok, JSON.stringify(r.checks));
-  assert.deepEqual(r.stages.map((s) => s.writes), [6, 99], "2 keys: claim+allow+owner+room+owner+trade; then allow + 98 owners");
-  assert.equal(r.server.messages.close1, 2);
+  assert.deepEqual(r.stages.map((s) => s.writes), [7, 101], "claim+allow+admin owner+room+2 staging owners+staging trade; then allow rewrite + 100 owners");
+  assert.equal(r.server.messages.close1, 2, "only CC-ADMIN writes in close1");
+  assert.equal(r.server.allowDids, 102, "2 staging + 100 strategy");
+  assert.ok(r.checks.find((c) => /untouched/.test(c.name))!.ok);
 });
 
-test("bootstrap dry-run with faults: lost requests, timeouts after commit, a crash after planning, CC001 missed by the referee", async () => {
-  const r = await simulateBootstrap(contest(), { stages: [2, 100], startSweep: 300, faults: true, missFirstOwner: true });
+test("bootstrap dry-run with faults: lost requests, timeouts after commit, 429s, a crash after planning, CC-ADMIN missed by the referee", async () => {
+  const r = await simulateBootstrap(contest(), { stages: [0, 100], startSweep: 300, faults: true, missFirstOwner: true, rate429At: [2, 9, 40] });
   assert.ok(r.ok, JSON.stringify(r.checks));
-  assert.equal(r.server.messages.close1, 3, "CC001 owner reposted once (missed) + room");
+  assert.equal(r.server.messages.close1, 3, "CC-ADMIN owner reposted once (missed) + room");
 });
 
-test("STRICT with unlisted mints never promotes by time: CC001 waits forever, nothing else is written", async () => {
-  const r = await simulateBootstrap(contest(), { stages: [2], startSweep: 300, policy: "STRICT", maxSteps: 30 });
+test("STRICT with unlisted mints never promotes by time: CC-ADMIN waits forever, nothing else is written", async () => {
+  const r = await simulateBootstrap(contest(), { stages: [0], startSweep: 300, policy: "STRICT", maxSteps: 30 });
   assert.equal(r.ok, false);
   assert.equal(r.final.keys.MINT_EXPECTED ?? 0, 1, "protocol evidence is recorded as MINT_EXPECTED (information), never promoted");
   assert.equal(r.final.keys.MINT_CONFIRMED ?? 0, 0);
-  assert.equal(r.server.posts, 3, "claim + allow + CC001 owner, then only waiting");
-  assert.ok(r.steps.slice(3).every((s) => s.action === "waiting" && s.phase === "wait-first-mint"));
+  assert.equal(r.server.posts, 3, "claim + allow + CC-ADMIN owner, then only waiting");
+  assert.ok(r.steps.slice(3).every((s) => s.action === "waiting" && s.phase === "wait-admin-mint"));
 });
 
 function liveBootstrap(srv: MockTechnocore, room = "d-cc-test") {
   const { db } = tmpDb();
   const signers = new Map<string, Signer>();
-  for (let i = 1; i <= 2; i++) {
+  for (const [id, role] of [["CC-ADMIN", "admin"], ["CC-TEST-001", "staging"], ["CC-TEST-002", "staging"]] as const) {
     const s = ephemeralSigner();
-    signers.set(keyId(i), s);
-    db.prepare("INSERT INTO keys (id, did, key_path, fake, status, updated_at) VALUES (?, ?, NULL, 0, 'GENERATED', ?)").run(keyId(i), s.did, now());
+    signers.set(id, s);
+    db.prepare("INSERT INTO keys (id, did, key_path, fake, status, role, updated_at) VALUES (?, ?, NULL, 0, 'GENERATED', ?, ?)").run(id, s.did, role, now());
   }
   const c = contest();
   const clock = () => sweepTime(c, 300) + 1000;
@@ -205,14 +207,14 @@ test("bootstrap preflight: a closed backup gate, a missing signer or a halt bloc
   const srv = new MockTechnocore();
   const { db } = tmpDb();
   const s = ephemeralSigner();
-  db.prepare("INSERT INTO keys (id, did, key_path, fake, status, updated_at) VALUES ('CC001', ?, NULL, 0, 'GENERATED', ?)").run(s.did, now());
-  db.prepare("INSERT INTO keys (id, did, key_path, fake, status, updated_at) VALUES ('CC002', ?, NULL, 0, 'GENERATED', ?)").run(ephemeralSigner().did, now());
+  db.prepare("INSERT INTO keys (id, did, key_path, fake, status, role, updated_at) VALUES ('CC-ADMIN', ?, NULL, 0, 'GENERATED', 'admin', ?)").run(s.did, now());
+  db.prepare("INSERT INTO keys (id, did, key_path, fake, status, role, updated_at) VALUES ('CC-TEST-001', ?, NULL, 0, 'GENERATED', 'staging', ?)").run(ephemeralSigner().did, now());
   const c = contest();
-  const b = new Bootstrap({ db, contest: c, journal: new WriteJournal(db, new Map([["CC001", s]]), srv), transport: srv, signers: new Map([["CC001", s]]),
+  const b = new Bootstrap({ db, contest: c, journal: new WriteJournal(db, new Map([["CC-ADMIN", s]]), srv), transport: srv, signers: new Map([["CC-ADMIN", s]]),
     policy: "PROTOCOL", room: "d-cc-x", clock: () => sweepTime(c, 300), refreshReferee: async () => {}, gate: () => ({ ok: false, problems: ["no verified backup"] }) });
   const r = await b.step();
   assert.equal(r.action, "blocked");
-  assert.ok(r.blockers!.some((x) => /CC002: no signer/.test(x)) && r.blockers!.some((x) => /backup gate/.test(x)));
+  assert.ok(r.blockers!.some((x) => /CC-TEST-001: no signer/.test(x)) && r.blockers!.some((x) => /backup gate/.test(x)) && r.blockers!.some((x) => /two staging keys/.test(x)));
   assert.equal(srv.posts, 0);
   assert.equal(getMeta(db, "halts"), null);
 });

@@ -39,10 +39,14 @@ import { report } from "./report.js";
 import { banner, runLoop } from "./run.js";
 import { unhalt } from "./safety.js";
 import { snapshot } from "./status.js";
-import { backupDb, openCloseCallDb, SCHEMA_VERSION } from "./store.js";
+import { backupDb, openCloseCallDb, SCHEMA_VERSION, setMeta } from "./store.js";
 
 export const COMMANDS = ["run", "paper", "observe", "dry-run", "status", "health", "positions", "leaderboard", "keys", "pending", "report",
   "reconcile", "backup", "restore-check", "unhalt", "bootstrap-plan", "watch"] as const;
+
+function getMetaSafe(db: import("./store.js").CcDb, key: string): string | null {
+  try { return (db.prepare("SELECT value FROM meta WHERE key = ?").get(key) as { value: string } | undefined)?.value ?? null; } catch { return null; }
+}
 
 /** KEY=VALUE lines of the service env file, if readable (the monitor uses it when run by hand). */
 function serviceEnv(path = "/etc/flop-closecall/closecall.env"): Record<string, string> {
@@ -184,8 +188,13 @@ async function main(argv: string[]): Promise<number> {
           out(r);
           return r.problems.length && r.files.length ? 1 : 0;
         }
+        const allowed = (() => { try { return new Set(JSON.parse(getMetaSafe(db, "room_allow_seen") ?? "[]") as string[]); } catch { return new Set<string>(); } })();
+        const live = openCloseCallDb(cfg.liveDbPath);
+        const verified = (() => { try { return backupGate(live, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient }).verified; } catch { return null; } finally { live.close(); } })();
+        const backed = new Set((verified?.files ?? []).map((f) => f.name.replace(/\.json$/, "")));
         for (const k of listKeys(db)) {
-          out(`${k.id} ${k.status.padEnd(16)} fake=${k.fake} role=${k.strategy_role ?? "-"} pair=${k.pair_index ?? "-"} entry=${k.entry_px ?? "-"}@${k.entry_sweep ?? "-"} ${k.did}`);
+          const flags = k.fake ? "fake" : [k.role ?? "-", backed.has(k.id) ? "BACKED_UP" : "not-backed-up", k.registered ? "REGISTERED" : "", k.minted ? `MINTED@${k.minted_sweep}` : "", allowed.has(k.did) ? "ROOM_ALLOWED" : ""].filter(Boolean).join(" ");
+          out(`${k.id.padEnd(12)} ${k.status.padEnd(16)} ${flags.padEnd(52)} pair=${k.pair_index ?? "-"} entry=${k.entry_px ?? "-"}@${k.entry_sweep ?? "-"} ${k.did}`);
         }
         return 0;
       }
@@ -215,6 +224,7 @@ async function main(argv: string[]): Promise<number> {
         const keep = Number(arg("--keep") ?? "14");
         const olds = readdirSync(cfg.backupDir).filter((f) => /^close-call-.*\.sqlite3$/.test(f)).sort().reverse().slice(keep);
         for (const f of olds) unlinkSync(join(cfg.backupDir, f));
+        if (integrity === "ok") setMeta(db, "last_db_backup_at", new Date().toISOString());
         out({ backup: dest, pages: r.pages, bytes: statSync(dest).size, integrity, pruned: olds });
         return integrity === "ok" ? 0 : 1;
       }

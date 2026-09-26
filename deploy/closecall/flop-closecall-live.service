@@ -8,6 +8,9 @@
 #   /usr/local/lib/flop-closecall/node   a copy of the node binary (root's nvm dir is not readable by flopcc)
 
 [Unit]
+# Never auto-started: the installer does not enable it, and every start re-runs the readiness gate
+# (exit 3 = refused: no restart loop). A reboot therefore never causes a live write by itself.
+ConditionPathExists=/etc/flop-closecall/closecall-live.env
 Description=FLOP Close Call LIVE (Strategy K with real keys; refuses to start unless live-check passes)
 Documentation=file:///opt/flop-closecall/deploy/closecall/DEPLOY.md
 After=network-online.target
@@ -23,8 +26,9 @@ Group=flopcc
 WorkingDirectory=/opt/flop-closecall
 EnvironmentFile=/etc/flop-closecall/closecall-live.env
 # Belt and braces: the unit pins the data dir even if the env file forgets it.
-Environment=CLOSECALL_DATA_DIR=/var/lib/flop-closecall
+Environment=CLOSECALL_DATA_DIR=/var/lib/flop-closecall-live
 Environment=NODE_ENV=production
+Environment=CLOSECALL_ENV_FILE=/etc/flop-closecall/closecall-live.env
 # The code dir is read-only for the service: do not try to write __pycache__ next to the vendored fold.
 Environment=PYTHONDONTWRITEBYTECODE=1
 # `run` follows CLOSECALL_MODE (paper by default). live is refused with exit 3 in this build.
@@ -42,7 +46,7 @@ SendSIGKILL=yes
 
 # Files are created 0600 / dirs 0700 (sqlite, WAL, logs, lock).
 UMask=0077
-StateDirectory=flop-closecall
+StateDirectory=flop-closecall-live
 StateDirectoryMode=0700
 
 # Resources (paper run measured ~70-100 MB RSS).
@@ -55,7 +59,9 @@ LimitNOFILE=4096
 # Hardening
 NoNewPrivileges=yes
 ProtectSystem=strict
-ReadWritePaths=/var/lib/flop-closecall
+ReadWritePaths=/var/lib/flop-closecall-live
+# Live can never read or write paper state (fake keys, paper strategy state, paper halts/mismatches).
+InaccessiblePaths=-/var/lib/flop-closecall
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

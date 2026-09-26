@@ -47,7 +47,7 @@ export function validateKeyDir(dir: string, backupDir: string, uid = typeof proc
     r.files.push({ name, mode: mode(f.mode), ok, ownerOk });
     if (!ok) problems.push(`${name}: mode ${mode(f.mode)} (must be 600)`);
     if (!ownerOk) problems.push(`${name}: not owned by the service user`);
-    if (!/^CC\d{3}\.json$/.test(name)) problems.push(`${name}: unexpected file in the key directory`);
+    if (!/^CC(\d{3}|-TEST-\d{3}|-ADMIN)\.json$/.test(name)) problems.push(`${name}: unexpected file in the key directory`);
   }
   if (existsSync(backupDir)) {
     const all = readdirSync(backupDir).filter((f) => /^(keys|secrets)-/.test(f) && !f.endsWith(".manifest.json"));

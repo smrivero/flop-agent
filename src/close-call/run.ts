@@ -36,6 +36,8 @@ export interface RunOptions {
   paper: boolean;
   /** Live: the LiveExecutor (built by live/cli-live.ts, the only place that can). Same decision engine as paper. */
   executor?: TradeExecutor & { confirmPosted?: () => Promise<number> };
+  /** Live: room upkeep (RoomKeeper.tick: ownership/allow-list/existence check, 5-day refresh, keepalive), every minute. */
+  maintenance?: () => Promise<unknown>;
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -120,6 +122,7 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
     let nextRef = 0;
     let nextHl = 0;
     let nextSafety = 0;
+    let nextMaint = 0;
     let lastStateSweep = -1;
     const decided = new Set<number>();
 
@@ -159,16 +162,17 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
             const p = ev.post as PricePost;
             const hlNow = hl.latest;
             ccLog("PRICE", { n: p.n, referee_close: p.ref.px, referee_tid: p.ref.tid, age_s: p.age_s, hl_latest: hlNow?.px, hl_tid: hlNow?.tid,
-              hl_age_ms: hl.ageMs(), hl_minus_referee_bps: hlNow ? (((Number(hlNow.px) - Number(p.ref.px)) / Number(p.ref.px)) * 1e4).toFixed(2) : null });
+              hl_trade_age_ms: hl.ageMs(), hl_feed_age_ms: hl.feedAgeMs(), hl_minus_referee_bps: hlNow ? (((Number(hlNow.px) - Number(p.ref.px)) / Number(p.ref.px)) * 1e4).toFixed(2) : null });
             if ((p.age_s ?? 0) >= cfg.refereeStaleAgeS) {
               void alerts.raise({ event: "referee_stale", severity: "warning", message: `referee close is ${p.age_s}s old at sweep ${p.n}`, key: "referee_stale" });
             }
           }
         }
         if (events.length) await guard("reconcile", () => reconcileReferee(db));
-        if (events.length && paper && opts.executor) {
-          await guard("live-confirm", () => opts.executor!.confirmPosted?.());
-          await guard("live-verify", () => paper!.verifyWithReferee());
+        if (paper && opts.executor) {
+          if (events.length) await guard("live-confirm", () => opts.executor!.confirmPosted?.());
+          if (paper.deferred.size) await guard("live-settle", () => paper!.retryDeferred());
+          if (events.length) await guard("live-verify", () => paper!.verifyWithReferee());
         }
         const snap = snapshot(db);
         if (snap.sweep !== null && snap.sweep !== lastStateSweep && snap.owners !== null) {
@@ -178,6 +182,11 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
             missed: snap.missed_ranges.length, keys: snap.keys, paper: snap.paper_intents, halted: snap.halted });
           ccLog("LEADERBOARD", { sweep: snap.sweep, mark: snap.mark, top3: snap.top3.map(([d, s]) => `${d.slice(-8)}:${s}`) });
         }
+      }
+
+      if (opts.maintenance && t >= nextMaint) {
+        nextMaint = t + 60_000;
+        await guard("room-keeper", () => opts.maintenance!());
       }
 
       if (t >= nextSafety) {
@@ -197,7 +206,7 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
 
 /** Transient halts that set and clear themselves; alerts on each change. */
 export function safetyChecks(db: CcDb, cfg: CloseCallConfig, rt: RuntimeState, alerts: Alerts, observer: { lastOkAt: number | null },
-  hl: { ageMs: (n?: number) => number | null }, t = Date.now()): void {
+  hl: { feedAgeMs: (n?: number) => number | null }, t = Date.now()): void {
   const lastRead = db.prepare("SELECT MAX(fetched_at) m FROM raw_posts WHERE room LIKE 'd-close1-%'").get() as { m: string | null };
   const silence = lastRead.m ? (t - Date.parse(lastRead.m)) / 1000 : null;
   if (silence !== null && silence >= cfg.haltRefereeSilenceS) {
@@ -205,10 +214,11 @@ export function safetyChecks(db: CcDb, cfg: CloseCallConfig, rt: RuntimeState, a
   } else if (silence !== null) {
     clearTransient(db, "referee_stale", alerts);
   }
-  const hlAge = hl.ageMs(t);
+  // FEED health (last successful poll), never the last trade's age: a quiet market is not a broken feed.
+  const hlAge = hl.feedAgeMs(t);
   if (hlAge !== null && hlAge >= cfg.haltHlStaleMs) {
-    halt(db, "hyperliquid_stale", `last xyz:NVDA trade seen ${Math.round(hlAge / 1000)} s ago`, alerts);
-    void alerts.raise({ event: "hyperliquid_stale", severity: "warning", message: `Hyperliquid stale ${Math.round(hlAge / 1000)} s`, key: "hl" });
+    halt(db, "hyperliquid_stale", `Hyperliquid feed: no successful poll for ${Math.round(hlAge / 1000)} s`, alerts);
+    void alerts.raise({ event: "hyperliquid_stale", severity: "warning", message: `Hyperliquid feed down ${Math.round(hlAge / 1000)} s`, key: "hl" });
   } else if (hlAge !== null) {
     clearTransient(db, "hyperliquid_stale", alerts);
   }

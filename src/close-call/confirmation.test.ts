@@ -44,7 +44,10 @@ test("PROTOCOL: registration in a registered room, published sweep, not missed, 
   flow(f2, 7, { rooms: ["d-cc-x"] });
   assert.match(protocolEvidence(db2, C, { ...ok, room: "d-cc-x", ts: at(5) }).blockers.join(), /counts only after sweep 7/);
   assert.deepEqual(protocolEvidence(db2, C, { ...ok, room: "d-cc-x", ts: new Date(sweepTime(C, 8) - 60_000).toISOString() }).blockers
-    .filter((b) => !/not published/.test(b)), [], "stamped after the listing sweep: accepted once that sweep is published");
+    .filter((b) => !/not published|state posts/.test(b)), [], "stamped after the listing sweep: accepted once that sweep is published");
+  // corroboration: the state post's owner count must grow by at least our registrations of that sweep
+  assert.deepEqual(protocolEvidence(db2, C, ok, [], 10).blockers, [], "grew by 10, we registered 10");
+  assert.match(protocolEvidence(db2, C, ok, [], 11).blockers.join(), /owners grew by 10 at sweep 3, fewer than our 11/);
   db2.prepare("INSERT INTO void_ids (id, n, reason) VALUES ('t1', 6, 'not_owner')").run();
   assert.match(protocolEvidence(db2, C, ok, ["t1"]).blockers.join(), /voided not_owner/);
 });

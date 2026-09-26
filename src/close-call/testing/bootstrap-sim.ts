@@ -14,7 +14,7 @@ import { join } from "node:path";
 import { Bootstrap, type StepResult } from "../bootstrap.js";
 import { sweepTime, type Contest } from "../contest.js";
 import { WriteJournal } from "../journal.js";
-import { keyId, keyStatusCounts, listKeys, type ConfirmationPolicyName } from "../keys.js";
+import { keysByRole, keyStatusCounts, listKeys, roleKeyId, type ConfirmationPolicyName, type KeyRole } from "../keys.js";
 import { ownerMessageText } from "../protocol.js";
 import type { Signer } from "../protocol-writes.js";
 import { getRoom } from "../room.js";
@@ -25,8 +25,10 @@ import { MockTechnocore } from "./mock-technocore.js";
 import { SimReferee } from "./sim-referee.js";
 
 export interface SimOptions {
-  /** Key counts to reach, in order: [2, 100] = the progressive plan. */
+  /** STRATEGY key counts to reach, in order. Stage 1 also creates CC-ADMIN + CC-TEST-001/002: [0, 100] = staging first, then 100. */
   stages: number[];
+  /** Inject a 429 before these (1-based) POSTs. */
+  rate429At?: number[];
   policy?: ConfirmationPolicyName;
   room?: string;
   listMints?: boolean;
@@ -48,6 +50,8 @@ export interface SimReport {
   server: { posts: number; messages: Record<string, number>; ownerNote: boolean; allowDids: number };
   checks: { name: string; ok: boolean; detail: string }[];
   journal: Record<string, number>;
+  /** The simulated world after the bootstrap, to keep going (live trading) in the same server + DB. */
+  world: { db: CcDb; srv: MockTechnocore; signers: Map<string, Signer>; referee: SimReferee; room: string; now: () => number; setNow: (ms: number) => void; publish: (n: number) => void; published: () => number };
 }
 
 export async function simulateBootstrap(contest: Contest, o: SimOptions): Promise<SimReport> {
@@ -59,26 +63,30 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
   const signers = new Map<string, Signer>();
   const referee = new SimReferee(db, srv, contest, { listMints: o.listMints ?? false });
   let published = o.startSweep;
+  referee.seed();
+  referee.baseline(o.startSweep);
   const lag = o.refereeLagMs ?? 20_000;
   const perWriteMs = 60_000 / (o.writesPerMin ?? 75);
   const steps: StepResult[] = [];
   const stages: SimReport["stages"] = [];
   let missed = false;
 
-  const addKeys = (total: number) => {
-    const have = listKeys(db).length;
-    for (let i = have + 1; i <= total; i++) {
-      const id = keyId(i);
+  const addRole = (role: KeyRole, total: number) => {
+    for (let i = keysByRole(db, role).length + 1; i <= total; i++) {
+      const id = roleKeyId(role, i);
       const s = ephemeralSigner();
       signers.set(id, s);
-      db.prepare("INSERT INTO keys (id, did, key_path, fake, status, updated_at) VALUES (?, ?, NULL, 0, 'GENERATED', ?)").run(id, s.did, now());
+      db.prepare("INSERT INTO keys (id, did, key_path, fake, status, role, updated_at) VALUES (?, ?, NULL, 0, 'GENERATED', ?, ?)").run(id, s.did, role, now());
     }
   };
+  const addKeys = (strategyTotal: number) => { addRole("admin", 1); addRole("staging", 2); addRole("strategy", strategyTotal); };
+  const realPost = srv.post.bind(srv);
+  srv.post = async (path, body) => { if (o.rate429At?.includes(srv.posts + 1)) srv.failNext("429"); return realPost(path, body); };
   const publishDue = async () => {
     while (sweepTime(contest, published + 1) + lag <= simNow) {
       published++;
       if (o.missFirstOwner && !missed) {
-        const first = listKeys(db)[0];
+        const first = keysByRole(db, "admin")[0];
         const msg = (srv.rooms.get("close1") ?? []).find((m) => m.text === ownerMessageText(first.did));
         if (msg) {
           (referee as unknown as { opts: { missSeqs?: { room: string; from: number; to: number }[] } }).opts.missSeqs = [{ room: "close1", from: msg.seq, to: msg.seq }];
@@ -93,7 +101,8 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
     const journal = new WriteJournal(db, signers, srv, { clock: () => simNow });
     return new Bootstrap({
       db, contest, journal, transport: srv, signers, policy: o.policy ?? "PROTOCOL", room, clock: () => simNow,
-      refreshReferee: publishDue, gate: () => ({ ok: true, problems: [] }), pace: async () => { simNow += perWriteMs; }, refreshDays: 5,
+      refreshReferee: publishDue, gate: () => ({ ok: true, problems: [] }), pace: async () => { simNow += perWriteMs; },
+      sleep: async (ms) => { simNow += ms; }, refreshDays: 5,
     });
   };
 
@@ -128,6 +137,8 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
   }
 
   const keys = listKeys(db);
+  const admin = keysByRole(db, "admin")[0];
+  const nonAdmin = [...keysByRole(db, "staging"), ...keysByRole(db, "strategy")];
   const checks: SimReport["checks"] = [];
   const count = (roomName: string, text: string) => srv.count(roomName, text);
   const dupOwners = keys.filter((k) => {
@@ -135,14 +146,19 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
     return count("close1", ownerMessageText(k.did)) + count(room, ownerMessageText(k.did)) > 1 + reposts;
   });
   checks.push({ name: "no duplicated owner message (beyond deliberate reposts of missed ones)", ok: dupOwners.length === 0, detail: dupOwners.map((k) => k.id).join(" ") || "-" });
-  checks.push({ name: "room owned by CC001", ok: srv.notes.get(`room-owners/${room}`) === keys[0]?.did, detail: room });
+  const allTexts = [...srv.rooms.values()].flat().map((m) => `${m.from}|${m.text}`);
+  checks.push({ name: "0 duplicate writes (every stored message unique)", ok: new Set(allTexts).size === allTexts.length - keys.reduce((a, k) => a + Number(getMeta(db, `owner_reposts:${k.id}`) ?? "0"), 0), detail: `${allTexts.length} messages` });
+  checks.push({ name: "room owned by CC-ADMIN", ok: srv.notes.get(`room-owners/${room}`) === admin?.did, detail: room });
   const allow = (srv.notes.get(`room-allow/${room}`) ?? "").split(" ").filter(Boolean);
-  checks.push({ name: "allow-list = every other key, nothing else", ok: allow.length === keys.length - 1 && keys.slice(1).every((k) => allow.includes(k.did)), detail: `${allow.length} DIDs` });
+  checks.push({ name: "allow-list = staging + strategy keys, nothing else", ok: allow.length === nonAdmin.length && nonAdmin.every((k) => allow.includes(k.did)), detail: `${allow.length} DIDs, ${(srv.notes.get(`room-allow/${room}`) ?? "").length} chars` });
   checks.push({ name: "exactly one room registration message", ok: count("close1", `{"t":"room","season":"close-1","room":"${room}"}`) === 1, detail: "" });
   checks.push({ name: "every key READY", ok: keys.every((k) => k.status === "READY"), detail: JSON.stringify(keyStatusCounts(db)) });
   const tt = getMeta(db, "test_trade_id");
-  const ttRow = tt ? (db.prepare("SELECT status FROM trades WHERE trade_id = ?").get(tt) as { status: string }) : null;
-  checks.push({ name: "test trade settled exactly once", ok: !!tt && referee.settled.has(tt) && ttRow?.status === "settled", detail: tt ?? "none" });
+  const ttRow = tt ? (db.prepare("SELECT status, maker_id, taker_id FROM trades WHERE trade_id = ?").get(tt) as { status: string; maker_id: string; taker_id: string }) : null;
+  checks.push({ name: "staging trade (CC-TEST-001 -> CC-TEST-002) settled exactly once", ok: !!tt && referee.settled.has(tt) && ttRow?.status === "settled" && ttRow.maker_id === "CC-TEST-001", detail: tt ?? "none" });
+  const strategyDids = new Set(keysByRole(db, "strategy").map((k) => k.did));
+  const touched = [...srv.rooms.values()].flat().filter((m) => /"t":"trade"/.test(m.text) && [...strategyDids].some((d) => m.text.includes(d)));
+  checks.push({ name: "strategy keys untouched by bootstrap (no trade, no fee: 10,000 POLF, flat)", ok: touched.length === 0, detail: `${strategyDids.size} strategy keys` });
   const journal = Object.fromEntries((db.prepare("SELECT state, COUNT(*) n FROM write_attempts GROUP BY state").all() as { state: string; n: number }[]).map((r) => [r.state, r.n]));
   checks.push({ name: "no write left unresolved", ok: !journal.UNKNOWN && !journal.SENDING && !journal.PLANNED && !journal.PREPARED, detail: JSON.stringify(journal) });
   return {
@@ -151,5 +167,7 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
     final: { keys: keyStatusCounts(db), room: getRoom(db, room).status, halted: haltSummary(db), testTrade: ttRow?.status ?? null },
     server: { posts: srv.posts, messages: Object.fromEntries([...srv.rooms].map(([k, v]) => [k, v.length])), ownerNote: srv.notes.has(`room-owners/${room}`), allowDids: allow.length },
     checks, journal,
+    world: { db, srv, signers, referee, room, now: () => simNow, setNow: (ms) => { simNow = ms; },
+      publish: (n) => { referee.sweep(n, sweepTime(contest, n) + lag); published = Math.max(published, n); }, published: () => published },
   };
 }

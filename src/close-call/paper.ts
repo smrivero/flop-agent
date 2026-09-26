@@ -56,13 +56,20 @@ export interface TradeExecutor {
   recover?(repost: (intentId: string) => Promise<string[] | null>): Promise<void>;
   /** Does the executor already hold a journal row for this intent? */
   has?(intentId: string): boolean;
+  /**
+   * Live only: may this posted trade enter our book for sweep n? "include" only when the referee
+   * demonstrably read it (located in our room, stamped before the boundary, sweep's flow published,
+   * seq outside every reported missed range); "exclude:<why>" when it certainly did not; "defer" when
+   * that cannot be decided yet (never guessed).
+   */
+  admissible?(intentId: string, sweep: number): Promise<string>;
 }
 export const PAPER_EXECUTOR: TradeExecutor = { live: false, post: async () => ({ posted: true, state: "SIMULATED", detail: "paper: nothing signed or sent" }) };
 
 /** Keys the live strategy may use: real, tradable, never used by a bootstrap/probe trade (those hold a 0.10 position). */
 export function liveStrategyKeys(db: CcDb): KeyRecord[] {
   const used = new Set((db.prepare("SELECT maker_id m, taker_id t FROM trades").all() as { m: string; t: string }[]).flatMap((r) => [r.m, r.t]));
-  const keys = listKeys(db).filter((k) => k.fake === 0 && isTradable(k.status) && !used.has(k.id));
+  const keys = listKeys(db).filter((k) => k.fake === 0 && (k.role ?? "strategy") === "strategy" && isTradable(k.status) && !used.has(k.id));
   return keys.slice(0, keys.length - (keys.length % 2));
 }
 
@@ -91,6 +98,13 @@ export class PaperTrader {
   /** Clock for the pre-POST checks (tests inject one). */
   clock: () => number = Date.now;
   private postedThisSweep = new Map<number, WireTrade[]>();
+  /** Live: sweeps whose settlement waits for the flow post or our trades' stamps. */
+  readonly deferred = new Map<number, PricePost>();
+
+  /** Live: retry deferred settlements (called by the service loop). */
+  async retryDeferred(): Promise<void> {
+    for (const [n, price] of [...this.deferred].sort((a, b) => a[0] - b[0])) await this.settle(n, price);
+  }
 
   constructor(private db: CcDb, private cfg: CloseCallConfig, private contest: Contest,
     readonly fold: OfficialFold, readonly lookFold: OfficialFold, private hl: HyperliquidObserver | null,
@@ -212,7 +226,8 @@ export class PaperTrader {
     const r = this.referenceFor(n);
     const est = estimateClose(this.cfg.estimator, {
       lastRefPx: r?.ref ?? null, lastRefAgeS: r?.ageS ?? null,
-      hl: this.hl?.latest ?? null, hlAgeMs: this.hl?.ageMs(nowMs) ?? null,
+      // Freshness = FEED health: the last trade, however old, is exactly what the close will be if nothing trades.
+      hl: this.hl?.latest ?? null, hlAgeMs: this.hl?.feedAgeMs(nowMs) ?? null,
     }, this.cfg.hlStaleMs, this.cfg.refereeStaleAgeS);
     return { est, r };
   }
@@ -457,7 +472,25 @@ export class PaperTrader {
       await this.paperMint(n, refStr, close);
       return;
     }
-    const pend = this.pending.get(n) ?? [];
+    let pend = this.pending.get(n) ?? [];
+    if (this.exec.admissible && pend.length) {
+      const verdicts = await Promise.all(pend.map((p) => this.exec.admissible!(p.intentId, n)));
+      if (verdicts.includes("defer")) {
+        this.deferred.set(n, price);
+        ccLog("LIVE RESULT", { sweep: n, waiting: verdicts.filter((v) => v === "defer").length }, "settlement deferred: waiting for the flow post / the stamp of our trades");
+        return;
+      }
+      this.deferred.delete(n);
+      const excluded = pend.filter((_, i) => verdicts[i] !== "include");
+      for (const p of excluded) {
+        const why = verdicts[pend.indexOf(p)].replace(/^exclude:/, "");
+        this.db.prepare("UPDATE intents SET outcome = 'void', reason = ?, actual_close = ?, result_at = ? WHERE intent_id = ?").run(`not_applied:${why}`, close, now(), p.intentId);
+        this.exec.onSettled?.(p.intentId, "not_applied", why);
+        this.state = this.strategy.onResult(this.state, p.intent.pairIndex, p.intent.favored, p.intent.trigger, p.intent.tries, false);
+        ccLog("LIVE RESULT", { sweep: n, trade_id: p.wire.id, outcome: "NOT_APPLIED", why }, "the referee did not read this trade: kept out of our book, pair released");
+      }
+      pend = pend.filter((_, i) => verdicts[i] === "include");
+    }
     this.pending.delete(n);
     this.postedThisSweep.delete(n);
     // Live: our real keys enter our book the first sweep after they are READY (their mint is confirmed by

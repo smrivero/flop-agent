@@ -23,7 +23,7 @@ import { makerSigningString, REFEREE_DID, takerSigningString, type Terms } from 
 import type { CcDb } from "../store.js";
 import type { MockTechnocore } from "./mock-technocore.js";
 
-export interface SimRefereeOptions { listMints?: boolean; ref?: string; missSeqs?: { room: string; from: number; to: number }[] }
+export interface SimRefereeOptions { listMints?: boolean; listSettled?: boolean; ref?: string; ageS?: number; missSeqs?: { room: string; from: number; to: number }[] }
 
 export class SimReferee {
   owners = new Set<string>();
@@ -33,13 +33,26 @@ export class SimReferee {
   private postSeq: Record<string, number> = {};
   private observer: RefereeObserver;
 
-  constructor(private db: CcDb, private srv: MockTechnocore, private contest: Contest, private opts: SimRefereeOptions = {}) {
+  constructor(private db: CcDb, private srv: MockTechnocore, private contest: Contest, public opts: SimRefereeOptions = {}) {
     this.observer = new RefereeObserver(db, "http://unused.invalid", null);
   }
 
   private post(room: string, body: Record<string, unknown>, tsMs: number) {
     this.postSeq[room] = (this.postSeq[room] ?? 0) + 1;
     this.observer.ingest(room, 1, { seq: this.postSeq[room], ts: new Date(tsMs).toISOString(), from: REFEREE_DID, text: JSON.stringify(body) });
+  }
+
+  /** Other players' owners (the real count is ~1.2M): only our growth is simulated on top. */
+  baseOwners = 1_000_000;
+
+  /** The contest seed (the engine needs it to start its book). */
+  seed(px = "226.00"): void {
+    this.post("d-close1-price", { t: "seed", season: "close-1", price: px, trade: { tid: 1, time: new Date(this.contest.openingMs - 1000).toISOString() }, package: "sim", rooms: ["close1"] }, this.contest.openingMs);
+  }
+
+  /** Publish a state post for sweep n with no activity (the sweep before the simulation starts). */
+  baseline(n: number): void {
+    this.post("d-close1-state", { t: "state", n, root: `sim-root-${n}`, owners: this.baseOwners + this.owners.size, rooms: this.listed.size, file: `sim-${n}` }, sweepTime(this.contest, n) + 3_000);
   }
 
   /** Run sweep n and publish it (the publication time is `publishMs`, default boundary + 3 s). */
@@ -91,10 +104,13 @@ export class SimReferee {
       settled.push(id);
     }
     const file = `sim-${n}`;
-    this.post("d-close1-price", { t: "price", n, ref: { px: ref, tid: n, time: new Date(boundary - 1_000).toISOString() }, limits: [fmt2(lo), fmt2(hi)], global: ref, file }, publishMs);
+    this.post("d-close1-price", { t: "price", n, ref: { px: ref, tid: n, time: new Date(boundary - 1_000).toISOString() }, limits: [fmt2(lo), fmt2(hi)], global: ref, file,
+      ...(this.opts.ageS !== undefined ? { age_s: this.opts.ageS } : {}) }, publishMs);
     const missed = (this.opts.missSeqs ?? []).map((r) => [r.room, r.from, r.to]);
-    this.post("d-close1-flow", { t: "flow", n, mints: this.opts.listMints === false ? [] : mints, rooms, settled, void: voids, missed, file,
-      omitted: this.opts.listMints === false && mints.length ? { mints: mints.length } : {} }, publishMs);
+    const hideSettled = this.opts.listSettled === false;
+    this.post("d-close1-flow", { t: "flow", n, mints: this.opts.listMints === false ? [] : mints, rooms, settled: hideSettled ? [] : settled, void: voids, missed, file,
+      omitted: { ...(this.opts.listMints === false && mints.length ? { mints: mints.length } : {}), ...(hideSettled && settled.length ? { settled: settled.length } : {}) } }, publishMs);
+    this.post("d-close1-state", { t: "state", n, root: `sim-root-${n}`, owners: this.baseOwners + this.owners.size, rooms: this.listed.size, file }, publishMs);
     return { mints, rooms, settled, void: voids };
   }
 }

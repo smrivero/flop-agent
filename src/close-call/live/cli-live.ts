@@ -19,7 +19,7 @@
 import { lastClosedSweep, loadContest } from "../contest.js";
 import { CloseCallConfigError, loadCloseCallConfig } from "../config.js";
 import { backupGate } from "../backup-gate.js";
-import { Bootstrap } from "../bootstrap.js";
+import { Bootstrap, RoomKeeper } from "../bootstrap.js";
 import { WriteJournal } from "../journal.js";
 import { keyStatusCounts } from "../keys.js";
 import { fetchLimits } from "../limits.js";
@@ -76,14 +76,15 @@ async function main(argv: string[]): Promise<number> {
     return r.ok ? 0 : 1;
   }
 
+  const envFile = process.env.CLOSECALL_ENV_FILE ?? null;
   if (cmd === "check") {
-    const r = liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED);
+    const r = await liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED, "check", { offline: has("--offline"), envFile });
     out(renderReadiness(r));
     return r.pass ? 0 : 1;
   }
 
   if (cmd === "run") {
-    const r = liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED);
+    const r = await liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED, "run", { envFile });
     process.stdout.write(banner("live") + "\n");
     if (!r.pass) {
       process.stderr.write(renderReadiness(r) + "\n[CLOSECALL][HALT] live readiness FAILED: refusing to start. NO WRITE.\n");
@@ -97,8 +98,13 @@ async function main(argv: string[]): Promise<number> {
       const transport = new HttpTransport(cfg.technocoreBaseUrl);
       const journal = new WriteJournal(ldb, signers, transport, { onAmbiguous: (row, why) => halt(ldb, "ambiguous_operation", `${row.op_key}: ${why}`) });
       const executor = new LiveExecutor(ldb, signers, journal, transport, cfg.room!, contest, cfg.postGuardMs);
+      const keeper = new RoomKeeper({ db: ldb, journal, transport, room: cfg.room!, clock: Date.now, refreshDays: cfg.roomRefreshDays });
+      // Startup order: readiness (keys, room on server, nonce reconciliation, backup, clock) passed above ->
+      // bootstrap-era writes reconciled -> runLoop: observer + reconcile, fold replay, live_trades recovery,
+      // then decisions (none while a halt such as an UNKNOWN trade is active).
+      await journal.recover();
       ccLog("MODE", { mode: "live", db: cfg.liveDbPath, room: cfg.room, keys: signers.size, policy: cfg.confirmationPolicy }, "LIVE MODE: Strategy K intents are signed and posted");
-      await runLoop(ldb, cfg, contest, { paper: false, executor, maxMinutes: arg("--minutes") ? Number(arg("--minutes")) : undefined });
+      await runLoop(ldb, cfg, contest, { paper: false, executor, maintenance: () => keeper.tick(), maxMinutes: arg("--minutes") ? Number(arg("--minutes")) : undefined });
       return 0;
     } finally {
       ldb.close();
@@ -118,9 +124,12 @@ async function main(argv: string[]): Promise<number> {
 
   if (cmd === "keygen") {
     const total = Number(arg("--total"));
-    if (!has("--i-understand-these-are-real-keys")) { process.stderr.write("keygen creates REAL keys: pass --total N --i-understand-these-are-real-keys\n"); return 2; }
+    const role = (arg("--role") ?? "") as "admin" | "staging" | "strategy";
+    if (!["admin", "staging", "strategy"].includes(role)) { process.stderr.write("keygen --role admin|staging|strategy --total N --i-understand-these-are-real-keys\n"); return 2; }
+    if (!has("--i-understand-these-are-real-keys")) { process.stderr.write("keygen creates REAL keys: pass --i-understand-these-are-real-keys\n"); return 2; }
+    if (cfg.dbPath !== cfg.liveDbPath || cfg.dataDir === "/var/lib/flop-closecall") { process.stderr.write("keygen only with the LIVE env (its own data dir): refusing\n"); return 3; }
     try {
-      const r = generateKeys(db, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient, total });
+      const r = generateKeys(db, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient, total, role });
       out({ created: r.created, existing: r.existing, next: "run closecall-backup.sh, verify it on the Mac, then keys --backup-verify: live writes stay blocked until then" });
       return 0;
     } catch (e) {
@@ -153,10 +162,15 @@ async function main(argv: string[]): Promise<number> {
         gate: () => backupGate(db, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient }),
         pace: async () => { await sleep(perWriteMs); }, refreshDays: cfg.roomRefreshDays,
       });
-      const r = await b.step();
-      ccLog("BOOTSTRAP", { phase: r.phase, action: r.action, writes: r.writes }, r.detail);
-      out(r);
-      return r.action === "halted" || r.action === "blocked" ? 1 : 0;
+      // --loop: keep stepping (resumable: every step re-derives its position from the DB and the server).
+      for (;;) {
+        const r = await b.step();
+        ccLog("BOOTSTRAP", { phase: r.phase, action: r.action, writes: r.writes, blockers: r.blockers?.slice(0, 3) }, r.detail);
+        out(r);
+        if (r.action === "halted" || r.action === "blocked") return 1;
+        if (r.action === "done" || !has("--loop")) return 0;
+        if (r.action === "waiting") await sleep(30_000);
+      }
     } finally {
       lock.release();
     }

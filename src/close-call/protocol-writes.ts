@@ -40,7 +40,7 @@ export interface Signer {
 }
 
 export interface SignedMessageBody { did: string; sig: string; nonce: string; text: string }
-export interface SignedNoteBody { value: string; did: string; sig: string; nonce: string; if_absent?: boolean }
+export interface SignedNoteBody { value: string; did: string; sig: string; nonce: string; if_absent?: boolean; if?: string }
 
 export function messageSigningString(room: string, nonce: string, text: string): string {
   return `${room}|${nonce}|${sweepText(text)}`;
@@ -65,7 +65,7 @@ export function buildSignedMessage(signer: Signer, room: string, nonce: string, 
 }
 
 export function buildSignedNote(signer: Signer, ns: typeof OWNERS_NS | typeof ALLOW_NS, key: string, nonce: string, value: string,
-  opts: { ifAbsent?: boolean } = {}): { path: string; body: SignedNoteBody } {
+  opts: { ifAbsent?: boolean; ifValue?: string } = {}): { path: string; body: SignedNoteBody } {
   check(NAME_RE.test(key) && key.startsWith("d-"), `only d- rooms are ownable: ${key}`);
   check(NONCE_RE.test(nonce), `bad nonce ${nonce}`);
   const swept = sweepText(value);
@@ -74,6 +74,7 @@ export function buildSignedNote(signer: Signer, ns: typeof OWNERS_NS | typeof AL
   check(SIG_RE.test(sig), "signer returned a malformed signature");
   const body: SignedNoteBody = { value: swept, did: signer.did, sig, nonce };
   if (opts.ifAbsent) body.if_absent = true;
+  else if (opts.ifValue !== undefined) body.if = opts.ifValue;          // compare-and-set: only if the note still holds this
   return { path: `/kv/${ns}/${key}`, body };
 }
 

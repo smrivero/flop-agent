@@ -93,13 +93,13 @@ test("safety checks: referee silence, stale Hyperliquid and low disk halt and th
   const cfg = testConfig({ CLOSECALL_DATA_DIR: dir, CLOSECALL_HALT_REFEREE_SILENCE_S: "600", CLOSECALL_HALT_HL_STALE_MS: "60000" });
   const alerts = new Alerts(db, [], 0);
   db.prepare("INSERT INTO raw_posts (room, seq, generation, text, fetched_at) VALUES ('d-close1-price', 1, 1, '{}', ?)").run(new Date(Date.now() - 3_600_000).toISOString());
-  safetyChecks(db, cfg, rt(), alerts, { lastOkAt: null }, { ageMs: () => 120_000 });
+  safetyChecks(db, cfg, rt(), alerts, { lastOkAt: null }, { feedAgeMs: () => 120_000 });
   assert.deepEqual(Object.keys(activeHalts(db)).sort(), ["hyperliquid_stale", "referee_stale"]);
   db.prepare("INSERT INTO raw_posts (room, seq, generation, text, fetched_at) VALUES ('d-close1-price', 2, 1, '{}', ?)").run(new Date().toISOString());
-  safetyChecks(db, cfg, rt(), alerts, { lastOkAt: null }, { ageMs: () => 2_000 });
+  safetyChecks(db, cfg, rt(), alerts, { lastOkAt: null }, { feedAgeMs: () => 2_000 });
   assert.deepEqual(activeHalts(db), {});
   const low = testConfig({ CLOSECALL_DATA_DIR: dir, CLOSECALL_DISK_LOW_MB: "999999" });
-  safetyChecks(db, low, rt(), alerts, { lastOkAt: null }, { ageMs: () => 2_000 });
+  safetyChecks(db, low, rt(), alerts, { lastOkAt: null }, { feedAgeMs: () => 2_000 });
   assert.ok(activeHalts(db).disk_low);
   assert.ok((db.prepare("SELECT COUNT(*) n FROM alerts WHERE event = 'disk_low'").get() as { n: number }).n >= 1);
 });

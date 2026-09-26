@@ -58,7 +58,14 @@ export function halt(db: CcDb, kind: HaltKind, reason: string, alerts?: Alerts):
   setMeta(db, "halts", JSON.stringify(halts));
   healthEvent(db, "halt", h);
   ccLog("HALT", { kind, severity: h.severity, code: h.code }, `HALTED: ${reason}`);
-  void alerts?.raise({ event: "execution_halted", severity: h.severity === "grave" ? "critical" : "warning", message: `HALTED: ${kind}: ${reason}`, key: kind });
+  if (alerts) void alerts.raise({ event: "execution_halted", severity: h.severity === "grave" ? "critical" : "warning", message: `HALTED: ${kind}: ${reason}`, key: kind });
+  else {
+    // No alert sink in this code path (executor, bootstrap, keeper): still record it where monitor and alerts read.
+    try {
+      db.prepare("INSERT INTO alerts (event, severity, message, detail, delivered, at) VALUES ('execution_halted', ?, ?, ?, 'log', ?)")
+        .run(h.severity === "grave" ? "critical" : "warning", `HALTED: ${kind}: ${reason}`, JSON.stringify({ code: h.code }), at);
+    } catch { /* read-only DB */ }
+  }
   return h;
 }
 

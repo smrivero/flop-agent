@@ -43,6 +43,7 @@ export interface WriteOp {
   text?: string;                // messages
   value?: string;               // notes
   ifAbsent?: boolean;           // notes (the initial claim)
+  ifValue?: string;             // notes: compare-and-set against the value read just before
 }
 
 export class TransportTimeout extends Error {}
@@ -54,6 +55,8 @@ export interface Transport {
   post(path: string, body: unknown): Promise<TransportResponse>;
   readRoom(room: string, since: number): Promise<{ first_seq: number | null; last_seq: number; messages: RoomMessage[] }>;
   readNote(ns: string, key: string): Promise<string | null>;
+  /** The newest messages (GET /r/<room>?limit=200): a fresh write is found here even in a busy room. */
+  readTail?(room: string): Promise<{ messages: RoomMessage[] }>;
 }
 
 export interface AttemptRow {
@@ -63,6 +66,12 @@ export interface AttemptRow {
 }
 
 export class AmbiguousOperation extends Error {}
+
+/** Seconds to wait from a 429 body ("... retry in 2 s" / "Retry-After: 2"); 5 when unreadable. */
+export function retryAfterS(body: string): number {
+  const m = body.match(/(\d+(?:\.\d+)?)\s*(?:s\b|sec|second)/i) ?? body.match(/retry-after:?\s*(\d+)/i);
+  return m ? Math.min(60, Math.max(1, Number(m[1]))) : 5;
+}
 
 const FINAL: AttemptState[] = ["CONFIRMED", "FAILED"];
 
@@ -136,7 +145,7 @@ export class WriteJournal {
     return this.db.transaction(() => {
       const nonce = this.reserveNonce(op.signerId, this.scope(op), nonceFloor);
       const req = op.kind === "note-owners" || op.kind === "note-allow"
-        ? buildSignedNote(signer, op.kind === "note-owners" ? "room-owners" : "room-allow", op.room, nonce, op.value!, { ifAbsent: op.ifAbsent })
+        ? buildSignedNote(signer, op.kind === "note-owners" ? "room-owners" : "room-allow", op.room, nonce, op.value!, { ifAbsent: op.ifAbsent, ifValue: op.ifValue })
         : buildSignedMessage(signer, op.room, nonce, op.text!);
       return this.set(row, { state: "PREPARED", nonce, body: JSON.stringify({ op, request: req }) });
     })();
@@ -162,6 +171,11 @@ export class WriteJournal {
       return this.set(row, { state: "UNKNOWN", error: (e as Error).message });
     }
     if (res.status >= 200 && res.status < 300) return this.set(row, { state: "CONFIRMED", http_status: res.status, response: res.text.slice(0, 2000) });
+    if (res.status === 429) {
+      // Rate limited: NOT stored. The same signed body may be sent again after the wait (callers decide when).
+      ccLog("EXECUTOR", { op: row.op_key, retry_after_s: retryAfterS(res.text) }, "429: not stored; same body kept for a later send");
+      return this.set(row, { state: "PREPARED", http_status: 429, response: res.text.slice(0, 500), error: `429 retry after ${retryAfterS(res.text)} s` });
+    }
     if (opts.noResend) {
       ccLog("EXECUTOR", { op: row.op_key, status: res.status, body: res.text.slice(0, 200) }, "write refused (no automatic re-send)");
       return this.set(row, { state: "FAILED", http_status: res.status, response: res.text.slice(0, 2000), error: `HTTP ${res.status}` });
@@ -197,13 +211,17 @@ export class WriteJournal {
       const counter = await this.transport.readNote("room-nonce", op.room);
       return { present: value !== null && value === req.body.value && !!counter && BigInt(counter) >= BigInt(req.body.nonce), serverNonce: counter ? BigInt(counter) : 0n };
     }
-    const mine = await this.readMine(op.room, req.body.did);
+    const mine = await this.readMine(op.room, req.body.did, req.body.text);
     const serverNonce = mine.reduce((mx, m) => (m.nonce && BigInt(m.nonce) > mx ? BigInt(m.nonce) : mx), 0n);
     return { present: mine.some((m) => m.text === req.body.text), serverNonce };
   }
 
   /** Every message by `did` still in the room's history, paging forward (busy rooms like close1 hold thousands). */
-  private async readMine(room: string, did: string, maxPages = 100): Promise<RoomMessage[]> {
+  private async readMine(room: string, did: string, text?: string, maxPages = 100): Promise<RoomMessage[]> {
+    if (this.transport.readTail) {
+      const tail = (await this.transport.readTail(room)).messages.filter((m) => m.from === did);
+      if (text !== undefined && tail.some((m) => m.text === text)) return tail;
+    }
     const mine: RoomMessage[] = [];
     let since = 0;
     for (let page = 0; page < maxPages; page++) {
@@ -220,7 +238,7 @@ export class WriteJournal {
     const op = this.opOf(row);
     if (op.kind === "note-owners" || op.kind === "note-allow") return null;
     const req = this.request(row);
-    const mine = (await this.readMine(op.room, req.body.did)).filter((m) => m.text === req.body.text);
+    const mine = (await this.readMine(op.room, req.body.did, req.body.text)).filter((m) => m.text === req.body.text);
     // Same text can appear more than once (a deliberate repost): the nonce identifies THIS attempt.
     return mine.find((m) => m.nonce === req.body.nonce) ?? (mine.length === 1 ? mine[0] : null);
   }

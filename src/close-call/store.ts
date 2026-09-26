@@ -131,6 +131,14 @@ const MIGRATIONS: { version: number; name: string; up: (db: CcDb) => void }[] = 
         created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS live_trades_state ON live_trades (state);`),
   },
+  {
+    version: 5,
+    name: "key roles: admin (room owner) / staging (test trades) / strategy (CC001..CC100)",
+    up: (db) => {
+      const cols = (db.prepare("PRAGMA table_info(keys)").all() as { name: string }[]).map((c) => c.name);
+      if (!cols.includes("role")) db.exec("ALTER TABLE keys ADD COLUMN role TEXT");
+    },
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

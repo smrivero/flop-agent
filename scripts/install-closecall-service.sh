@@ -32,6 +32,8 @@ fi
 
 # 3. dirs (never chmod -R the data: only the top levels)
 install -d -m 0700 -o "$SVC_USER" -g "$SVC_USER" "$DATA" "$DATA/keys" "$DATA/backups" "$DATA/logs"
+# live state: a separate tree nothing paper can touch (the units make each tree inaccessible to the other)
+install -d -m 0700 -o "$SVC_USER" -g "$SVC_USER" /var/lib/flop-closecall-live /var/lib/flop-closecall-live/keys /var/lib/flop-closecall-live/backups /var/lib/flop-closecall-live/logs
 install -d -m 0750 -o root -g "$SVC_USER" "$ETC"
 
 # 4. env file: create once, never overwrite

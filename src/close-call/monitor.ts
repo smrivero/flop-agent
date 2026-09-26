@@ -22,6 +22,7 @@ import { lastClosedSweep, sweepTime, type Contest } from "./contest.js";
 import type { Health } from "./health.js";
 import { KEY_STATUSES } from "./keys.js";
 import { lockStatus } from "./lock.js";
+import { backupGate } from "./backup-gate.js";
 import { decideStale, type StaleDecision } from "./stale-policy.js";
 
 // ------------------------------------------------------------------ data
@@ -49,7 +50,9 @@ export interface MonitorData {
   trades: { simulated: boolean; total: N<number>; settled: N<number>; void: N<number>; pending: N<number>; unknown: N<number>;
     recent: { id: string; maker: string; taker: string; side: string; qty: string; px: string; sweep: number; status: string; fee: N<string> }[] };
   security: { executor: string; writes: "DISABLED" | "ENABLED"; halted: N<boolean>; safeMode: string; haltReason: N<string>; pendingWrites: N<number>; unresolved: N<number>; nonceErrors: N<number> };
-  reconcile: { l1: N<string>; l1Sweep: N<number>; l2: N<string>; mismatches: N<number>; lastMismatch: N<string> };
+  reconcile: { l1: N<string>; l1Sweep: N<number>; l2: N<string>; mismatches: N<number>; sinceStart: N<number>; lastMismatch: N<string> };
+  live: null | { roles: Record<string, string>; journal: Record<string, number>; nonceScopes: number; backup: string; backupOk: boolean; room: string; roomOk: boolean;
+    ntp: N<boolean>; staging: string };
   errors: { reconnects: N<number>; timeouts: N<number>; http503: N<number>; alerts24h: N<number>; lastAlerts: { at: string; severity: string; message: string }[] };
   activity: { refereeS: N<number>; hlS: N<number>; strategyS: N<number>; dbWriteS: N<number> };
 }
@@ -325,9 +328,11 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
   const l1 = q<{ status: string; n: number | null }>(db, "SELECT status, n FROM reconcile WHERE level = 'L1-referee' ORDER BY id DESC LIMIT 1");
   const l2 = q<{ status: string; level: string }>(db, "SELECT status, level FROM reconcile WHERE level LIKE 'L2%' ORDER BY id DESC LIMIT 1");
   const mm = q<{ n: number }>(db, "SELECT COUNT(*) n FROM reconcile WHERE status <> 'OK'");
+  const startIso = sd?.since ? new Date(sd.since).toISOString() : h ? new Date(now - h.process.uptime_s * 1000).toISOString() : null;
+  const mmNow = startIso ? q<{ n: number }>(db, "SELECT COUNT(*) n FROM reconcile WHERE status <> 'OK' AND at >= ?", startIso) : undefined;
   const lastMm = q<{ n: number | null; level: string; at: string }>(db, "SELECT n, level, at FROM reconcile WHERE status <> 'OK' ORDER BY id DESC LIMIT 1");
   const reconcile: MonitorData["reconcile"] = {
-    l1: l1?.status ?? null, l1Sweep: l1?.n ?? null, l2: l2?.status ?? null, mismatches: mm?.n ?? null,
+    l1: l1?.status ?? null, l1Sweep: l1?.n ?? null, l2: l2?.status ?? null, mismatches: mm?.n ?? null, sinceStart: mmNow?.n ?? null,
     lastMismatch: lastMm ? `${lastMm.level} @${lastMm.n ?? "-"} ${lastMm.at.slice(0, 16).replace("T", " ")}` : null,
   };
 
@@ -348,9 +353,29 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
     dbWriteS: lastWrite ? Math.max(0, Math.round((now - lastWrite) / 1000)) : null,
   };
 
+  // ---- live-only operational state
+  let liveD: MonitorData["live"] = null;
+  if (live && exec) {
+    const roleRows = qa<{ role: string | null; status: string; n: number }>(exec, "SELECT role, status, COUNT(*) n FROM keys WHERE fake = 0 GROUP BY role, status");
+    const roles: Record<string, string> = {};
+    for (const r of ["admin", "staging", "strategy"]) roles[r] = roleRows.filter((x) => x.role === r).map((x) => `${x.status} ${x.n}`).join(", ") || "none";
+    const journal = Object.fromEntries(qa<{ state: string; n: number }>(exec, "SELECT state, COUNT(*) n FROM live_trades GROUP BY state").map((r) => [r.state, r.n]));
+    const gate = safe(() => backupGate(exec, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient }), null);
+    const rh = safe(() => JSON.parse(q<{ value: string }>(exec, "SELECT value FROM meta WHERE key = 'room_health'")?.value ?? "null") as { ok: boolean; why?: string; at: string } | null, null);
+    const roomState = cfg.room ? q<{ status: string }>(exec, "SELECT status FROM rooms_state WHERE name = ?", cfg.room)?.status ?? "UNCREATED" : "not set";
+    const ts = q<{ value: string }>(exec, "SELECT value FROM meta WHERE key = 'test_trade_settled'")?.value;
+    liveD = {
+      roles, journal, nonceScopes: q<{ n: number }>(exec, "SELECT COUNT(*) n FROM nonces")?.n ?? 0,
+      backup: gate ? (gate.ok ? `OK ${gate.verified!.archive}` : gate.problems[0] ?? "not verified") : "N/A", backupOk: !!gate?.ok,
+      room: `${cfg.room ?? "-"} ${roomState}${rh ? ` · checked ${rh.at.slice(11, 16)}Z ${rh.ok ? "ok" : `FAIL ${rh.why}`}` : ""}`, roomOk: roomState === "READY" && (rh?.ok ?? true),
+      ntp: safe(() => execFileSync("timedatectl", ["show", "-p", "NTPSynchronized", "--value"], { encoding: "utf8", timeout: 1500, stdio: ["ignore", "pipe", "ignore"] }).trim() === "yes", null),
+      staging: ts ? `staging trade settled @${ts}` : "staging trade not settled",
+    };
+  }
+
   safe(() => db?.close(), undefined);
   if (exec && exec !== db) safe(() => exec.close(), undefined);
-  return { at: now, host: hostname(), mode: cfg.mode, version: (src.version ?? readVersion)(), service, contest: contestD, hl, keys, positions, leaderboard, strategy, trades, security, reconcile, errors, activity };
+  return { at: now, host: hostname(), mode: cfg.mode, version: (src.version ?? readVersion)(), service, contest: contestD, hl, keys, positions, leaderboard, strategy, trades, security, reconcile, errors, activity, live: liveD };
 }
 
 // ------------------------------------------------------------------ render
@@ -479,7 +504,8 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
   blocks.push([p.bold("RECONCILE"),
     row("L1", r.l1 === null ? NA : `${state(r.l1 === "OK" ? "OK" : "ERROR")}${r.l1Sweep !== null ? ` @${r.l1Sweep}` : ""}`),
     row("L2", r.l2 === null ? NA : state(r.l2 === "OK" ? "OK" : "ERROR")),
-    row("mismatches", (r.mismatches ?? 0) > 0 ? p.err(String(r.mismatches)) : v(r.mismatches)), row("last mismatch", v(r.lastMismatch)),
+    row("mismatches (run)", r.sinceStart === null ? NA : r.sinceStart > 0 ? p.err(String(r.sinceStart)) : p.ok("0")),
+    row("mismatches (all)", p.dim(v(r.mismatches))), row("last mismatch", p.dim(v(r.lastMismatch))),
   ]);
 
   const e = d.errors;
@@ -487,6 +513,17 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
     row("reconnects", v(e.reconnects)), row("timeouts", v(e.timeouts)), row("HTTP 503 today", v(e.http503)), row("alerts 24h", (e.alerts24h ?? 0) > 0 ? p.warn(String(e.alerts24h)) : v(e.alerts24h)),
     ...e.lastAlerts.map((a) => `${p.dim(a.at.slice(5, 16).replace("T", " "))} ${a.severity === "critical" ? p.err(a.severity) : p.warn(a.severity)} ${a.message.slice(0, 60)}`),
   ]);
+
+  if (d.live) {
+    const L = d.live;
+    blocks.push([p.bold("LIVE"),
+      row("admin", L.roles.admin), row("staging", L.roles.staging), row("strategy", L.roles.strategy), row("staging trade", L.staging),
+      row("journal", Object.entries(L.journal).map(([k, n]) => `${k} ${n}`).join(", ") || "empty"),
+      row("UNKNOWN trades", (L.journal.UNKNOWN ?? 0) > 0 ? p.err(String(L.journal.UNKNOWN)) : p.ok("0")),
+      row("nonce scopes", String(L.nonceScopes)), row("backup", L.backupOk ? p.ok(L.backup) : p.err(L.backup)),
+      row("room", L.roomOk ? p.ok(L.room) : p.err(L.room)), row("clock NTP", L.ntp === null ? NA : L.ntp ? p.ok("synchronized") : p.err("NOT synchronized")),
+    ]);
+  }
 
   const a = d.activity;
   const fresh = (x: number | null, warnS: number) => (x === null ? NA : x > warnS * 3 ? p.err(ago(x)) : x > warnS ? p.warn(ago(x)) : ago(x));

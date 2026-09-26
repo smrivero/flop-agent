@@ -372,6 +372,105 @@ After that:
   lists, which are truncated, so many ids stay "unlisted".
 - An UNKNOWN POST halts live execution for an operator decision; paper never has one.
 
+## Operational design for live (pre-live audit, 26 Sep)
+
+**Isolation.**
+
+| | PAPER | LIVE |
+|---|---|---|
+| data dir | `/var/lib/flop-closecall` | `/var/lib/flop-closecall-live` |
+| DB | `close-call.sqlite3` (fake keys, paper strategy state, paper halts and mismatches) | `live.sqlite3` (fresh: its own keys, strategy state, intents, nonces, journal, halts) |
+| lock, logs, backups, health port | inside the paper dir, 8787 | inside the live dir, 8788 |
+| env | `closecall.env` | `closecall-live.env` |
+
+- Each unit has `InaccessiblePaths=` on the other tree, so neither service can read or write the other's
+  state.
+- `live-check` fails if live points at the paper dir.
+- Live starts with an empty strategy state. Its first decision is the split start at the market price of that
+  moment:
+  - `lo = hi = estimate`, with pairs 0 and 1;
+  - the next low is `lo × (1 − 0.25%)` and the next high is `hi × (1 + 0.25%)`;
+  - pairs are used in order.
+- Nothing is inherited from paper: not lo/hi, not pairs_used, not the trigger history.
+
+**Key roles.**
+- `CC-ADMIN` claims, owns and registers the room, refreshes the notes and posts keepalives. It never trades.
+- `CC-TEST-001/002` make the 0.10 staging trade.
+- `CC001..CC100` are the strategy keys, untouched until Strategy K uses them: 10,000 POLF, flat.
+
+This fits the rules: any did:key may register once, any owner may register a room, and one operator may run
+many keys. The admin must itself be an owner, because only owners register rooms; its 10,000 POLF stay idle.
+
+**Commands.** All are resumable and idempotent:
+```
+flop-closecall live keygen --role admin|staging|strategy --total N --i-understand-these-are-real-keys
+flop-closecall live bootstrap --loop
+```
+
+Per-key flags, in `flop-closecall --live keys`:
+```
+GENERATED → BACKED_UP → REGISTERED → MINT_EXPECTED → MINTED → ROOM_ALLOWED → READY
+```
+
+**Writes, retries and rate limits.** Limits are read live from `/config`: today 300 writes/min/IP, and the
+bootstrap uses 25% of that.
+
+| write | on 429 | on timeout / crash |
+|---|---|---|
+| bootstrap: claim, allow (CAS `if`), owner, room, staging trade | not stored → same signed body after `Retry-After`, up to 6 times, then halt | read-back first; resend the same body only if absent (the nonce guard prevents a duplicate) |
+| strategy trade | same body, only while it can still land before `boundary − 3 s`, else NOT_POSTED | read-back **only** → found: POSTED; absent: UNKNOWN + grave halt, never re-sent |
+
+**PROTOCOL mint evidence.** Timing is never evidence. All of the following are required:
+- our owner message, byte-exact and signed, in a room registered before its stamp (`close1`, or our room after
+  the sweep that listed it);
+- stamped for a sweep the referee has **published** (flow and state posts);
+- outside every `missed` range;
+- the state post's owner count grew by **at least as many as our registrations stamped for that sweep**;
+- no `not_owner` void of ours.
+
+`flow.mints` is never needed, so truncation does not matter. The first trade of each key is a further check: a
+`not_owner` void is a grave mismatch.
+
+**Trade finalization.** The official fold is fed ONLY trades the referee demonstrably read:
+
+| state | evidence |
+|---|---|
+| POSTED | 2xx, or found by read-back (`from` = our DID, exact text incl. trade id and both sigs, our nonce) |
+| CONFIRMED | located in our room, server `ts` ≤ the sweep boundary |
+| SETTLED / VOID | the official fold at the referee's own published ref/close, only after that sweep's flow post is published and the trade's seq is outside every `missed` range |
+| NOT_APPLIED | stamped after the boundary, or inside a missed range: kept out of our book, pair released for a retry |
+| UNKNOWN | POST uncertain and not found: grave halt, no new entries, operator decides |
+
+- The referee's lists then **verify**: listed settled vs fold void, or the reverse, is a grave halt.
+- An id the lists do not mention is `unlisted`. Truncation is normal, it never blocks, and the fold's outcome
+  stands. The fold is deterministic on those inputs and our trades only touch our own accounts.
+
+**Room lifecycle.** technocore deletes rooms and notes with no write for 7 days, and a room still on a single
+message after 12 h. Every minute, `RoomKeeper`:
+- checks that the owner note is CC-ADMIN, the allow-list is exactly ours and the room still exists; otherwise a
+  grave halt, and it **never** re-claims or recreates anything;
+- re-signs both notes with their current values every 5 days;
+- posts a plain-text keepalive after 48 h idle.
+
+**Allow-list.** 102 DIDs take 5,813 characters, against a real limit of 8,192 per note value on
+`POST /kv` (openapi): about 143 DIDs fit.
+
+**Startup order (live run).**
+1. The readiness gate, against the server:
+   - keys, room owner and allow-list;
+   - nonce reconciliation: our journal must not be behind the server;
+   - clock/NTP, backup and permissions.
+2. Bootstrap-era writes reconciled.
+3. Observer, then L1.
+4. Fold replay.
+5. `live_trades` recovery.
+6. Decisions, none while any halt (e.g. an UNKNOWN trade) is active.
+
+**Backup = full state.** The age archive holds the key files, the canary, the live env and a consistent
+`live.sqlite3` snapshot: live_trades, nonces, journal, strategy state, room state, halts. The Mac restore-check
+also runs a **drill**: it rebuilds the live dir from the archive in a temp dir and runs
+`live-check --offline` on it.
+
 ## Plan to production
 
 Done:

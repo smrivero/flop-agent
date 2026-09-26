@@ -18,7 +18,7 @@ import { publicKeyFromDid } from "../../identity.js";
 import { sweepText, type SignedMessageBody, type SignedNoteBody } from "../protocol-writes.js";
 import { TransportTimeout, type RoomMessage, type Transport, type TransportResponse } from "../journal.js";
 
-type Fault = "drop" | "timeout-after-commit" | "timeout-before-commit";
+type Fault = "drop" | "timeout-after-commit" | "timeout-before-commit" | "429";
 
 export class MockTechnocore implements Transport {
   rooms = new Map<string, RoomMessage[]>();
@@ -47,6 +47,7 @@ export class MockTechnocore implements Transport {
     this.posts++;
     const fault = this.faults.shift();
     if (fault === "drop" || fault === "timeout-before-commit") throw new TransportTimeout("request lost before the server stored it");
+    if (fault === "429") return { status: 429, text: "429 write bucket empty: refills 5/s, retry in 1 s" };
     const res = path.startsWith("/kv/") ? this.postNote(path, body as SignedNoteBody) : this.postMessage(path, body as SignedMessageBody);
     if (fault === "timeout-after-commit") throw new TransportTimeout("server stored it but the client timed out");
     return res;
@@ -92,6 +93,7 @@ export class MockTechnocore implements Transport {
     } else if (owner === undefined || b.did !== owner) {
       return { status: 403, text: "403 only the room owner writes room-allow" };
     }
+    if (b.if !== undefined && (this.notes.get(`${ns}/${key}`) ?? null) !== b.if) return { status: 409, text: "409 if: the note no longer holds that value" };
     const counter = BigInt(this.notes.get(`room-nonce/${key}`) ?? "0");
     if (BigInt(b.nonce) <= counter) return { status: 409, text: "409 nonce must exceed /kv/room-nonce" };
     this.notes.set(`room-nonce/${key}`, b.nonce);
@@ -102,6 +104,10 @@ export class MockTechnocore implements Transport {
   async readRoom(room: string, since: number) {
     const msgs = (this.rooms.get(room) ?? []).filter((m) => m.seq > since).slice(0, 200);
     return { first_seq: msgs[0]?.seq ?? null, last_seq: this.rooms.get(room)?.length ?? 0, messages: msgs };
+  }
+
+  async readTail(room: string) {
+    return { messages: (this.rooms.get(room) ?? []).slice(-200) };
   }
 
   async readNote(ns: string, key: string): Promise<string | null> {

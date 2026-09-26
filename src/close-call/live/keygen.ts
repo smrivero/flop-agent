@@ -16,7 +16,7 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readdirSync, rea
 import { join } from "node:path";
 import { didFromPublicKey, generateIdentitySeed, verifyEd25519 } from "../../identity.js";
 import { backupGate, CANARY_FILE, keyFileHashes, KEY_FILE_RE, verifyCode, type FileHash } from "../backup-gate.js";
-import { keyId, listKeys } from "../keys.js";
+import { keysByRole, listKeys, roleKeyId, type KeyRole } from "../keys.js";
 import { ccLog } from "../logger.js";
 import type { Signer } from "../protocol-writes.js";
 import { now, type CcDb } from "../store.js";
@@ -52,8 +52,10 @@ export function loadSigners(db: CcDb): Map<string, Signer> {
  * Generate keys up to `total` (CC001..CC<total>), only the ones that do not exist yet.
  * Progressive plan: total=2 first, total=100 after the 2-key stage is validated.
  */
-export function generateKeys(db: CcDb, p: { keysDir: string; backupDir: string; recipient: string | null; total: number; prefix?: string }): { created: string[]; existing: number } {
-  if (!Number.isInteger(p.total) || p.total < 1 || p.total > 100) throw new KeygenRefused("total must be 1..100");
+export function generateKeys(db: CcDb, p: { keysDir: string; backupDir: string; recipient: string | null; total: number; role?: KeyRole }): { created: string[]; existing: number } {
+  const role: KeyRole = p.role ?? "strategy";
+  const max = role === "admin" ? 1 : role === "staging" ? 2 : 100;
+  if (!Number.isInteger(p.total) || p.total < 1 || p.total > max) throw new KeygenRefused(`${role}: total must be 1..${max}`);
   if ((db.prepare("SELECT COUNT(*) n FROM keys WHERE fake = 1").get() as { n: number }).n > 0) {
     throw new KeygenRefused("this database holds paper (fake) keys: real keys go in the live DB only (CLOSECALL_LIVE_DB_PATH)");
   }
@@ -61,13 +63,14 @@ export function generateKeys(db: CcDb, p: { keysDir: string; backupDir: string; 
   if (!gate.ok) throw new KeygenRefused(`backup gate: ${gate.problems.join("; ")}`);
   mkdirSync(p.keysDir, { recursive: true, mode: 0o700 });
   if ((statSync(p.keysDir).mode & 0o077) !== 0) throw new KeygenRefused(`${p.keysDir} must be mode 700`);
-  const existing = listKeys(db).filter((k) => k.fake === 0);
+  const all = listKeys(db).filter((k) => k.fake === 0);
   const onDisk = readdirSync(p.keysDir).filter((f) => KEY_FILE_RE.test(f));
-  if (onDisk.length !== existing.length) throw new KeygenRefused(`${onDisk.length} key files on disk but ${existing.length} keys in the live DB: resolve by hand first`);
+  if (onDisk.length !== all.length) throw new KeygenRefused(`${onDisk.length} key files on disk but ${all.length} keys in the live DB: resolve by hand first`);
+  const existing = keysByRole(db, role);
   const created: string[] = [];
-  const ins = db.prepare("INSERT INTO keys (id, did, key_path, fake, status, updated_at) VALUES (?, ?, ?, 0, 'GENERATED', ?)");
+  const ins = db.prepare("INSERT INTO keys (id, did, key_path, fake, status, role, updated_at) VALUES (?, ?, ?, 0, 'GENERATED', ?, ?)");
   for (let i = existing.length + 1; i <= p.total; i++) {
-    const id = keyId(i, p.prefix ?? "CC");
+    const id = roleKeyId(role, i);
     const path = join(p.keysDir, `${id}.json`);
     if (existsSync(path)) throw new KeygenRefused(`${path} already exists: refusing to overwrite a key`);
     const { did, seedHex } = generateIdentitySeed();
@@ -80,13 +83,13 @@ export function generateKeys(db: CcDb, p: { keysDir: string; backupDir: string; 
     }
     const s = loadSigner(path);
     if (s.did !== did) throw new KeyFileError(`${id}: written key does not reload to the same did`);
-    ins.run(id, did, path, now());
+    ins.run(id, did, path, role, now());
     created.push(id);
     ccLog("KEYS", { key: id, did }, "real key generated (0600); it is NOT in any verified backup yet");
   }
   const dfd = openSync(p.keysDir, "r");
   try { fsyncSync(dfd); } finally { closeSync(dfd); }
-  return { created, existing: existing.length };
+  return { created, existing: all.length };
 }
 
 export interface RestoreReport { keys: { file: string; did: string }[]; files: FileHash[]; canaryPresent: boolean; code: string | null; problems: string[] }

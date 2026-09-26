@@ -55,6 +55,9 @@ LimitNOFILE=4096
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/var/lib/flop-closecall
+# Paper can never read or write live state (keys, live DB, journal, nonces).
+InaccessiblePaths=-/var/lib/flop-closecall-live
+InaccessiblePaths=-/etc/flop-closecall/closecall-live.env
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes

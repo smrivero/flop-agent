@@ -21,7 +21,7 @@
 
 import { verifyEd25519 } from "../../identity.js";
 import { sweepTime, type Contest } from "../contest.js";
-import type { AttemptRow, Transport, WriteJournal } from "../journal.js";
+import { retryAfterS, type AttemptRow, type Transport, type WriteJournal } from "../journal.js";
 import { getKey, isTradable } from "../keys.js";
 import { ccLog } from "../logger.js";
 import type { ExecIntent, ExecResult, TradeExecutor } from "../paper.js";
@@ -38,7 +38,7 @@ export interface LiveTradeRow {
   decided_at: string | null; sign_start: string | null; sign_end: string | null; post_at: string | null; response_at: string | null;
 }
 
-const POSTED_STATES = ["POSTED", "CONFIRMED", "LATE", "SETTLED", "VOID"];
+const POSTED_STATES = ["POSTED", "CONFIRMED", "LATE", "SETTLED", "VOID", "NOT_APPLIED"];
 const iso = (ms: number) => new Date(ms).toISOString();
 
 export class LiveExecutor implements TradeExecutor {
@@ -54,6 +54,7 @@ export class LiveExecutor implements TradeExecutor {
     private contest: Contest,
     private guardMs: number,
     private clock: () => number = Date.now,
+    private sleep: (ms: number) => Promise<void> = (ms) => new Promise((r) => setTimeout(r, ms)),
   ) {}
 
   has(intentId: string): boolean {
@@ -138,6 +139,13 @@ export class LiveExecutor implements TradeExecutor {
     if (a.state === "PLANNED") a = this.journal.prepare(a);          // outer nonce reserved + persisted
     this.set(i.intentId, { state: "POSTING", attempt_op: a.op_key, post_at: now() });
     a = await this.journal.send(a, { noResend: true });
+    // 429 = not stored: the SAME signed body may go again, only while it can still land before the deadline.
+    while (a.state === "PREPARED" && a.http_status === 429) {
+      const wait = retryAfterS(a.response ?? "") * 1000;
+      if (this.clock() + wait >= i.deadlineMs) return this.notPosted(i, "rate limited (429) until the posting deadline: nothing stored");
+      await this.sleep(wait);
+      a = await this.journal.send(a, { noResend: true });
+    }
     if (a.state === "UNKNOWN" || a.state === "SENDING") a = await this.journal.readBackOnly(a);
     return this.finish(i.intentId, a);
   }
@@ -177,7 +185,24 @@ export class LiveExecutor implements TradeExecutor {
   onSettled(intentId: string, outcome: string, reason: string | null): void {
     const r = this.get(intentId);
     if (!r) return;
-    this.set(intentId, { fold_outcome: reason ? `${outcome}:${reason}` : outcome, state: POSTED_STATES.includes(r.state) ? (outcome === "settled" ? "SETTLED" : "VOID") : r.state });
+    const state = outcome === "not_applied" ? "NOT_APPLIED" : POSTED_STATES.includes(r.state) ? (outcome === "settled" ? "SETTLED" : "VOID") : r.state;
+    this.set(intentId, { fold_outcome: reason ? `${outcome}:${reason}` : outcome, state });
+  }
+
+  async admissible(intentId: string, sweep: number): Promise<string> {
+    let r = this.get(intentId);
+    if (!r) return "exclude:no journal row";
+    if (r.state === "POSTED") {
+      await this.confirmPosted();
+      r = this.get(intentId)!;
+    }
+    if (r.state === "LATE") return "exclude:stamped after the boundary";
+    if (r.state !== "CONFIRMED") return r.state === "POSTED" ? "defer" : `exclude:state ${r.state}`;
+    const flow = this.db.prepare("SELECT flow_json FROM sweeps WHERE n = ?").get(sweep) as { flow_json: string | null } | undefined;
+    if (!flow?.flow_json) return "defer";
+    const missed = ((JSON.parse(flow.flow_json) as { missed?: [string, number, number][] }).missed ?? []);
+    if (missed.some(([room, a, b]) => room === this.room && r!.seq! >= a && r!.seq! <= b)) return "exclude:missed by the referee";
+    return "include";
   }
 
   async recover(repost: (intentId: string) => Promise<string[] | null>): Promise<void> {
