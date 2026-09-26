@@ -504,8 +504,8 @@ export function render(d: MonitorData, opts: { color: boolean; width: number; co
     row("pending", (t.pending ?? 0) > 0 ? p.warn(String(t.pending)) : v(t.pending)), row("unknown", (t.unknown ?? 0) > 0 ? p.err(String(t.unknown)) : v(t.unknown)),
     ...(t.recent.length ? [p.dim("LAST TRADE"), `${t.recent[0].maker} -> ${t.recent[0].taker}  ${t.recent[0].id}`,
       `${t.recent[0].side} ${t.recent[0].qty} @ ${t.recent[0].px}  #${t.recent[0].sweep}`, `${tradeStatus(t.recent[0].status)} fee ${v(t.recent[0].fee)}`,
-      p.dim("id       pair          side  qty    px      #   status"),
-      ...t.recent.slice(0, 5).map((r) => `${r.id} ${`${r.maker}>${r.taker}`.padEnd(13)} ${r.side.slice(0, 5).padEnd(5)} ${r.qty.padEnd(6)} ${r.px.padEnd(7)} ${String(r.sweep).padEnd(3)} ${r.status}`)] : [p.dim("(no trade yet)")]),
+      p.dim("id    pair        side  qty    px      #   status"),
+      ...t.recent.slice(0, 5).map((r) => `${r.id.slice(0, 5)} ${`${r.maker}>${r.taker}`.padEnd(11)} ${r.side.slice(0, 5).padEnd(5)} ${r.qty.padEnd(6)} ${r.px.padEnd(7)} ${String(r.sweep).padEnd(3)} ${tradeStatus(r.status)}`)] : [p.dim("(no trade yet)")]),
   ]);
 
   const sec = d.security;
@@ -590,7 +590,7 @@ export function render(d: MonitorData, opts: { color: boolean; width: number; co
 
   if (opts.compact) {
     // One screen: what matters while trading. The live detail blocks collapse into one LIVE block.
-    const keep = /^(CONTEST|POSITIONS|STRATEGY K|TRADES|SAFETY|ERRORS|RECONCILE)/;
+    const keep = /^(CONTEST|POSITIONS|LEADERBOARD|STRATEGY K|TRADES|SAFETY|ERRORS|RECONCILE)/;
     const kept = blocks.filter((b) => keep.test(stripAnsi(b[0])));
     if (d.live) {
       const L = d.live;

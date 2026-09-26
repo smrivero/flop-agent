@@ -291,7 +291,7 @@ test("LIVE --compact fits one screen; confirmed receipts are not nonce errors; a
   const compact = render(await collect(liveSrc(x)), { color: false, width: 150, compact: true });
   const lines = compact.split("\n");
   assert.ok(lines.length <= 40, `compact is ${lines.length} lines`);
-  for (const s of ["CLOSE CALL — LIVE", "TRADES (REAL)", "SAFETY", "STRATEGY K", "POSITIONS", "LIVE", "readiness", "PASS", "journal", "102/102"]) assert.ok(compact.includes(s), `missing ${s}\n${compact}`);
+  for (const s of ["CLOSE CALL — LIVE", "TRADES (REAL)", "SAFETY", "STRATEGY K", "POSITIONS", "LEADERBOARD", "our global rank", "LIVE", "readiness", "PASS", "journal", "102/102"]) assert.ok(compact.includes(s), `missing ${s}\n${compact}`);
   for (const s of ["KEY CLASSES", "ENVIRONMENT", "LIVE JOURNAL", "  CREATED"]) assert.ok(!compact.includes(s), `compact still has ${s}`);
 });
 
