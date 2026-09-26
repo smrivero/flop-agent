@@ -207,6 +207,8 @@ export class RefereeObserver {
       }
       case "final":
         ccLog("PRICE", { kind: "final", price: post.price }, "referee posted S");
+        this.db.prepare("INSERT INTO meta (key, value) VALUES ('final_S', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+          .run(JSON.stringify({ price: post.price, trade: (post as { trade?: unknown }).trade ?? null, seen_at: now() }));
         return [{ kind: "final", room, post }];
     }
   }

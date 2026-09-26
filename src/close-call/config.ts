@@ -98,6 +98,10 @@ export interface CloseCallConfig {
   writeBudgetFraction: number;
   /** Live: no trade is posted later than this many ms before its sweep's boundary. */
   postGuardMs: number;
+  /** The live writer is compiled in and connected; it writes ONLY when this is "armed" (and no DISARM kill switch file). */
+  liveWriter: "armed" | "disarmed";
+  /** Live: at most this many trade POSTs per sweep (Strategy K rarely needs more than 2). */
+  maxTradesPerSweep: number;
 }
 
 function num(env: NodeJS.ProcessEnv, name: string, def: number, min: number, max: number): number {
@@ -135,6 +139,9 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
   }
   if (modeRaw !== "live" && env.CLOSECALL_LIVE_ENABLED) {
     throw new CloseCallConfigError("CLOSECALL_LIVE_ENABLED is set but CLOSECALL_MODE is not live: remove it so the two can never disagree.");
+  }
+  if (env.CLOSECALL_LIVE_WRITER?.trim() === "armed" && modeRaw !== "live") {
+    throw new CloseCallConfigError("CLOSECALL_LIVE_WRITER=armed is only valid with CLOSECALL_MODE=live (paper can never write)");
   }
   const keyCount = num(env, "CLOSECALL_KEY_COUNT", 100, 2, 100);
   if (keyCount % 2 !== 0) throw new CloseCallConfigError("CLOSECALL_KEY_COUNT must be even (keys trade in pairs)");
@@ -208,6 +215,8 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
     backupAgeRecipient: ageRecipient(env.CLOSECALL_BACKUP_AGE_RECIPIENT),
     writeBudgetFraction: num(env, "CLOSECALL_WRITE_BUDGET_FRACTION", 0.25, 0.01, 0.9),
     postGuardMs: num(env, "CLOSECALL_POST_GUARD_MS", 3_000, 500, 60_000),
+    liveWriter: oneOf(env, "CLOSECALL_LIVE_WRITER", ["armed", "disarmed"] as const, "disarmed"),
+    maxTradesPerSweep: num(env, "CLOSECALL_MAX_TRADES_PER_SWEEP", 6, 1, 50),
   };
 }
 

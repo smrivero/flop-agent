@@ -7,16 +7,18 @@
  *   restore-verify <decrypted keys dir>  (on the Mac) check a decrypted backup and print its VERIFY CODE
  *   bootstrap --dry-run [--stages 2,100] [--faults] [--miss-first] [--policy P] [--json]
  *                                        the full bootstrap against an in-memory server + simulated referee
- *   bootstrap                            the real bootstrap: NOT CONNECTED in this build (refuses, exit 3)
+ *   bootstrap [--loop]                   the real bootstrap (needs the writer ARMED: CLOSECALL_LIVE_WRITER=armed, no kill switch)
+ *   disarm --reason "..."                kill switch: no write, no new decision; observer keeps running
+ *   arm                                  remove the kill switch (refused unless live-check passes)
  *   check                                `live-check`: every live precondition, read only, nothing written or sent
  *   run                                  the live service (Strategy K through the LiveExecutor). Refuses unless check PASSes.
  *
- * The real bootstrap additionally needs CLOSECALL_MODE=live + the exact CLOSECALL_LIVE_ENABLED ack
- * (config.ts), CLOSECALL_ROOM, the backup gate, its own lock, and LIVE_WRITER_CONNECTED = true
- * -- a one-line change that must go through review. Paper mode never loads this file.
+ * The writer is connected in this build: the same code runs in tests and in live. It writes only when
+ * CLOSECALL_MODE=live + the exact ack, CLOSECALL_LIVE_WRITER=armed, and no DISARM file (the kill switch)
+ * -- all configuration, never a code change. Paper mode never loads this file.
  */
 
-import { lastClosedSweep, loadContest } from "../contest.js";
+import { lastClosedSweep, loadContest, sweepTime } from "../contest.js";
 import { CloseCallConfigError, loadCloseCallConfig } from "../config.js";
 import { backupGate } from "../backup-gate.js";
 import { Bootstrap, RoomKeeper } from "../bootstrap.js";
@@ -27,8 +29,11 @@ import { acquireLock, LockHeldError } from "../lock.js";
 import { ccLog, setLogSink, setQuiet } from "../logger.js";
 import { RefereeObserver } from "../observer.js";
 import { getRoom } from "../room.js";
-import { halt, haltSummary } from "../safety.js";
+import { disarm, halt, haltSummary, rearm, writerState } from "../safety.js";
 import { openCloseCallDb } from "../store.js";
+import { openReadonly } from "../monitor.js";
+import { mkdirSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { simulateBootstrap } from "../testing/bootstrap-sim.js";
 import { banner, runLoop } from "../run.js";
 import { LiveExecutor } from "./executor.js";
@@ -36,8 +41,6 @@ import { HttpTransport } from "./http-transport.js";
 import { liveReadiness, renderReadiness } from "./readiness.js";
 import { generateKeys, KeygenRefused, loadSigners, verifyRestoredKeyDir } from "./keygen.js";
 
-/** Flipping this is the act of connecting the live writer. Keep false until the reviewed go-live change. */
-export const LIVE_WRITER_CONNECTED = false;
 
 const out = (v: unknown) => process.stdout.write((typeof v === "string" ? v : JSON.stringify(v, null, 2)) + "\n");
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -78,13 +81,13 @@ async function main(argv: string[]): Promise<number> {
 
   const envFile = process.env.CLOSECALL_ENV_FILE ?? null;
   if (cmd === "check") {
-    const r = await liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED, "check", { offline: has("--offline"), envFile });
+    const r = await liveReadiness(cfg, contest, "check", { offline: has("--offline"), envFile });
     out(renderReadiness(r));
     return r.pass ? 0 : 1;
   }
 
   if (cmd === "run") {
-    const r = await liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED, "run", { envFile });
+    const r = await liveReadiness(cfg, contest, "run", { envFile });
     process.stdout.write(banner("live") + "\n");
     if (!r.pass) {
       process.stderr.write(renderReadiness(r) + "\n[CLOSECALL][HALT] live readiness FAILED: refusing to start. NO WRITE.\n");
@@ -93,18 +96,32 @@ async function main(argv: string[]): Promise<number> {
     const lock = await acquireLock(cfg.lockPath, "close-call live run");
     setLogSink(cfg.logDir);
     const ldb = openCloseCallDb(cfg.liveDbPath, { checkIntegrity: true });
+    // The full gate result (incl. network: nonce reconciliation, room, clock skew, latency) as of this start:
+    // the monitor shows it instead of calling external APIs itself.
+    ldb.prepare("INSERT INTO meta (key, value) VALUES ('last_readiness', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(JSON.stringify({ at: new Date().toISOString(), pass: r.pass, rows: r.rows }));
     try {
       const signers = loadSigners(ldb);
       const transport = new HttpTransport(cfg.technocoreBaseUrl);
-      const journal = new WriteJournal(ldb, signers, transport, { onAmbiguous: (row, why) => halt(ldb, "ambiguous_operation", `${row.op_key}: ${why}`) });
+      const canWrite = () => { const w = writerState(cfg); return w.armed ? null : w.reason; };
+      const journal = new WriteJournal(ldb, signers, transport, { onAmbiguous: (row, why) => halt(ldb, "ambiguous_operation", `${row.op_key}: ${why}`), canWrite });
       const executor = new LiveExecutor(ldb, signers, journal, transport, cfg.room!, contest, cfg.postGuardMs);
-      const keeper = new RoomKeeper({ db: ldb, journal, transport, room: cfg.room!, clock: Date.now, refreshDays: cfg.roomRefreshDays });
+      const keeper = new RoomKeeper({ db: ldb, journal, transport, room: cfg.room!, clock: Date.now, refreshDays: cfg.roomRefreshDays,
+        lockMs: sweepTime(contest, contest.lockSweep) });
+      // technocore limits change per deployment: snapshot /config at start and hourly (audit + pacing)
+      let nextSnap = 0;
+      const snapshot = async () => {
+        if (Date.now() < nextSnap) return;
+        nextSnap = Date.now() + 3_600_000;
+        const lim = await fetchLimits(cfg.technocoreBaseUrl).catch(() => null);
+        if (lim) ldb.prepare("INSERT INTO config_snapshots (source, json, at) VALUES (?, ?, ?)").run(lim.source, JSON.stringify(lim), new Date().toISOString());
+      };
       // Startup order: readiness (keys, room on server, nonce reconciliation, backup, clock) passed above ->
       // bootstrap-era writes reconciled -> runLoop: observer + reconcile, fold replay, live_trades recovery,
       // then decisions (none while a halt such as an UNKNOWN trade is active).
       await journal.recover();
       ccLog("MODE", { mode: "live", db: cfg.liveDbPath, room: cfg.room, keys: signers.size, policy: cfg.confirmationPolicy }, "LIVE MODE: Strategy K intents are signed and posted");
-      await runLoop(ldb, cfg, contest, { paper: false, executor, maintenance: () => keeper.tick(), maxMinutes: arg("--minutes") ? Number(arg("--minutes")) : undefined });
+      await runLoop(ldb, cfg, contest, { paper: false, executor, canTrade: canWrite, maintenance: async () => { await snapshot(); return keeper.tick(); }, maxMinutes: arg("--minutes") ? Number(arg("--minutes")) : undefined });
       return 0;
     } finally {
       ldb.close();
@@ -112,9 +129,52 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
+  if (cmd === "disarm") {
+    disarm(cfg.dataDir, arg("--reason") ?? "manual");
+    out(`DISARMED: ${writerState(cfg).reason}. No write and no new decision from now on; the observer keeps running.`);
+    return 0;
+  }
+  if (cmd === "arm") {
+    const probe = { ...cfg, liveWriter: "armed" as const };
+    if (!rearm(cfg.dataDir)) { out(`no kill switch present; writer: ${writerState(cfg).reason}`); return 0; }
+    const r = await liveReadiness(cfg, contest, "check", { envFile });
+    if (!r.pass) { disarm(cfg.dataDir, "re-armed refused: live-check FAIL"); out(renderReadiness(r)); out("ARM REFUSED: kill switch put back."); return 3; }
+    out(`ARMED: ${writerState(probe).reason}`);
+    return 0;
+  }
+
+  if (cmd === "final-report" || cmd === "audit-export") {
+    // Read only. final-report: S, our standings (official fold), our key DIDs + roles, the referee's final
+    // posts -- public data only; the owner keys themselves stay in the encrypted backup for the claim.
+    const { db: rdb } = openReadonly(cfg.liveDbPath);
+    if (!rdb) { process.stderr.write("live DB unavailable\n"); return 1; }
+    try {
+      const meta = (k: string) => (rdb.prepare("SELECT value FROM meta WHERE key = ?").get(k) as { value: string } | undefined)?.value ?? null;
+      if (cmd === "final-report") {
+        out({ contest: contest.contestId, final_S: JSON.parse(meta("final_S") ?? "null"), standings: JSON.parse(meta("final_standings") ?? "null"),
+          keys: rdb.prepare("SELECT id, did, role, status, minted_sweep FROM keys WHERE fake = 0 ORDER BY id").all(),
+          referee_final_posts: rdb.prepare("SELECT room, seq, ts, text FROM raw_posts WHERE room IN ('d-close1-price','d-close1-pnl') AND (text LIKE '%\"t\":\"final\"%' OR seq = (SELECT MAX(seq) FROM raw_posts r2 WHERE r2.room = raw_posts.room))").all(),
+          claim: "within 90 days of FLOP mainnet launch the winner signs a mainnet address with its OWNER key: keep the encrypted key backup" });
+      } else {
+        const dir = argv[1];
+        if (!dir) { process.stderr.write("usage: audit-export <dir>\n"); return 2; }
+        mkdirSync(dir, { recursive: true, mode: 0o700 });
+        for (const [name, sql] of [["write_attempts", "SELECT * FROM write_attempts ORDER BY created_at"], ["live_trades", "SELECT * FROM live_trades ORDER BY created_at"],
+          ["referee_posts", "SELECT * FROM raw_posts ORDER BY room, seq"], ["config_snapshots", "SELECT * FROM config_snapshots ORDER BY id"],
+          ["keys_public", "SELECT id, did, role, status, registered, minted, minted_sweep, mint_evidence FROM keys WHERE fake = 0 ORDER BY id"],
+          ["nonces", "SELECT * FROM nonces"], ["meta", "SELECT * FROM meta"], ["reconcile", "SELECT * FROM reconcile ORDER BY id"]] as const) {
+          const rows = rdb.prepare(sql).all();
+          writeFileSync(join(dir, `${name}.jsonl`), rows.map((r) => JSON.stringify(r)).join("\n") + "\n", { mode: 0o600 });
+        }
+        out(`audit archive written to ${dir} (byte-exact signed requests, receipts, referee posts, config snapshots; no secrets)`);
+      }
+      return 0;
+    } finally { rdb.close(); }
+  }
+
   const db = openCloseCallDb(cfg.liveDbPath);
   if (cmd === "status") {
-    out({ live_db: cfg.liveDbPath, writer_connected: LIVE_WRITER_CONNECTED, mode: cfg.mode, policy: cfg.confirmationPolicy, room: cfg.room,
+    out({ live_db: cfg.liveDbPath, writer: writerState(cfg), mode: cfg.mode, policy: cfg.confirmationPolicy, room: cfg.room,
       room_status: cfg.room ? getRoom(db, cfg.room).status : null, keys: keyStatusCounts(db),
       backup_gate: backupGate(db, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient }),
       pending_writes: (db.prepare("SELECT COUNT(*) n FROM write_attempts WHERE state NOT IN ('CONFIRMED','FAILED')").get() as { n: number }).n,
@@ -139,22 +199,23 @@ async function main(argv: string[]): Promise<number> {
   }
 
   if (cmd === "bootstrap") {
-    if (!LIVE_WRITER_CONNECTED) {
-      process.stderr.write("[CLOSECALL][HALT] the live writer is not connected in this build: refusing. NO WRITE. (use --dry-run)\n");
+    const w = writerState(cfg);
+    if (!w.armed) {
+      process.stderr.write(`[CLOSECALL][HALT] live writer DISARMED (${w.reason}): refusing. NO WRITE. (use --dry-run)\n`);
       return 3;
     }
-    // ---- everything below runs only after the reviewed go-live change ----
-    if (cfg.mode !== "live") { process.stderr.write("bootstrap needs CLOSECALL_MODE=live and the exact CLOSECALL_LIVE_ENABLED ack\n"); return 3; }
     if (!cfg.room) { process.stderr.write("CLOSECALL_ROOM is not set\n"); return 2; }
     const lock = await acquireLock(cfg.lockPath, "close-call live bootstrap"); // the SAME lock as the live service: never both at once
     setLogSink(cfg.logDir);
     try {
       const limits = await fetchLimits(cfg.technocoreBaseUrl);
+      db.prepare("INSERT INTO config_snapshots (source, json, at) VALUES (?, ?, ?)").run(limits.source, JSON.stringify(limits), new Date().toISOString());
       const perWriteMs = Math.ceil(60_000 / Math.max(1, Math.floor(limits.writesPerMinPerIp * cfg.writeBudgetFraction)));
       const signers = loadSigners(db);
       const transport = new HttpTransport(cfg.technocoreBaseUrl);
       const observer = new RefereeObserver(db, cfg.technocoreBaseUrl, cfg.rawLogDir);
-      const journal = new WriteJournal(db, signers, transport, { onAmbiguous: (row, why) => halt(db, "ambiguous_operation", `${row.op_key}: ${why}`) });
+      const journal = new WriteJournal(db, signers, transport, { onAmbiguous: (row, why) => halt(db, "ambiguous_operation", `${row.op_key}: ${why}`),
+        canWrite: () => { const x = writerState(cfg); return x.armed ? null : x.reason; } });
       await journal.recover();
       const b = new Bootstrap({
         db, contest, journal, transport, signers, policy: cfg.confirmationPolicy, room: cfg.room, clock: Date.now,
@@ -163,9 +224,15 @@ async function main(argv: string[]): Promise<number> {
         pace: async () => { await sleep(perWriteMs); }, refreshDays: cfg.roomRefreshDays,
       });
       // --loop: keep stepping (resumable: every step re-derives its position from the DB and the server).
+      let lim = limits;
+      let limAt = Date.now();
       for (;;) {
+        if (Date.now() - limAt > 600_000) { lim = await fetchLimits(cfg.technocoreBaseUrl).catch(() => lim); limAt = Date.now(); }
+        const left = (db.prepare("SELECT COUNT(*) n FROM keys WHERE fake = 0 AND status = 'GENERATED'").get() as { n: number }).n;
+        const perMin = Math.max(1, Math.floor(lim.writesPerMinPerIp * cfg.writeBudgetFraction));
         const r = await b.step();
-        ccLog("BOOTSTRAP", { phase: r.phase, action: r.action, writes: r.writes, blockers: r.blockers?.slice(0, 3) }, r.detail);
+        ccLog("BOOTSTRAP", { phase: r.phase, action: r.action, writes: r.writes, blockers: r.blockers?.slice(0, 3),
+          owner_writes_left: left, write_budget_per_min: perMin, eta_writes_min: +(left / perMin).toFixed(1), server_limit: lim.writesPerMinPerIp }, r.detail);
         out(r);
         if (r.action === "halted" || r.action === "blocked") return 1;
         if (r.action === "done" || !has("--loop")) return 0;

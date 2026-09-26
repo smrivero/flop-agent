@@ -110,7 +110,8 @@ export function verifyRestoredKeyDir(dir: string): RestoreReport {
       if (raw.did !== s.did) throw new Error("did mismatch");
       keys.push({ file: f, did: s.did });
     } catch (e) {
-      problems.push(`${f}: ${(e as Error).message}`);
+      // Never echo a parser message: Node's JSON errors quote the input, i.e. part of a seed.
+      problems.push(`${f}: ${e instanceof KeyFileError ? e.message : "unreadable or not a valid key file"}`);
     }
   }
   const canaryPath = join(dir, CANARY_FILE);

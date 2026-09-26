@@ -33,7 +33,7 @@ import { resolveProbe, type ProbeTrade } from "./probe.js";
 import { newTradeId, ownerMessageText, roomMessageText, type Terms } from "./protocol.js";
 import { buildSignedTrade, sha256Hex, type Signer } from "./protocol-writes.js";
 import { allowListValue, findRoomRegistration, getRoom, planOwnershipRefresh, transitionRoom } from "./room.js";
-import { halt, haltSummary, type HaltKind } from "./safety.js";
+import { halt, haltSummary, WriterDisarmed, type HaltKind } from "./safety.js";
 import { getMeta, now, setMeta, type CcDb } from "./store.js";
 
 export const REGISTRY_ROOM = "close1";
@@ -68,7 +68,7 @@ const realSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 /** Shared by Bootstrap and RoomKeeper: journaled write with 429 back-off, UNKNOWN resolved by read-back, anything else ambiguous halts. */
 export async function journaledWrite(d: Pick<BootstrapDeps, "db" | "journal" | "pace" | "sleep">, op: WriteOp, label: string):
-  Promise<{ row: AttemptRow } | { halted: string }> {
+  Promise<{ row: AttemptRow } | { halted: string } | { blocked: string }> {
   try {
     let row = await d.journal.execute(op);
     for (let i = 0; row.state === "PREPARED" && row.http_status === 429 && i < 6; i++) {
@@ -83,6 +83,7 @@ export async function journaledWrite(d: Pick<BootstrapDeps, "db" | "journal" | "
     await d.pace?.();
     return { row };
   } catch (e) {
+    if (e instanceof WriterDisarmed) return { blocked: (e as Error).message };
     if (e instanceof AmbiguousOperation) { halt(d.db, "ambiguous_operation", (e as Error).message); return { halted: (e as Error).message }; }
     throw e;
   }
@@ -102,7 +103,9 @@ export class Bootstrap {
 
   private async write(op: WriteOp, phase: Phase): Promise<AttemptRow | StepResult> {
     const r = await journaledWrite(this.d, op, phase);
-    return "row" in r ? r.row : { phase, action: "halted", detail: r.halted, writes: 0 };
+    if ("row" in r) return r.row;
+    if ("blocked" in r) return { phase, action: "blocked", detail: r.blocked, writes: 0 };
+    return { phase, action: "halted", detail: r.halted, writes: 0 };
   }
 
   private ownerRecord(id: string): OwnerMessageRecord | undefined {
@@ -219,8 +222,8 @@ export class Bootstrap {
       const ours = new Set(keys.map((k) => k.did));
       const foreign = (currentAllow ?? "").split(/\s+/).filter((x) => x && !ours.has(x));
       if (foreign.length) return this.stop("room_ownership", `room-allow/${room} holds ${foreign.length} DIDs that are not ours: not overwriting`, "allow");
-      const w = await this.write({ opKey: `allow:${room}:${sha256Hex(desired).slice(0, 16)}`, kind: "note-allow", signerId: owner.id, room, value: desired,
-        ifValue: currentAllow ?? undefined }, "allow");
+      // No `if` compare-and-set: it would repeat the whole old list in the body; only CC-ADMIN can sign this note and we read it just before.
+      const w = await this.write({ opKey: `allow:${room}:${sha256Hex(desired).slice(0, 16)}`, kind: "note-allow", signerId: owner.id, room, value: desired }, "allow");
       if (!("attempt_id" in w)) return w;
       const back = await this.d.transport.readNote("room-allow", room);
       if (back !== desired) return this.stop("room_ownership", `room-allow/${room} does not read back as written`, "allow");
@@ -265,10 +268,13 @@ export class Bootstrap {
       ccLog("ROOM", { room, sweep: n }, "room listed by the referee: REGISTER_CONFIRMED -> READY");
     }
 
-    // 7 staging owners in our room
+    // 7 staging owners in our room (two messages at once: the room never sits on a single message, the 12 h reap rule)
     const regStaging = staging.map((k) => getKey(db, k.id)).filter((k) => k.status === "GENERATED");
     if (regStaging.length) {
       for (const k of regStaging) { const s = await this.registerOwner(k, room, "owners-staging"); if (s) return s; }
+      const v = await this.d.transport.readRoom(room, 0);
+      const g = checkGeneration(db, room, v.generation, v.last_seq);
+      if (g) return this.stop("room_ownership", g, "owners-staging");
       return { phase: "owners-staging", action: "wrote", detail: `${regStaging.length} staging owner messages in ${room}`, writes: regStaging.length };
     }
 
@@ -385,8 +391,17 @@ export class Bootstrap {
  *   - if nothing was written in the room for `keepaliveHours` (default 48): CC-ADMIN posts a plain-text
  *     keepalive (not JSON, so the referee ignores it) so the room never reaches the 7-day idle deletion.
  */
+/** Persist our room's generation the first time we see it; afterwards any change is a grave problem (null = fine). */
+export function checkGeneration(db: CcDb, room: string, generation: number | undefined, lastSeq?: number): string | null {
+  // generation 0 = the name never held a message: nothing to pin yet (our first messages create generation 1)
+  if (generation === undefined || generation === 0 || lastSeq === 0) return null;
+  const stored = getMeta(db, `room_generation:${room}`);
+  if (stored === null) { setMeta(db, `room_generation:${room}`, String(generation)); return null; }
+  return Number(stored) === generation ? null : `${room} generation changed ${stored} -> ${generation}: deleted and recreated, it is not our registered room any more. NOT re-registering automatically`;
+}
+
 export class RoomKeeper {
-  constructor(private d: Pick<BootstrapDeps, "db" | "journal" | "transport" | "room" | "clock" | "pace" | "sleep"> & { refreshDays?: number; keepaliveHours?: number }) {}
+  constructor(private d: Pick<BootstrapDeps, "db" | "journal" | "transport" | "room" | "clock" | "pace" | "sleep"> & { refreshDays?: number; keepaliveHours?: number; lockMs?: number }) {}
 
   async tick(): Promise<{ ok: boolean; detail: string; wrote: number }> {
     const { db, room, transport } = this.d;
@@ -405,16 +420,24 @@ export class RoomKeeper {
     }
     const view = await transport.readRoom(room, 0);
     if (view.last_seq === 0) return bad(`${room} has no messages any more (deleted by technocore.chat?)`);
+    // The room's epoch: a deleted-and-recreated room is a DIFFERENT room for the referee (unregistered).
+    const gen = checkGeneration(db, room, view.generation, view.last_seq);
+    if (gen) return bad(gen);
     let wrote = 0;
     const nowMs = this.d.clock();
+    if (this.d.lockMs !== undefined && nowMs >= this.d.lockMs) {
+      setMeta(db, "room_health", JSON.stringify({ ok: true, at: now(), last_seq: view.last_seq, note: "after the lock: checks only, no writes" }));
+      return { ok: true, detail: "after the lock: no writes", wrote: 0 };
+    }
     const last = getMeta(db, "room_refresh_at") ?? getMeta(db, "bootstrap_done_at");
     if (!last || nowMs - Date.parse(last) >= (this.d.refreshDays ?? 5) * 86_400_000) {
       const cycle = Math.floor(nowMs / 86_400_000);
       for (const w of [
         { opKey: `refresh:${room}:${cycle}:owners`, kind: "note-owners" as const, signerId: admin.id, room, value: admin.did, ifValue: admin.did },
-        { opKey: `refresh:${room}:${cycle}:allow`, kind: "note-allow" as const, signerId: admin.id, room, value: allow!, ifValue: allow! },
+        { opKey: `refresh:${room}:${cycle}:allow`, kind: "note-allow" as const, signerId: admin.id, room, value: allow! },
       ]) {
         const r = await journaledWrite(this.d, w, "refresh");
+        if ("blocked" in r) return { ok: true, detail: `upkeep skipped: ${r.blocked}`, wrote };
         if ("halted" in r) return { ok: false, detail: r.halted, wrote };
         wrote++;
       }
@@ -424,6 +447,7 @@ export class RoomKeeper {
     if (lastMsg !== null && nowMs - lastMsg >= (this.d.keepaliveHours ?? 48) * 3_600_000) {
       const stamp = new Date(nowMs).toISOString();
       const r = await journaledWrite(this.d, { opKey: `keepalive:${room}:${stamp.slice(0, 13)}`, kind: "keepalive", signerId: admin.id, room, text: `close-call keepalive ${stamp}` }, "keepalive");
+      if ("blocked" in r) return { ok: true, detail: `upkeep skipped: ${r.blocked}`, wrote };
       if ("halted" in r) return { ok: false, detail: r.halted, wrote };
       wrote++;
     }

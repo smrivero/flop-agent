@@ -471,6 +471,96 @@ message after 12 h. Every minute, `RoomKeeper`:
 also runs a **drill**: it rebuilds the live dir from the archive in a temp dir and runs
 `live-check --offline` on it.
 
+## Closing audit (26 Sep): what live does, exactly
+
+**Writer.**
+- The writer is connected in the code; the tested build is the production build.
+- It writes only when all of these hold: `CLOSECALL_MODE=live` plus the ack, `CLOSECALL_LIVE_WRITER=armed`, and no
+  `DISARM` file in the live data dir.
+- `flop-closecall live disarm --reason …` is the kill switch. It stops every write and every new decision; the
+  observer, reconciliation and read-only recovery keep running.
+- `live arm` re-arms only if `live-check` PASSES.
+- Every send goes through the journal's `canWrite` check.
+
+**Contest end.**
+- Nothing opens after the lock: Strategy K, the risk check `until ≤ lock` and the service loop all stop.
+- RoomKeeper writes nothing after the lock.
+- The referee's `final` post (S) is stored, and our book is settled at S by the official fold's `final`
+  operation. Our standings (score, position, fees, places) go to meta `final_standings`.
+- `live final-report` exports them, plus our DIDs and roles, the referee's final posts and the claim note: the
+  owner key must sign a mainnet address within 90 days of mainnet launch. **Never delete the encrypted key
+  backup.**
+
+**Room lifecycle and generation.**
+- technocore reaps rooms and notes idle for 7 days, and a single-message room after 12 h. A recreated name gets
+  a new `generation`, and according to the rules a deleted room leaves the registered list.
+- Our room gets 2 messages at once (both staging owners), so it never sits on one.
+- A 48 h keepalive and a 5-day note refresh keep it alive.
+- The generation is pinned once the room has messages. RoomKeeper (every minute), `live-check` and the
+  executor (once per sweep, before posting) verify it.
+- A change is a grave halt; nothing is ever re-created automatically.
+
+**Local archive (technocore is not a system of record).** In `live.sqlite3`, so inside the encrypted backup:
+- the byte-exact signed requests (`write_attempts.body`);
+- server receipts (seq, ts, generation of our record, from `POST ?format=json`);
+- referee posts verbatim (`raw_posts`) and `/config` snapshots (hourly);
+- live_trades, nonces, strategy state and room state.
+
+`live audit-export <dir>` writes them as JSONL, with no secrets.
+
+**Nonces (verified against the server docs).**
+- Room messages: per key per room, and it must exceed the last one within the newest 1 MiB of that room. Our
+  scope is `room:<room>` per key.
+- `room-owners` and `room-allow` share `/kv/room-nonce/<room>`. Our scope is `note:<room>`.
+- At startup, `live-check` compares the server with the journal: the max nonce per DID in our room, and the
+  room-nonce counter. If the server is ahead, it FAILs and nothing is written.
+- Writes use the POST signed lane only; there are never signed GET URLs.
+
+**Replay window.** A signed message can be re-accepted once it falls outside the newest 1 MiB of its room. For
+us this is harmless:
+- the signature binds the room, and our room admits only our keys;
+- our room stays far below 1 MiB (about 100 owners plus trades, a few hundred KB);
+- a replayed owner message is a no-op (one mint per key);
+- a replayed trade is either `void:settled` (ids settle once) or `void:expired`, because live trades carry
+  `until` = their own sweep.
+
+**Serialization.**
+- We sign exactly the stored bytes: `<room>|<nonce>|<text>`.
+- Texts are single-line printable ASCII, checked before signing, and the sweep is a no-op on them.
+- Terms JSON is canonical: sorted keys, no spaces.
+- The read-back matches the exact text, our DID and our nonce.
+
+**Multiple intents per sweep.**
+- A single process (lock) posts them one after another.
+- Each one is re-validated right before its POST, against the book including this sweep's earlier posts.
+- The deadline is boundary − 3 s, with at most `CLOSECALL_MAX_TRADES_PER_SWEEP` (6) per sweep.
+
+**Pair fates.**
+
+| state | pair |
+|---|---|
+| SETTLED | keeps the position; never traded again by Strategy K |
+| VOID / NOT_APPLIED (missed, LATE) / NOT_POSTED / FAILED | nothing held → released for a retry (up to 3 tries, fresh trade id) |
+| UNKNOWN | blocked. No new entries (transient `unknown_trade` halt) until evidence after the boundary: found before it → CONFIRMED (enters the book); found after → LATE; absent → NOT_POSTED (it can never settle: `until` expired). Then released or kept, and the halt clears itself. Never re-sent |
+
+**Errors.**
+- 429 means not stored: the same body is sent after `Retry-After`. For trades, only while it can still land
+  before the deadline.
+- 5xx and timeouts are uncertain → read-back.
+- Other 4xx are FAILED (nothing stored).
+
+**Backups off-host.** Pull hourly during live, from the Mac:
+```bash
+rsync -av root@srv792559:/var/lib/flop-closecall-live/backups/ ~/flop-closecall-backups/live/
+```
+That is the encrypted keys + env + DB archives, the plain DB snapshots and the manifests. An audit JSONL export
+is optional (`flop-closecall live audit-export /var/lib/flop-closecall-live/backups/audit-$(date -u +%F)`).
+
+**Host.**
+- Reboot the VPS for its pending updates **before** generating real keys.
+- Afterwards, check that paper and the TCLK workers are active.
+- `flop-closecall-live` is never enabled, so a reboot never starts it.
+
 ## Plan to production
 
 Done:

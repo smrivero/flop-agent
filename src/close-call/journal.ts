@@ -31,6 +31,7 @@ import { randomBytes } from "node:crypto";
 import { ccLog } from "./logger.js";
 import { buildSignedMessage, buildSignedNote, sha256Hex, sweepText, type Signer } from "./protocol-writes.js";
 import { now, type CcDb } from "./store.js";
+import { WriterDisarmed } from "./safety.js";
 
 export type OpKind = "owner" | "room" | "trade" | "keepalive" | "note-owners" | "note-allow";
 export type AttemptState = "PLANNED" | "PREPARED" | "SENDING" | "CONFIRMED" | "UNKNOWN" | "FAILED";
@@ -53,19 +54,33 @@ export interface RoomMessage { seq: number; from: string; text: string; nonce?: 
 
 export interface Transport {
   post(path: string, body: unknown): Promise<TransportResponse>;
-  readRoom(room: string, since: number): Promise<{ first_seq: number | null; last_seq: number; messages: RoomMessage[] }>;
+  readRoom(room: string, since: number): Promise<{ first_seq: number | null; last_seq: number; messages: RoomMessage[]; generation?: number }>;
   readNote(ns: string, key: string): Promise<string | null>;
   /** The newest messages (GET /r/<room>?limit=200): a fresh write is found here even in a busy room. */
-  readTail?(room: string): Promise<{ messages: RoomMessage[] }>;
+  readTail?(room: string): Promise<{ messages: RoomMessage[]; generation?: number; last_seq?: number }>;
 }
 
 export interface AttemptRow {
   attempt_id: string; op_key: string; kind: OpKind; room: string | null; ns: string | null; note_key: string | null;
   signer_id: string; nonce: string; payload_sha256: string; body: string; state: AttemptState; http_status: number | null;
-  response: string | null; error: string | null; tries: number;
+  response: string | null; error: string | null; tries: number; receipt?: string | null;
 }
 
 export class AmbiguousOperation extends Error {}
+
+/**
+ * Keep the server's own receipt of OUR record (the POST reply is the room after the append, with
+ * ?format=json): status, seq, ts, generation -- so the audit trail survives technocore's ring.
+ */
+function receiptOf(res: TransportResponse, body: { nonce: string; did: string; text?: string; value?: string }): string {
+  const base: Record<string, unknown> = { status: res.status, at: new Date().toISOString() };
+  try {
+    const v = JSON.parse(res.text.replace(/"nonce":\s*(\d+)/g, '"nonce":"$1"')) as { generation?: number; messages?: RoomMessage[] };
+    const m = v.messages?.find((x) => x.from === body.did && x.nonce === body.nonce);
+    if (m) Object.assign(base, { seq: m.seq, ts: m.ts, generation: v.generation ?? null });
+  } catch { base.text = res.text.slice(0, 200); }
+  return JSON.stringify(base);
+}
 
 /** Seconds to wait from a 429 body ("... retry in 2 s" / "Retry-After: 2"); 5 when unreadable. */
 export function retryAfterS(body: string): number {
@@ -80,7 +95,9 @@ export class WriteJournal {
     private db: CcDb,
     private signers: Map<string, Signer>,
     private transport: Transport,
-    private opts: { maxResolveTries?: number; clock?: () => number; onAmbiguous?: (row: AttemptRow, why: string) => void } = {},
+    private opts: { maxResolveTries?: number; clock?: () => number; onAmbiguous?: (row: AttemptRow, why: string) => void;
+      /** Live kill switch: a non-null reason blocks every send (nothing leaves, nothing changes state). */
+      canWrite?: () => string | null } = {},
   ) {}
 
   private clock(): number {
@@ -161,20 +178,31 @@ export class WriteJournal {
    */
   async send(row: AttemptRow, opts: { noResend?: boolean } = {}): Promise<AttemptRow> {
     if (row.state === "PLANNED") row = this.prepare(row);
+    const blocked = this.opts.canWrite?.() ?? null;
+    if (blocked) throw new WriterDisarmed(`writer disarmed: ${blocked}`);
     const req = this.request(row);
     row = this.set(row, { state: "SENDING", tries: row.tries + 1 });
     let res: TransportResponse;
     try {
       res = await this.transport.post(req.path, req.body);
     } catch (e) {
+      // A simulated kill -9 must leave the row exactly as a real one would: SENDING, the process gone.
+      if ((e as Error).name === "SimulatedKill") throw e;
       ccLog("EXECUTOR", { op: row.op_key, attempt: row.attempt_id, error: (e as Error).message }, "write outcome unknown: will resolve by read-back, never by a blind resend");
       return this.set(row, { state: "UNKNOWN", error: (e as Error).message });
     }
-    if (res.status >= 200 && res.status < 300) return this.set(row, { state: "CONFIRMED", http_status: res.status, response: res.text.slice(0, 2000) });
+    if (res.status >= 200 && res.status < 300) {
+      return this.set(row, { state: "CONFIRMED", http_status: res.status, response: res.text.slice(0, 2000), receipt: receiptOf(res, req.body) } as Partial<AttemptRow>);
+    }
     if (res.status === 429) {
       // Rate limited: NOT stored. The same signed body may be sent again after the wait (callers decide when).
       ccLog("EXECUTOR", { op: row.op_key, retry_after_s: retryAfterS(res.text) }, "429: not stored; same body kept for a later send");
       return this.set(row, { state: "PREPARED", http_status: 429, response: res.text.slice(0, 500), error: `429 retry after ${retryAfterS(res.text)} s` });
+    }
+    if (res.status >= 500) {
+      // 5xx: the fate is uncertain (the edge may or may not have reached the origin) -> UNKNOWN, resolved by read-back.
+      ccLog("EXECUTOR", { op: row.op_key, status: res.status }, "5xx: outcome uncertain; resolved by read-back, never assumed");
+      return this.set(row, { state: "UNKNOWN", http_status: res.status, response: res.text.slice(0, 500), error: `HTTP ${res.status}` });
     }
     if (opts.noResend) {
       ccLog("EXECUTOR", { op: row.op_key, status: res.status, body: res.text.slice(0, 200) }, "write refused (no automatic re-send)");

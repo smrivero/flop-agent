@@ -36,6 +36,8 @@ export interface RunOptions {
   paper: boolean;
   /** Live: the LiveExecutor (built by live/cli-live.ts, the only place that can). Same decision engine as paper. */
   executor?: TradeExecutor & { confirmPosted?: () => Promise<number> };
+  /** Live: non-null = writer disarmed (config / kill switch): estimates only, no new decisions. */
+  canTrade?: () => string | null;
   /** Live: room upkeep (RoomKeeper.tick: ownership/allow-list/existence check, 5-day refresh, keepalive), every minute. */
   maintenance?: () => Promise<unknown>;
 }
@@ -108,6 +110,7 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
       ccLog("FOLD", { vendor: cfg.vendorRoot, manifest_sha256: main.vendor.manifestSha256, fold_sha256: main.vendor.foldSha256, bytes: main.vendor.foldBytes },
         "official fold verified against the referee's pinned package and started");
       paper = new PaperTrader(db, cfg, contest, main, look, hl, opts.executor ?? PAPER_EXECUTOR);
+      if (opts.canTrade) paper.canTrade = opts.canTrade;
       paper.alerts = alerts;
       await paper.start();
     }
@@ -158,6 +161,7 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
         rt.timeouts = observer.timeouts;
         for (const ev of events) {
           if (ev.kind === "price" && paper) await guard("settle", () => paper!.settle(ev.n!, ev.post as PricePost));
+          if (ev.kind === "final" && paper) await guard("final", () => paper!.finalize((ev.post as { price: string }).price));
           if (ev.kind === "price") {
             const p = ev.post as PricePost;
             const hlNow = hl.latest;

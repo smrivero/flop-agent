@@ -29,6 +29,10 @@ export interface SimOptions {
   stages: number[];
   /** Inject a 429 before these (1-based) POSTs. */
   rate429At?: number[];
+  /** kill -9 the process during these (1-based) POSTs (the request never reaches the server); the loop restarts. */
+  killAt?: number[];
+  /** 503 on these (1-based) POSTs. */
+  err503At?: number[];
   policy?: ConfirmationPolicyName;
   room?: string;
   listMints?: boolean;
@@ -81,7 +85,13 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
   };
   const addKeys = (strategyTotal: number) => { addRole("admin", 1); addRole("staging", 2); addRole("strategy", strategyTotal); };
   const realPost = srv.post.bind(srv);
-  srv.post = async (path, body) => { if (o.rate429At?.includes(srv.posts + 1)) srv.failNext("429"); return realPost(path, body); };
+  srv.post = async (path, body) => {
+    const k = srv.posts + 1;
+    if (o.rate429At?.includes(k)) srv.failNext("429");
+    else if (o.killAt?.includes(k)) srv.failNext("kill");
+    else if (o.err503At?.includes(k)) srv.failNext("503");
+    return realPost(path, body);
+  };
   const publishDue = async () => {
     while (sweepTime(contest, published + 1) + lag <= simNow) {
       published++;
@@ -127,7 +137,14 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
           crashedPlan = true;
         }
       }
-      const r = await deps().step();
+      let r: StepResult;
+      try {
+        r = await deps().step();
+      } catch (e) {
+        // kill -9: the process is gone; the next iteration is a fresh process on the same DB (a restart)
+        steps.push({ phase: "preflight", action: "waiting", detail: `crashed: ${(e as Error).message}`, writes: 0 });
+        continue;
+      }
       steps.push(r);
       if (r.action === "done" || r.action === "blocked" || r.action === "halted") break;
       if (r.action === "waiting") simNow = Math.max(simNow, sweepTime(contest, published + 1) + lag) + 1;

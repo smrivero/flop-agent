@@ -48,6 +48,11 @@ test("the only non-GET requests outside live/: Hyperliquid recentTrades and the 
       assert.equal(posts, 1);
       assert.match(text, /type: "recentTrades"/);
       assert.ok(!/\/exchange|\baction\s*:|signature|wallet|privateKey/i.test(code(text)), "no exchange/order code");
+    } else if (rel === "readiness.ts") {
+      // Hyperliquid's read-only info query (latency + feed health); never technocore.
+      assert.ok(posts <= 2, `${rel}: ${posts} non-GET`);
+      assert.ok((code(text).match(/method:\s*"POST"[\s\S]{0,160}?recentTrades/g) ?? []).length === posts, "only recentTrades");
+      assert.ok(!/technocoreBaseUrl[^\n]*method:\s*"POST"/.test(code(text)), "never a POST to technocore");
     } else if (rel === "alerts.ts") {
       assert.equal(posts, 2);
       assert.match(text, /must not point at technocore\.chat/);
@@ -65,7 +70,7 @@ test("live mode needs both deliberate settings; anything else refuses to start (
   assert.equal(loadCloseCallConfig({}).mode, "paper", "paper is the default");
   assert.equal(loadCloseCallConfig({ CLOSECALL_MODE: "live", CLOSECALL_LIVE_ENABLED: LIVE_ACK }).mode, "live", "config accepts it ...");
   const cli = readFileSync(join(DIR, "cli.ts"), "utf8");
-  assert.match(cli, /live execution is not connected in this build/, "... but the CLI refuses to run it");
+  assert.match(cli, /live execution is not connected in this build/, "... but the PAPER CLI refuses to run it (live runs only via live\/cli-live.ts)");
   assert.throws(() => loadRealKey("/any/path.json"), RealKeysNotAvailable);
   assert.equal(wouldSign("did:key:x", "close-1|terms|{}").signature, null);
 });
@@ -86,10 +91,15 @@ test("the CLI exposes no register, room or trade command", () => {
   }
 });
 
-test("the live writer exists but is NOT connected: cli-live refuses the real bootstrap", () => {
+test("the live writer is connected in code and armed ONLY by configuration; paper can never arm it", () => {
+  assert.equal(loadCloseCallConfig({}).liveWriter, "disarmed", "default: disarmed");
+  assert.throws(() => loadCloseCallConfig({ CLOSECALL_LIVE_WRITER: "armed" }), CloseCallConfigError, "armed needs CLOSECALL_MODE=live");
+  const armed = loadCloseCallConfig({ CLOSECALL_MODE: "live", CLOSECALL_LIVE_ENABLED: LIVE_ACK, CLOSECALL_LIVE_WRITER: "armed" });
+  assert.equal(armed.liveWriter, "armed");
   const live = readFileSync(join(DIR, "live/cli-live.ts"), "utf8");
-  assert.match(live, /export const LIVE_WRITER_CONNECTED = false;/, "flipping this is the go-live change and must be reviewed");
-  assert.match(live, /if \(!LIVE_WRITER_CONNECTED\) \{[\s\S]{0,200}NO WRITE[\s\S]{0,80}return 3;/);
+  assert.ok(!/LIVE_WRITER_CONNECTED/.test(live), "no code constant gates the writer: test build == production build");
+  assert.match(live, /if \(!w\.armed\) \{[\s\S]{0,200}NO WRITE[\s\S]{0,80}return 3;/, "bootstrap refuses while disarmed");
+  assert.match(readFileSync(join(DIR, "journal.ts"), "utf8"), /canWrite\?\.\(\)[\s\S]{0,80}throw new WriterDisarmed/, "every send passes the arming check");
   for (const { rel, text } of runtime()) {
     assert.ok(!/HttpTransport|loadSigners|generateKeys|loadFileSigner/.test(code(text)), `${rel} reaches live-only code`);
   }
@@ -106,4 +116,29 @@ test("live bootstrap and live service share ONE lock (never both writing the liv
   const live = readFileSync(join(DIR, "live/cli-live.ts"), "utf8");
   const locks = [...live.matchAll(/acquireLock\(([^,]+),/g)].map((m) => m[1].trim());
   assert.ok(locks.length >= 2 && locks.every((l) => l === "cfg.lockPath"), JSON.stringify(locks));
+});
+
+test("secrets: no seed, private key or age secret can reach a log, an error, a URL or the DB", async () => {
+  const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
+  const { tmpdir } = await import("node:os");
+  const { verifyRestoredKeyDir } = await import("./live/keygen.js");
+  const { loadFileSigner } = await import("./live/signer.js");
+  const { didFromPublicKey } = await import("../identity.js");
+  const secret = "ab".repeat(32);
+  const dir = mkdtempSync(join(tmpdir(), "cc-secret-"));
+  chmodSync(dir, 0o700);
+  writeFileSync(join(dir, "CC001.json"), `{"did":"x","seedHex":"${secret}"`, { mode: 0o600 });          // malformed on purpose
+  const r = verifyRestoredKeyDir(dir);
+  assert.ok(!JSON.stringify(r).includes(secret.slice(0, 16)), "restore report never quotes the file");
+  try { loadFileSigner(join(dir, "CC001.json"), didFromPublicKey); } catch (e) { assert.ok(!String((e as Error).message).includes(secret.slice(0, 16))); }
+  // live writes go through POST bodies (signature in the body), never signed GET URLs
+  for (const f of ["live/http-transport.ts", "protocol-writes.ts", "journal.ts", "live/executor.ts", "bootstrap.ts"]) {
+    assert.ok(!/say-signed|set-signed/.test(code(readFileSync(join(DIR, f), "utf8"))), `${f} builds a signed URL`);
+  }
+  // the DB schema has no column for key material
+  const store = readFileSync(join(DIR, "store.ts"), "utf8");
+  assert.ok(!/seed_?hex|private_?key|secret/i.test(code(store).replace(/CREATE TABLE IF NOT EXISTS seed/g, "")), "no key material column");
+  // logs redact secret-looking fields
+  const { SECRET_FIELD } = await import("./logger.js");
+  for (const k of ["seedHex", "privateKey", "age_secret", "telegramBotToken", "authorization"]) assert.ok(SECRET_FIELD.test(k), k);
 });

@@ -22,7 +22,8 @@ import { lastClosedSweep, sweepTime, type Contest } from "./contest.js";
 import type { Health } from "./health.js";
 import { KEY_STATUSES } from "./keys.js";
 import { lockStatus } from "./lock.js";
-import { backupGate } from "./backup-gate.js";
+import { collectLive, JOURNAL_STATES, KEY_FLAGS, type LiveMonitor } from "./monitor-live.js";
+import { writerState } from "./safety.js";
 import { decideStale, type StaleDecision } from "./stale-policy.js";
 
 // ------------------------------------------------------------------ data
@@ -40,7 +41,8 @@ export interface MonitorData {
     lock: "OK" | "ERROR" | "N/A"; lockDetail: string; db: "OK" | "ERROR"; dbError: N<string>; diskFreeMb: N<number>; dbSizeMb: N<number>; walMb: N<number>; healthOk: boolean };
   contest: { season: string; currentSweep: N<number>; lastSweep: N<number>; secSinceReferee: N<number>; refereeDelayMin: N<number>; ageS: N<number>;
     ref: N<string>; refSweep: N<number>; close: N<string>; global: N<string> };
-  hl: { px: N<string>; ageS: N<number>; time: N<string>; stale: "OK" | "STALE" | "HALT" | "N/A"; vsRefBps: N<number>; vsCloseBps: N<number> };
+  hl: { px: N<string>; ageS: N<number>; time: N<string>; stale: "OK" | "STALE" | "HALT" | "N/A"; vsRefBps: N<number>; vsCloseBps: N<number>; feedAgeS: N<number> };
+  env: { dataDir: string; db: string; node: string; sqlite: string; writerArmed: boolean; writerReason: string; policy: string; estimator: string };
   keys: { total: number; by: Record<string, number>; kind: "FAKE" | "REAL" | "N/A" };
   positions: { sweep: N<number>; long: N<number>; short: N<number>; flat: N<number>; longQty: N<number>; shortQty: N<number>; cash: N<number>;
     collateral: N<number>; fees: N<number>; realized: N<number>; markPnl: N<number>; top: { id: string; side: string; entry: N<string>; qty: number; score: number }[] };
@@ -51,10 +53,10 @@ export interface MonitorData {
     recent: { id: string; maker: string; taker: string; side: string; qty: string; px: string; sweep: number; status: string; fee: N<string> }[] };
   security: { executor: string; writes: "DISABLED" | "ENABLED"; halted: N<boolean>; safeMode: string; haltReason: N<string>; pendingWrites: N<number>; unresolved: N<number>; nonceErrors: N<number> };
   reconcile: { l1: N<string>; l1Sweep: N<number>; l2: N<string>; mismatches: N<number>; sinceStart: N<number>; lastMismatch: N<string> };
-  live: null | { roles: Record<string, string>; journal: Record<string, number>; nonceScopes: number; backup: string; backupOk: boolean; room: string; roomOk: boolean;
-    ntp: N<boolean>; staging: string };
-  errors: { reconnects: N<number>; timeouts: N<number>; http503: N<number>; alerts24h: N<number>; lastAlerts: { at: string; severity: string; message: string }[] };
-  activity: { refereeS: N<number>; hlS: N<number>; strategyS: N<number>; dbWriteS: N<number> };
+  live: LiveMonitor | null;
+  errors: { reconnects: N<number>; timeouts: N<number>; http503: N<number>; alerts24h: N<number>; alertsSinceStart: N<number>; lastAlerts: { at: string; severity: string; message: string }[] };
+  activity: { refereeS: N<number>; hlS: N<number>; strategyS: N<number>; dbWriteS: N<number>; technocoreWriteS: N<number>; journalS: N<number>; nonceReconcileS: N<number>; backupVerifyS: N<number> };
+  processStart: N<string>;
 }
 
 export interface MonitorSources {
@@ -66,6 +68,8 @@ export interface MonitorSources {
   /** The running service's /health; null when it does not answer. */
   fetchHealth?: () => Promise<Health | null>;
   version?: () => string;
+  /** NTP probe override (tests). */
+  ntp?: () => boolean | null;
   /** Previous sample, for a CPU % between two watch frames. */
   prev?: { at: number; cpuNs: number } | null;
 }
@@ -226,7 +230,10 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
     stale: hlAge === null ? "N/A" : hlAge * 1000 >= cfg.haltHlStaleMs ? "HALT" : hlAge * 1000 >= cfg.hlStaleMs ? "STALE" : "OK",
     vsRefBps: hlPx && contestD.ref ? +bps(hlPx, Number(contestD.ref)).toFixed(1) : null,
     vsCloseBps: hlPx && contestD.close ? +bps(hlPx, Number(contestD.close)).toFixed(1) : null,
+    feedAgeS: (() => { const v = q<{ value: string }>(db, "SELECT value FROM meta WHERE key = 'hl_feed_ok_at'")?.value; return v ? Math.max(0, Math.round((now - Number(v)) / 1000)) : null; })(),
   };
+  // Feed status follows FEED health (last successful poll), exactly as the safety halt does; an old last trade is only information.
+  hl.stale = hl.feedAgeS === null ? "N/A" : hl.feedAgeS * 1000 >= cfg.haltHlStaleMs ? "HALT" : hl.feedAgeS * 1000 >= cfg.hlStaleMs ? "STALE" : "OK";
 
   // ---- keys
   const byRows = qa<{ status: string; n: number }>(exec, "SELECT status, COUNT(*) n FROM keys GROUP BY status");
@@ -318,7 +325,7 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
   const pendingWrites = q<{ n: number }>(exec, "SELECT COUNT(*) n FROM write_attempts WHERE state NOT IN ('CONFIRMED','FAILED')")?.n ?? null;
   const nonceErrors = q<{ n: number }>(exec, "SELECT COUNT(*) n FROM write_attempts WHERE response LIKE '%nonce%' OR error LIKE '%nonce%'")?.n ?? null;
   const security: MonitorData["security"] = {
-    executor: running ? h?.executor ?? (live ? "live" : "paper") : "stopped", writes: live ? "ENABLED" : "DISABLED",
+    executor: running ? h?.executor ?? (live ? "live" : "paper") : "stopped", writes: live && writerState(cfg).armed ? "ENABLED" : "DISABLED",
     halted: db ? halts.length > 0 : null, safeMode: !db ? "N/A" : halts.length ? "YES" : "NO",
     haltReason: halts.length ? halts.map((x2) => `${x2.kind}${x2.severity === "grave" ? ` [grave, unhalt --code ${x2.code}]` : ""}: ${x2.reason}`).join(" | ") : null,
     pendingWrites, unresolved: trades.pending, nonceErrors,
@@ -340,6 +347,7 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
   const errors: MonitorData["errors"] = {
     reconnects: h?.counters.reconnects ?? null, timeouts: h?.counters.timeouts ?? null, http503: safe(() => count503(cfg.logDir, now), null),
     alerts24h: q<{ n: number }>(db, "SELECT COUNT(*) n FROM alerts WHERE at > ?", new Date(now - 86_400_000).toISOString())?.n ?? null,
+    alertsSinceStart: startIso ? q<{ n: number }>(db, "SELECT COUNT(*) n FROM alerts WHERE at >= ?", startIso)?.n ?? null : null,
     lastAlerts: qa<{ at: string; severity: string; message: string }>(db, "SELECT at, severity, message FROM alerts WHERE severity <> 'info' ORDER BY id DESC LIMIT 3"),
   };
 
@@ -351,31 +359,26 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
   const activity: MonitorData["activity"] = {
     refereeS: secs(lastRaw), hlS: hlObs ? Math.max(0, Math.round((now - hlObs) / 1000)) : null, strategyS: secs(decided),
     dbWriteS: lastWrite ? Math.max(0, Math.round((now - lastWrite) / 1000)) : null,
+    technocoreWriteS: null, journalS: null, nonceReconcileS: null, backupVerifyS: null,
   };
 
-  // ---- live-only operational state
-  let liveD: MonitorData["live"] = null;
-  if (live && exec) {
-    const roleRows = qa<{ role: string | null; status: string; n: number }>(exec, "SELECT role, status, COUNT(*) n FROM keys WHERE fake = 0 GROUP BY role, status");
-    const roles: Record<string, string> = {};
-    for (const r of ["admin", "staging", "strategy"]) roles[r] = roleRows.filter((x) => x.role === r).map((x) => `${x.status} ${x.n}`).join(", ") || "none";
-    const journal = Object.fromEntries(qa<{ state: string; n: number }>(exec, "SELECT state, COUNT(*) n FROM live_trades GROUP BY state").map((r) => [r.state, r.n]));
-    const gate = safe(() => backupGate(exec, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient }), null);
-    const rh = safe(() => JSON.parse(q<{ value: string }>(exec, "SELECT value FROM meta WHERE key = 'room_health'")?.value ?? "null") as { ok: boolean; why?: string; at: string } | null, null);
-    const roomState = cfg.room ? q<{ status: string }>(exec, "SELECT status FROM rooms_state WHERE name = ?", cfg.room)?.status ?? "UNCREATED" : "not set";
-    const ts = q<{ value: string }>(exec, "SELECT value FROM meta WHERE key = 'test_trade_settled'")?.value;
-    liveD = {
-      roles, journal, nonceScopes: q<{ n: number }>(exec, "SELECT COUNT(*) n FROM nonces")?.n ?? 0,
-      backup: gate ? (gate.ok ? `OK ${gate.verified!.archive}` : gate.problems[0] ?? "not verified") : "N/A", backupOk: !!gate?.ok,
-      room: `${cfg.room ?? "-"} ${roomState}${rh ? ` · checked ${rh.at.slice(11, 16)}Z ${rh.ok ? "ok" : `FAIL ${rh.why}`}` : ""}`, roomOk: roomState === "READY" && (rh?.ok ?? true),
-      ntp: safe(() => execFileSync("timedatectl", ["show", "-p", "NTPSynchronized", "--value"], { encoding: "utf8", timeout: 1500, stdio: ["ignore", "pipe", "ignore"] }).trim() === "yes", null),
-      staging: ts ? `staging trade settled @${ts}` : "staging trade not settled",
-    };
-  }
+  // ---- live-only operational state (same sources as the service and the gate; see monitor-live.ts)
+  const liveD: MonitorData["live"] = live && exec ? await collectLive(exec, cfg, contest, now, src.ntp).catch(() => null) : null;
+  const sAgo = (iso: string | null | undefined) => (iso ? Math.max(0, Math.round((now - Date.parse(iso)) / 1000)) : null);
+  activity.technocoreWriteS = sAgo(liveD?.lastTechnocoreWrite);
+  activity.journalS = sAgo(liveD?.journal.lastTransition);
+  activity.nonceReconcileS = sAgo(liveD?.nonces.lastReconcile);
+  activity.backupVerifyS = sAgo(liveD?.lastBackupVerify);
+  const w = writerState(cfg);
+  const env: MonitorData["env"] = {
+    dataDir: cfg.dataDir, db: cfg.dbPath, node: process.version,
+    sqlite: safe(() => (JSON.parse(readFileSync(join(process.cwd(), "node_modules/better-sqlite3/package.json"), "utf8")) as { version: string }).version, "N/A"),
+    writerArmed: w.armed, writerReason: w.reason, policy: cfg.confirmationPolicy, estimator: cfg.estimator,
+  };
 
   safe(() => db?.close(), undefined);
   if (exec && exec !== db) safe(() => exec.close(), undefined);
-  return { at: now, host: hostname(), mode: cfg.mode, version: (src.version ?? readVersion)(), service, contest: contestD, hl, keys, positions, leaderboard, strategy, trades, security, reconcile, errors, activity, live: liveD };
+  return { at: now, host: hostname(), mode: cfg.mode, version: (src.version ?? readVersion)(), service, contest: contestD, hl, keys, positions, leaderboard, strategy, trades, security, reconcile, errors, activity, live: liveD, env, processStart: startIso };
 }
 
 // ------------------------------------------------------------------ render
@@ -416,6 +419,15 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
   const live = d.mode === "live";
   const blocks: Block[] = [];
 
+  const E = d.env;
+  blocks.push([p.bold("ENVIRONMENT"),
+    row("MODE", live ? p.live(" LIVE ") : p.paper("PAPER")), row("DATA DIR", E.dataDir.slice(-26)), row("DB", E.db.split("/").pop() ?? E.db),
+    row("RUNTIME", E.node), row("better-sqlite3", E.sqlite),
+    row("WRITER", live ? (E.writerArmed ? p.err("CONNECTED · ARMED") : p.ok("CONNECTED · DISARMED")) : p.ok("NONE (paper)")),
+    ...(live && !E.writerArmed ? [p.dim(`  ${E.writerReason}`.slice(0, 44))] : []),
+    row("CONFIRM POLICY", E.policy), row("ESTIMATOR", E.estimator),
+  ]);
+
   blocks.push([p.bold("SERVICE"),
     row("service", d.service.state === "OK" ? p.ok("OK") : p.err(d.service.state === "DOWN" ? "SERVICE DOWN" : d.service.state)),
     row("systemd", v(d.service.systemd)),
@@ -426,6 +438,7 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
     row("lock", `${state(d.service.lock)} ${p.dim(d.service.lockDetail)}`),
     row("DB", d.service.db === "OK" ? p.ok("OK") : `${p.err("ERROR")} ${p.dim((d.service.dbError ?? "").slice(0, 40))}`),
     row("disk free", v(d.service.diskFreeMb, " MB")), row("SQLite", `${v(d.service.dbSizeMb, " MB")} ${p.dim(`wal ${v(d.service.walMb, " MB")}`)}`),
+    row("process start", v(d.processStart?.slice(0, 19).replace("T", " "))),
   ]);
 
   const c = d.contest;
@@ -443,7 +456,9 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
   const hl = d.hl;
   blocks.push([p.bold("HYPERLIQUID xyz:NVDA"),
     row("NVDA", v(hl.px)),
-    row("age", hl.ageS === null ? NA : hl.stale === "OK" ? `${hl.ageS}s` : hl.stale === "STALE" ? p.warn(`${hl.ageS}s STALE`) : p.err(`${hl.ageS}s STALE (halt)`)),
+    row("last_trade_age", hl.ageS === null ? NA : `${hl.ageS}s ${p.dim("(a quiet market is normal)")}`),
+    row("feed_health_age", hl.feedAgeS === null ? p.dim("N/A (service view)") : `${hl.feedAgeS}s`),
+    row("feed status", hl.stale === "OK" ? p.ok("OK") : hl.stale === "STALE" ? p.warn("STALE") : hl.stale === "HALT" ? p.err("DOWN (halt)") : NA),
     row("trade time", v(hl.time)), row("HL vs REF", signed(hl.vsRefBps, 1, " bps")), row("HL vs CLOSE", signed(hl.vsCloseBps, 1, " bps")),
   ]);
 
@@ -471,7 +486,7 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
   ]);
 
   const s = d.strategy;
-  blocks.push([p.bold("STRATEGY K"),
+  blocks.push([p.bold(`STRATEGY K ${p.dim(live ? "(live strategy state)" : "(paper strategy state)")}`),
     row("strategy", state(s.status)), row("threshold", `${(s.threshold * 100).toFixed(2)}%`),
     row("last low", v(s.lo)), row("next low", v(s.nextLo)), row("last high", v(s.hi)), row("next high", v(s.nextHi)),
     row("pairs used", v(s.pairsUsed)), row("pairs unused", v(s.pairsUnused)),
@@ -510,18 +525,56 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
 
   const e = d.errors;
   blocks.push([p.bold("ERRORS"),
-    row("reconnects", v(e.reconnects)), row("timeouts", v(e.timeouts)), row("HTTP 503 today", v(e.http503)), row("alerts 24h", (e.alerts24h ?? 0) > 0 ? p.warn(String(e.alerts24h)) : v(e.alerts24h)),
+    row("reconnects", v(e.reconnects)), row("timeouts", v(e.timeouts)), row("HTTP 503 today", v(e.http503)),
+    row("alerts (run)", (e.alertsSinceStart ?? 0) > 0 ? p.warn(String(e.alertsSinceStart)) : v(e.alertsSinceStart)), row("alerts 24h (all)", p.dim(v(e.alerts24h))),
     ...e.lastAlerts.map((a) => `${p.dim(a.at.slice(5, 16).replace("T", " "))} ${a.severity === "critical" ? p.err(a.severity) : p.warn(a.severity)} ${a.message.slice(0, 60)}`),
   ]);
 
   if (d.live) {
     const L = d.live;
-    blocks.push([p.bold("LIVE"),
-      row("admin", L.roles.admin), row("staging", L.roles.staging), row("strategy", L.roles.strategy), row("staging trade", L.staging),
-      row("journal", Object.entries(L.journal).map(([k, n]) => `${k} ${n}`).join(", ") || "empty"),
-      row("UNKNOWN trades", (L.journal.UNKNOWN ?? 0) > 0 ? p.err(String(L.journal.UNKNOWN)) : p.ok("0")),
-      row("nonce scopes", String(L.nonceScopes)), row("backup", L.backupOk ? p.ok(L.backup) : p.err(L.backup)),
-      row("room", L.roomOk ? p.ok(L.room) : p.err(L.room)), row("clock NTP", L.ntp === null ? NA : L.ntp ? p.ok("synchronized") : p.err("NOT synchronized")),
+    const okv = (b: boolean | null, t: string, f?: string) => (b === null ? NA : b ? p.ok(t) : p.err(f ?? t));
+    blocks.push([p.bold("KEY CLASSES (REAL KEYS)"),
+      row("ADMIN", `${L.classes.admin.length} ${p.dim(L.classes.admin.join(" "))}`),
+      row("STAGING", `${L.classes.staging.length} ${p.dim(L.classes.staging.join(" "))}`),
+      row("STRATEGY", `${L.classes.strategy.count} ${p.dim(L.classes.strategy.first ? `${L.classes.strategy.first}..${L.classes.strategy.last}` : "")}`),
+      row("strategy pairs", `${L.classes.strategyPairs} ${p.dim("(no staging/admin)")}`),
+      ...KEY_FLAGS.map((f) => row(`  ${f}`, f === "ERROR" && L.flags[f] > 0 ? p.err(String(L.flags[f])) : String(L.flags[f]))),
+    ]);
+    blocks.push([p.bold("BACKUP"),
+      row("backup age", okv(L.backup.ok, "OK", "FAIL")), row("latest backup", v(L.backup.latestAt)), row("restore verify", okv(L.backup.restoreOk, "OK", `FAIL ${L.backup.detail.slice(0, 26)}`)),
+      row("keys newer", L.backup.keysNewer ? p.err("YES") : p.ok("NO")), row("plaintext backup", L.backup.plaintext ? p.err("YES") : p.ok("NO")),
+    ]);
+    blocks.push([p.bold("ROOM"),
+      row("room", v(L.room.name)), row("status", L.room.status === "READY" ? p.ok("READY") : p.warn(L.room.status)),
+      row("exists", L.room.exists === null ? NA : L.room.exists ? p.ok("YES") : p.err("NO")), row("owner", v(L.room.owner)),
+      row("writers", `${v(L.room.allowCount)} allowed / ${L.room.expectedWriters} expected`), row("generation", v(L.room.generation)),
+      row("last refresh", v(L.room.lastRefresh?.slice(0, 16))), row("last check", v(L.room.checkedAt?.slice(11, 19))),
+      row("room missing", L.room.missing ? p.err(`YES ${L.room.why ?? ""}`.slice(0, 40)) : p.ok("NO")),
+    ]);
+    blocks.push([p.bold("NONCES"),
+      row("scopes", String(L.nonces.scopes)), row("status", L.nonces.status === "OK" ? p.ok("OK") : p.err(L.nonces.status.slice(0, 30))),
+      row("server/local", L.nonces.mismatch === null ? p.dim("N/A (at service start)") : L.nonces.mismatch === "0" ? p.ok("0 mismatches") : p.err(L.nonces.mismatch.slice(0, 30))),
+      row("last reconcile", v(L.nonces.lastReconcile?.slice(0, 16))),
+    ]);
+    blocks.push([p.bold("LIVE JOURNAL"),
+      ...JOURNAL_STATES.map((s) => row(`  ${s}`, s === "UNKNOWN" && L.journal.counts[s] > 0 ? p.err(String(L.journal.counts[s])) : String(L.journal.counts[s]))),
+      row("pending", L.journal.pending > 0 ? p.warn(String(L.journal.pending)) : "0"), row("unknown", L.journal.unknown > 0 ? p.err(String(L.journal.unknown)) : p.ok("0")),
+      row("last trade", `${v(L.journal.lastId)} ${v(L.journal.lastState)}`), row("last POST", v(L.journal.lastPost?.slice(11, 19))), row("last referee", v(L.journal.lastReferee?.slice(11, 19))),
+    ]);
+    blocks.push([p.bold("CLOCK"),
+      row("system time", L.clock.system.slice(0, 19).replace("T", " ")), row("NTP", L.clock.ntp === null ? NA : L.clock.ntp ? p.ok("YES") : p.err("NO (live FAIL)")), row("skew", v(L.clock.skew)),
+    ]);
+    const bad = [...L.readiness.local, ...L.readiness.network].filter((r) => !r.ok);
+    const pick = (name: string) => [...L.readiness.local, ...L.readiness.network].find((r) => r.name === name);
+    const rr = (label: string, ...names: string[]) => { const rs = names.map(pick).filter(Boolean) as { ok: boolean; value: string }[]; return row(label, !rs.length ? p.dim("N/A") : rs.every((r) => r.ok) ? p.ok("OK") : p.err(`FAIL ${rs.find((r) => !r.ok)!.value.slice(0, 24)}`)); };
+    blocks.push([p.bold("LIVE READINESS"),
+      rr("writer", "writer"), rr("keys", "admin key", "staging keys", "strategy keys", "key dir perms"), rr("backup", "encrypted backup", "restore verification", "no plaintext key backup"),
+      rr("room", "room state", "room on server", "room generation"), rr("nonces", "nonce store", "nonce reconciliation", "note nonce (room-nonce)"),
+      rr("referee", "referee", "referee seed"), rr("Hyperliquid", "Hyperliquid feed"), rr("clock", "NTP", "clock skew"), rr("pending writes", "pending writes"),
+      rr("unknown trades", "unknown trades"), rr("safe mode", "not halted"),
+      p.dim(`network rows as of ${L.readiness.networkAt ? L.readiness.networkAt.slice(0, 16) : "never (run live-check)"}`),
+      L.readiness.pass ? p.ok("LIVE READINESS: PASS") : p.err(`LIVE READINESS: FAIL (${bad.length})`),
+      ...bad.slice(0, 3).map((r) => p.dim(`  ${r.name}: ${r.value}`.slice(0, 44))),
     ]);
   }
 
@@ -529,15 +582,21 @@ export function render(d: MonitorData, opts: { color: boolean; width: number }):
   const fresh = (x: number | null, warnS: number) => (x === null ? NA : x > warnS * 3 ? p.err(ago(x)) : x > warnS ? p.warn(ago(x)) : ago(x));
   blocks.push([p.bold("ACTIVITY"),
     row("referee event", fresh(a.refereeS, 120)), row("Hyperliquid event", fresh(a.hlS, 60)), row("strategy eval", fresh(a.strategyS, 420)), row("DB write", fresh(a.dbWriteS, 60)),
+    ...(live ? [row("technocore write", v(a.technocoreWriteS === null ? null : ago(a.technocoreWriteS))), row("journal change", v(a.journalS === null ? null : ago(a.journalS))),
+      row("nonce reconcile", v(a.nonceReconcileS === null ? null : ago(a.nonceReconcileS))), row("backup verify", v(a.backupVerifyS === null ? null : ago(a.backupVerifyS)))] : []),
   ]);
 
   // ---- header
   const at = new Date(d.at);
   const local = at.toLocaleTimeString("en-GB", { hour12: false });
-  const title = live ? p.live(" CLOSE CALL — LIVE ") : p.paper("CLOSE CALL — PAPER");
+  const armed = d.env.writerArmed;
+  const title = !live ? p.paper("CLOSE CALL — PAPER") : armed ? p.live(" CLOSE CALL — LIVE ") : p.warn("CLOSE CALL — LIVE CANDIDATE");
   const head = [
     `${title}  ${d.host}  pid ${v(d.service.pid)}  up ${dur(d.service.uptimeS)}  ${at.toISOString().slice(0, 19).replace("T", " ")} UTC  ${local} local  ${d.version}`,
-    [d.service.state !== "OK" ? p.err("SERVICE DOWN") : "", live ? p.live(" WRITES: ENABLED — REAL KEYS ") : p.paper("WRITES: DISABLED") + p.dim("  paper: fake keys, simulated trades, nothing is signed or sent"),
+    [d.service.state !== "OK" ? p.err("SERVICE DOWN") : "",
+      !live ? p.paper("WRITES: DISABLED") + p.dim("  FAKE KEYS · SIMULATED TRADES · nothing is signed or sent")
+        : armed ? p.live(" WRITES: ENABLED — REAL KEYS ") : p.ok("WRITES: DISABLED") + p.dim(`  (${d.env.writerReason})`),
+      live && d.live && !d.live.readiness.pass ? p.err("LIVE READINESS: FAIL") : live && d.live ? p.ok("LIVE READINESS: PASS") : "",
       sec.halted ? p.err(`HALTED: ${sec.haltReason ?? ""}`.slice(0, 90)) : ""].filter(Boolean).join("   "),
     "",
   ];

@@ -4,7 +4,7 @@
 # Layout (the installer creates it):
 #   /opt/flop-closecall            code, owned by root, read-only for the service (deploy-closecall.sh)
 #   /etc/flop-closecall/closecall.env   config, root:flopcc 0640, never in git, never overwritten by the installer
-#   /var/lib/flop-closecall        data: sqlite, logs, keys/, backups/, lock  (flopcc, 0700, StateDirectory)
+#   /var/lib/flop-closecall-live   LIVE data: live.sqlite3, keys/, backups/, logs, lock  (flopcc, 0700, StateDirectory)
 #   /usr/local/lib/flop-closecall/node   a copy of the node binary (root's nvm dir is not readable by flopcc)
 
 [Unit]
@@ -16,8 +16,9 @@ Documentation=file:///opt/flop-closecall/deploy/closecall/DEPLOY.md
 After=network-online.target
 Wants=network-online.target
 # Crash loop guard: more than 10 starts in 10 minutes -> systemd stops trying (see `systemctl status`).
-StartLimitIntervalSec=600
-StartLimitBurst=10
+# Live: at most 3 starts in 15 minutes, then systemd gives up (no aggressive restart loop of a writer).
+StartLimitIntervalSec=900
+StartLimitBurst=3
 
 [Service]
 Type=simple
@@ -34,7 +35,7 @@ Environment=PYTHONDONTWRITEBYTECODE=1
 # `run` follows CLOSECALL_MODE (paper by default). live is refused with exit 3 in this build.
 ExecStart=/usr/local/lib/flop-closecall/node --import tsx src/close-call/live/cli-live.ts run
 Restart=always
-RestartSec=15
+RestartSec=30
 # Config errors (2), live refused (3) and lock held (4) are not fixed by restarting.
 # 3 = live readiness failed / writer not connected: never loop on it.
 RestartPreventExitStatus=2 3 4

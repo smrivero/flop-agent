@@ -20,7 +20,9 @@ import { getMeta, healthEvent, now, setMeta, type CcDb } from "./store.js";
 
 export type HaltKind =
   | "reconcile_mismatch" | "db_corruption" | "room_ownership" | "nonce_conflict" | "ambiguous_operation"
-  | "referee_stale" | "hyperliquid_stale" | "disk_low" | "manual";
+  | "referee_stale" | "hyperliquid_stale" | "disk_low" | "manual"
+  /** A live POST whose fate is not known yet: no new entries until it is resolved by evidence (then it clears itself). */
+  | "unknown_trade";
 
 export const GRAVE: readonly HaltKind[] = ["reconcile_mismatch", "db_corruption", "room_ownership", "nonce_conflict", "ambiguous_operation", "manual"];
 
@@ -94,3 +96,41 @@ export function unhalt(db: CcDb, code: string): Halt | null {
   ccLog("SAFE MODE", { kind: entry[0], code }, "halt cleared manually");
   return entry[1];
 }
+
+// ------------------------------------------------------------------ live writer arming / kill switch
+
+import { existsSync as _exists, readFileSync as _read, unlinkSync as _unlink, writeFileSync as _write } from "node:fs";
+import { join as _join } from "node:path";
+
+export const DISARM_FILE = "DISARM";
+
+/**
+ * May the live writer send anything right now? The code is always connected; it is ARMED only when
+ * CLOSECALL_MODE=live (+ ack), CLOSECALL_LIVE_WRITER=armed, and no DISARM kill-switch file exists in the
+ * live data dir. Disarming stops every write (trades, bootstrap, room upkeep) and every new decision;
+ * the observer, reconciliation and read-only recovery keep running.
+ */
+export function writerState(cfg: { mode: string; liveWriter: string; dataDir: string }): { armed: boolean; reason: string } {
+  if (cfg.mode !== "live") return { armed: false, reason: `mode ${cfg.mode}` };
+  if (cfg.liveWriter !== "armed") return { armed: false, reason: "CLOSECALL_LIVE_WRITER=disarmed" };
+  const f = _join(cfg.dataDir, DISARM_FILE);
+  if (_exists(f)) {
+    let why = "";
+    try { why = _read(f, "utf8").trim(); } catch { /* unreadable: still disarmed */ }
+    return { armed: false, reason: `kill switch ${f}${why ? `: ${why}` : ""}` };
+  }
+  return { armed: true, reason: "armed" };
+}
+
+export function disarm(dataDir: string, reason: string): void {
+  _write(_join(dataDir, DISARM_FILE), `${new Date().toISOString()} ${reason}\n`, { mode: 0o600 });
+}
+
+export function rearm(dataDir: string): boolean {
+  const f = _join(dataDir, DISARM_FILE);
+  if (!_exists(f)) return false;
+  _unlink(f);
+  return true;
+}
+
+export class WriterDisarmed extends Error {}

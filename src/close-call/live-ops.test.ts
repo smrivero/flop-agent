@@ -16,10 +16,12 @@ import { WriteJournal } from "./journal.js";
 import { keysByRole } from "./keys.js";
 import { generateKeys, loadSigners, verifyRestoredKeyDir } from "./live/keygen.js";
 import { liveReadiness, renderReadiness } from "./live/readiness.js";
-import { halt } from "./safety.js";
+import { disarm, halt } from "./safety.js";
 import { backupDb, now, openCloseCallDb, setMeta, type CcDb } from "./store.js";
 import { contest, testConfig } from "./test-helpers.js";
 import { MockTechnocore } from "./testing/mock-technocore.js";
+import { REFEREE_PACKAGE_SHA256 } from "./fold.js";
+import { REFEREE_DID } from "./protocol.js";
 
 const C = contest();
 const RECIPIENT = "age1" + "q".repeat(58);
@@ -57,8 +59,13 @@ function prepared(): { dir: string; db: CcDb; env: Record<string, string> } {
   setMeta(db, "bootstrap_done_at", new Date().toISOString());
   setMeta(db, "test_trade_settled", "301");
   setMeta(db, "last_db_backup_at", new Date().toISOString());
+  // the referee's signed seed, pinning the official package
+  db.prepare("INSERT INTO seed (id, price, tid, time, package, json) VALUES (1, '226.14', '1', 't', ?, '{}')").run(REFEREE_PACKAGE_SHA256);
+  db.prepare("INSERT INTO raw_posts (room, seq, generation, ts, from_did, text, fetched_at) VALUES ('d-close1-price', 1, 1, 't', ?, ?, ?)")
+    .run(REFEREE_DID, JSON.stringify({ t: "seed", season: "close-1", package: REFEREE_PACKAGE_SHA256 }), now());
   const env = { CLOSECALL_MODE: "live", CLOSECALL_LIVE_ENABLED: LIVE_ACK, CLOSECALL_DATA_DIR: dir, CLOSECALL_DB_PATH: join(dir, "live.sqlite3"),
-    CLOSECALL_LIVE_DB_PATH: join(dir, "live.sqlite3"), CLOSECALL_LOCK_PATH: join(dir, "live.lock"), CLOSECALL_ROOM: ROOM, CLOSECALL_BACKUP_AGE_RECIPIENT: RECIPIENT };
+    CLOSECALL_LIVE_DB_PATH: join(dir, "live.sqlite3"), CLOSECALL_LOCK_PATH: join(dir, "live.lock"), CLOSECALL_ROOM: ROOM, CLOSECALL_BACKUP_AGE_RECIPIENT: RECIPIENT,
+    CLOSECALL_LIVE_WRITER: "armed" };
   return { dir, db, env };
 }
 
@@ -79,7 +86,7 @@ function net(db: CcDb, o: { skewMs?: number; serverNonceBump?: bigint; owner?: s
     if (u.includes(`/r/${ROOM}`)) {
       const local = db.prepare("SELECT last_nonce FROM nonces WHERE signer_id = ? AND scope = ?").get("CC001", `room:${ROOM}`) as { last_nonce: string } | undefined;
       const n = (local ? BigInt(local.last_nonce) : 1000n) + (o.serverNonceBump ?? 0n);
-      return new Response(JSON.stringify({ messages: [{ seq: 1, from: keysByRole(db, "strategy")[0].did, text: "x", nonce: 0 }] }).replace('"nonce":0', `"nonce":${n}`), { status: 200, headers });
+      return new Response(JSON.stringify({ generation: 1, last_seq: 1, messages: [{ seq: 1, from: keysByRole(db, "strategy")[0].did, text: "x", nonce: 0 }] }).replace('"nonce":0', `"nonce":${n}`), { status: 200, headers });
     }
     return new Response("404", { status: 404 });
   }) as unknown as typeof fetch;
@@ -90,7 +97,7 @@ const rowsOf = (r: Awaited<ReturnType<typeof liveReadiness>>) => Object.fromEntr
 test("live-check: a fully prepared state PASSES; only GETs are made", async () => {
   const { db, env } = prepared();
   db.prepare("INSERT INTO nonces (signer_id, scope, last_nonce, updated_at) VALUES ('CC001', ?, '5000', ?)").run(`room:${ROOM}`, now());
-  const r = await liveReadiness(testConfig(env), C, true, "check", { fetch: net(db), ntp: () => true });
+  const r = await liveReadiness(testConfig(env), C, "check", { fetch: net(db), ntp: () => true });
   assert.ok(r.pass, renderReadiness(r));
   const rows = rowsOf(r);
   assert.match(rows["Hyperliquid feed"].value, /feed OK .* last trade 400 s ago \(a quiet market is not a broken feed\)/);
@@ -98,16 +105,18 @@ test("live-check: a fully prepared state PASSES; only GETs are made", async () =
 });
 
 test("live-check FAILS, with the reason, on each missing condition", async () => {
-  const cases: [string, (x: ReturnType<typeof prepared>) => { env?: Record<string, string>; fetch?: typeof fetch; ntp?: boolean; writer?: boolean }, string][] = [
-    ["writer not connected", () => ({ writer: false }), "writer"],
-    ["NTP not synchronized", () => ({ ntp: false }), "clock (NTP)"],
-    ["clock skew 5 s", (x) => ({ fetch: net(x.db, { skewMs: 5_000 }) }), "clock (NTP)"],
+  const cases: [string, (x: ReturnType<typeof prepared>) => { env?: Record<string, string>; fetch?: typeof fetch; ntp?: boolean }, string][] = [
+    ["writer disarmed by config", (x) => ({ env: { ...x.env, CLOSECALL_LIVE_WRITER: "disarmed" } }), "writer"],
+    ["kill switch", (x) => { disarm(x.dir, "operator"); return {}; }, "writer"],
+    ["NTP not synchronized", () => ({ ntp: false }), "NTP"],
+    ["clock skew 5 s", (x) => ({ fetch: net(x.db, { skewMs: 5_000 }) }), "clock skew"],
     ["server nonce ahead of our journal (restored from an old backup)", (x) => ({ fetch: net(x.db, { serverNonceBump: 10n }) }), "nonce reconciliation"],
     ["room owned by someone else", (x) => ({ fetch: net(x.db, { owner: "did:key:z6MkSomeoneElse" }) }), "room on server"],
     ["paper data dir", (x) => ({ env: { ...x.env, CLOSECALL_DATA_DIR: "/var/lib/flop-closecall" } }), "isolation from paper"],
     ["loose key file", (x) => { chmodSync(join(x.dir, "keys", "CC001.json"), 0o644); return {}; }, "key dir perms"],
     ["key added after the backup", (x) => { writeFileSync(join(x.dir, "keys", "CC005.json"), "{}", { mode: 0o600 }); return {}; }, "restore verification"],
     ["staging trade not settled", (x) => { x.db.prepare("DELETE FROM meta WHERE key = 'test_trade_settled'").run(); return {}; }, "staging trade"],
+    ["referee seed pins another package", (x) => { x.db.prepare("UPDATE seed SET package = 'f00d'").run(); return {}; }, "referee seed"],
     ["UNKNOWN trade", (x) => { x.db.prepare(`INSERT INTO live_trades (intent_id, trade_id, sweep, maker_id, taker_id, terms, payload_sha256, state, created_at, updated_at)
       VALUES ('i', 't', 1, 'CC001', 'CC002', '{}', 'x', 'UNKNOWN', ?, ?)`).run(now(), now()); return {}; }, "unknown trades"],
   ];
@@ -115,7 +124,7 @@ test("live-check FAILS, with the reason, on each missing condition", async () =>
     const x = prepared();
     x.db.prepare("INSERT INTO nonces (signer_id, scope, last_nonce, updated_at) VALUES ('CC001', ?, '5000', ?)").run(`room:${ROOM}`, now());
     const m = mutate(x);
-    const r = await liveReadiness(testConfig(m.env ?? x.env), C, m.writer ?? true, "check", { fetch: m.fetch ?? net(x.db), ntp: () => m.ntp ?? true });
+    const r = await liveReadiness(testConfig(m.env ?? x.env), C, "check", { fetch: m.fetch ?? net(x.db), ntp: () => m.ntp ?? true });
     assert.equal(r.pass, false, name);
     assert.equal(rowsOf(r)[row]?.ok, false, `${name}: row ${row}\n${renderReadiness(r)}`);
   }
@@ -126,8 +135,8 @@ test("live run tolerates what it must reconcile (pending writes, UNKNOWN, halts)
   x.db.prepare("INSERT INTO nonces (signer_id, scope, last_nonce, updated_at) VALUES ('CC001', ?, '5000', ?)").run(`room:${ROOM}`, now());
   halt(x.db, "ambiguous_operation", "trade t: unknown");
   const opts = { fetch: net(x.db), ntp: () => true };
-  assert.equal((await liveReadiness(testConfig(x.env), C, true, "check", opts)).pass, false);
-  assert.equal((await liveReadiness(testConfig(x.env), C, true, "run", opts)).pass, true, "the service starts, reconciles read-only, and stays halted for new entries");
+  assert.equal((await liveReadiness(testConfig(x.env), C, "check", opts)).pass, false);
+  assert.equal((await liveReadiness(testConfig(x.env), C, "run", opts)).pass, true, "the service starts, reconciles read-only, and stays halted for new entries");
 });
 
 test("disaster recovery drill: backup -> brand-new dir -> live-check --offline PASSES; nothing written anywhere else", async () => {
@@ -154,7 +163,7 @@ test("disaster recovery drill: backup -> brand-new dir -> live-check --offline P
   assert.equal((rdb.prepare("SELECT state FROM live_trades WHERE trade_id = 'abc'").get() as { state: string }).state, "SETTLED", "journal restored");
   assert.equal((rdb.prepare("SELECT last_nonce FROM nonces WHERE signer_id = 'CC001'").get() as { last_nonce: string }).last_nonce, "5000", "nonces restored");
   rdb.close();
-  const r = await liveReadiness(testConfig(env), C, true, "check", { offline: true });
+  const r = await liveReadiness(testConfig(env), C, "check", { offline: true });
   assert.ok(r.pass, renderReadiness(r));
 });
 

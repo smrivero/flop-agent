@@ -18,10 +18,21 @@ import { publicKeyFromDid } from "../../identity.js";
 import { sweepText, type SignedMessageBody, type SignedNoteBody } from "../protocol-writes.js";
 import { TransportTimeout, type RoomMessage, type Transport, type TransportResponse } from "../journal.js";
 
-type Fault = "drop" | "timeout-after-commit" | "timeout-before-commit" | "429";
+type Fault = "drop" | "timeout-after-commit" | "timeout-before-commit" | "429" | "503" | "kill" | "403";
 
 export class MockTechnocore implements Transport {
   rooms = new Map<string, RoomMessage[]>();
+  /** Room generation (epoch): bumped when a deleted room's name is used again. */
+  generations = new Map<string, number>();
+  private reaped = new Set<string>();
+
+  /** technocore reaps the room (idle / stillborn): messages and notes go, the generation is kept until reuse. */
+  reap(room: string): void {
+    this.rooms.delete(room);
+    this.notes.delete(`room-owners/${room}`);
+    this.notes.delete(`room-allow/${room}`);
+    this.reaped.add(room);
+  }
   notes = new Map<string, string>();
   lastNonce = new Map<string, bigint>();       // `${room}|${did}`
   private recent: { room: string; text: string; at: number }[] = [];
@@ -48,6 +59,9 @@ export class MockTechnocore implements Transport {
     const fault = this.faults.shift();
     if (fault === "drop" || fault === "timeout-before-commit") throw new TransportTimeout("request lost before the server stored it");
     if (fault === "429") return { status: 429, text: "429 write bucket empty: refills 5/s, retry in 1 s" };
+    if (fault === "503") return { status: 503, text: "503 Service Unavailable" };
+    if (fault === "403") return { status: 403, text: "403 refused" };
+    if (fault === "kill") { const e = new Error("SIGKILL: the process died mid-request (simulated kill -9)"); e.name = "SimulatedKill"; throw e; }
     const res = path.startsWith("/kv/") ? this.postNote(path, body as SignedNoteBody) : this.postMessage(path, body as SignedMessageBody);
     if (fault === "timeout-after-commit") throw new TransportTimeout("server stored it but the client timed out");
     return res;
@@ -72,10 +86,14 @@ export class MockTechnocore implements Transport {
     this.recent.push({ room, text, at: t });
     this.lastNonce.set(k, BigInt(b.nonce));
     const msgs = this.rooms.get(room) ?? [];
+    if (!msgs.length) {
+      const g = this.generations.get(room) ?? 0;
+      if (g === 0 || this.reaped.has(room)) { this.generations.set(room, g + 1); this.reaped.delete(room); }
+    }
     const seq = msgs.length + 1;
     msgs.push({ seq, from: b.did, text, nonce: b.nonce, ts: new Date(t).toISOString() });
     this.rooms.set(room, msgs);
-    return { status: 200, text: JSON.stringify({ ok: true, seq }) };
+    return { status: 200, text: JSON.stringify({ room, generation: this.generations.get(room) ?? 0, last_seq: seq, messages: msgs.slice(-5) }) };
   }
 
   private postNote(path: string, b: SignedNoteBody): TransportResponse {
@@ -103,11 +121,11 @@ export class MockTechnocore implements Transport {
 
   async readRoom(room: string, since: number) {
     const msgs = (this.rooms.get(room) ?? []).filter((m) => m.seq > since).slice(0, 200);
-    return { first_seq: msgs[0]?.seq ?? null, last_seq: this.rooms.get(room)?.length ?? 0, messages: msgs };
+    return { first_seq: msgs[0]?.seq ?? null, last_seq: this.rooms.get(room)?.length ?? 0, messages: msgs, generation: this.generations.get(room) ?? 0 };
   }
 
   async readTail(room: string) {
-    return { messages: (this.rooms.get(room) ?? []).slice(-200) };
+    return { messages: (this.rooms.get(room) ?? []).slice(-200), generation: this.generations.get(room) ?? 0, last_seq: this.rooms.get(room)?.length ?? 0 };
   }
 
   async readNote(ns: string, key: string): Promise<string | null> {

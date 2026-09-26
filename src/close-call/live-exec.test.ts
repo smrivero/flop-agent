@@ -174,16 +174,27 @@ test("timeout AFTER the server committed: read-back finds it -> POSTED, one copy
   assert.equal(Object.keys(activeHalts(w.db)).length, 0);
 });
 
-test("timeout BEFORE the server stored it: UNKNOWN, execution halted, NO automatic re-post (not even after a restart)", async () => {
+test("timeout BEFORE the server stored it: UNKNOWN, no new entries, NEVER re-sent (not even after a restart); resolved by evidence after the boundary", async () => {
   const { w, p } = await readyLive(2);
   w.srv.failNext("timeout-before-commit");
   await p.decide(3, true, at(3));
   assert.equal(liveRows(w.db)[0].state, "UNKNOWN");
   assert.equal(tradesIn(w).length, 0);
-  assert.ok(activeHalts(w.db).ambiguous_operation, "grave halt; the observer keeps running");
-  await engine(w, executor(w), 2);
-  assert.equal(tradesIn(w).length, 0, "never re-sent");
+  assert.ok(activeHalts(w.db).unknown_trade, "no new entries while unknown; the observer keeps running");
+  const p2 = await engine(w, executor(w), 2);                                  // restart: still never re-sent
+  assert.equal(tradesIn(w).length, 0);
   assert.equal(liveRows(w.db)[0].state, "UNKNOWN");
+  const price = priceOf(w.feed.sweep(3, { close: "226.10", applied: "226.00", owners: 10, prevOwners: 5 }));
+  await p2.settle(3, price);                                                   // before boundary + grace: deferred
+  assert.equal(liveRows(w.db)[0].state, "UNKNOWN");
+  assert.ok(p2.deferred.has(3));
+  w.clock.t = sweepTime(C, 3) + 31_000;
+  await p2.retryDeferred();
+  assert.equal(liveRows(w.db)[0].state, "NOT_APPLIED", "absent after the boundary -> never settles -> kept out of the book");
+  assert.match(liveRows(w.db)[0].detail, /absent after the boundary/);
+  assert.equal(activeHalts(w.db).unknown_trade, undefined, "resolved: the halt clears itself");
+  assert.equal(p2.state.retries.length, 1, "the pair is released for a retry only now");
+  assert.equal(tradesIn(w).length, 0, "nothing was ever re-sent");
 });
 
 test("stale sweep: past the posting deadline nothing is signed or sent; the pair is released for a retry", async () => {
@@ -276,10 +287,27 @@ test("100 keys: several triggers over several sweeps with a restart in the middl
   }
   const rows = liveRows(w.db);
   const posted = tradesIn(w);
-  assert.ok(rows.length >= 4, `triggers: ${rows.length}`);
+  assert.ok(rows.length >= 4, `triggers: ${rows.length} ${JSON.stringify(rows.map((r) => [r.sweep, r.pair_index, r.state, r.detail]))} ${JSON.stringify(w.db.prepare("SELECT sweep, trigger, decision, detail FROM strategy_triggers").all())}`);
   assert.equal(new Set(posted.map((t) => t.terms.id)).size, posted.length, "no trade id posted twice");
   assert.equal(posted.length, rows.filter((r) => ["POSTED", "CONFIRMED", "SETTLED", "VOID"].includes(r.state)).length);
   for (const t of posted) assert.ok(verifyEd25519(t.terms.maker, t.maker_sig, makerSigningString(t.terms)));
   const pairs = rows.map((r) => r.pair_index);
   assert.equal(new Set(pairs).size, pairs.length, "each pair used once");
+});
+
+test("pair fates: FAILED (refused, nothing stored) and NOT_POSTED release the pair; SETTLED never re-trades it; UNKNOWN blocks it until resolved", async () => {
+  const { w, p } = await readyLive(2);
+  w.srv.failNext("403");
+  const sent = await p.decide(3, true, at(3));
+  assert.equal(sent.length, 0);
+  assert.equal(liveRows(w.db)[0].state, "FAILED");
+  assert.equal(p.state.retries.length, 1, "FAILED: nothing was stored -> the pair is free for a retry (fresh id)");
+  assert.equal(Object.keys(activeHalts(w.db)).length, 0, "a definitive refusal is not a halt");
+  // the retry at the next sweep uses a NEW trade id on the same (flat) pair
+  await p.settle(3, priceOf(w.feed.sweep(3, { close: "226.00", applied: "226.00", owners: 10, prevOwners: 5 })));
+  w.clock.t = at(4) + 500;
+  const again = await p.decide(4, true, at(4));
+  assert.equal(again.length, 1);
+  assert.notEqual(again[0].wire.id, liveRows(w.db)[0].trade_id);
+  assert.equal(liveRows(w.db).at(-1)!.state, "POSTED");
 });

@@ -19,6 +19,7 @@ NODE=/usr/local/lib/flop-closecall/node
 ENV_FILE=$PAPER_ENV
 FORCE_DATA=/var/lib/flop-closecall            # paper: pinned; live: taken from its env file (its own dir)
 if [ "${1:-}" = "--live" ]; then ENV_FILE=$LIVE_ENV; FORCE_DATA=""; shift; fi
+for a in "$@"; do if [ "$a" = "--live" ]; then ENV_FILE=$LIVE_ENV; FORCE_DATA=""; fi; done      # watch --live / status --live
 cmd="${1:-status}"
 case "$cmd" in
   run|paper|observe|dry-run) echo "use: systemctl start|restart flop-closecall  (this wrapper never starts a service)" >&2; exit 2 ;;

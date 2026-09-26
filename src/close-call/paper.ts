@@ -97,9 +97,26 @@ export class PaperTrader {
 
   /** Clock for the pre-POST checks (tests inject one). */
   clock: () => number = Date.now;
+  /** Live: a non-null reason (writer disarmed / kill switch) means estimates only, no new decisions. */
+  canTrade: () => string | null = () => null;
   private postedThisSweep = new Map<number, WireTrade[]>();
   /** Live: sweeps whose settlement waits for the flow post or our trades' stamps. */
   readonly deferred = new Map<number, PricePost>();
+
+  /**
+   * The referee posted S: settle our whole book at S with the OFFICIAL fold (its `final` op, on a copy) and
+   * keep our standings (score, position, fees, places) -- the evidence a prize claim rests on. Idempotent.
+   */
+  async finalize(S: string): Promise<{ S: string; ours: { key: string; id: string; score: string; places: number[] }[] }> {
+    const res = (await this.fold.final(S)) as { S: string; owners: number; fees: string; standings: { key: string; score: string; position: string; fees: string; places: number[]; sharing: number }[] };
+    const byDid = new Map(this.keys.map((k) => [k.did, k.id]));
+    const ours = res.standings.filter((s) => byDid.has(s.key)).map((s) => ({ key: s.key, id: byDid.get(s.key)!, score: s.score, places: s.places, position: s.position, fees: s.fees }));
+    this.db.prepare("INSERT INTO meta (key, value) VALUES ('final_standings', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
+      .run(JSON.stringify({ S: res.S, computed_at: now(), book: this.exec.live ? "live" : "paper", ours }));
+    ccLog("PAPER SUMMARY", { final_S: res.S, our_keys: ours.length, best: ours[0] ? `${ours[0].id}:${ours[0].score}` : null },
+      "FINAL: our book settled at S by the official fold (standings stored)");
+    return { S: res.S, ours };
+  }
 
   /** Live: retry deferred settlements (called by the service loop). */
   async retryDeferred(): Promise<void> {
@@ -262,6 +279,11 @@ export class PaperTrader {
       ccLog("HALT", { sweep: n, reason: this.halted }, "strategy halted: estimate recorded, no intents");
       return [];
     }
+    const noTrade = this.canTrade();
+    if (noTrade) {
+      ccLog("SAFE MODE", { sweep: n, reason: noTrade }, "writer disarmed: estimate recorded, no new decisions");
+      return [];
+    }
     if (!this.minted) {
       ccLog("KEYS", { sweep: n, statuses: keyStatusCounts(this.db) }, "no key is MINT_CONFIRMED yet: no intents (a registration is not a mint)");
       return [];
@@ -387,14 +409,23 @@ export class PaperTrader {
     this.state = st;
     saveStrategyState(this.db, "K", this.state);
     const sent: PendingTrade[] = [];
-    for (const p of accepted) {
-      const r = await this.exec.post(this.execIntent(p, nowMs), () => this.precheck(p));
+    // Serialized: one POST at a time, each re-validated against the book including the ones already posted.
+    for (const [idx, p] of accepted.entries()) {
+      const r = this.exec.live && idx >= this.cfg.maxTradesPerSweep
+        ? { posted: false, state: "NOT_POSTED", detail: `over CLOSECALL_MAX_TRADES_PER_SWEEP=${this.cfg.maxTradesPerSweep}` }
+        : await this.exec.post(this.execIntent(p, nowMs), () => this.precheck(p));
       if (r.posted) {
         sent.push(p);
         this.postedThisSweep.set(n, [...(this.postedThisSweep.get(n) ?? []), p.wire]);
+      } else if (r.state === "UNKNOWN") {
+        // It may exist: it stays pending (its settlement waits for the evidence) and its keys are never released
+        // until it is resolved; it also counts against the funds of this sweep's later posts.
+        sent.push(p);
+        this.postedThisSweep.set(n, [...(this.postedThisSweep.get(n) ?? []), p.wire]);
+        ccLog("HALT", { sweep: n, pair: p.intent.pairIndex, trade_id: p.wire.id }, "POST outcome UNKNOWN: pending until resolved by read-back after the boundary; pair blocked");
       } else {
         this.db.prepare("UPDATE intents SET risk_status = 'NOT_SENT', risk_detail = ? WHERE intent_id = ?").run(JSON.stringify({ state: r.state, detail: r.detail }), p.intentId);
-        ccLog("RISK", { sweep: n, pair: p.intent.pairIndex, trade_id: p.wire.id, state: r.state, detail: r.detail }, "intent not executed: pair released for a retry");
+        ccLog("RISK", { sweep: n, pair: p.intent.pairIndex, trade_id: p.wire.id, state: r.state, detail: r.detail }, "intent not executed (nothing stored): pair released for a retry");
         this.state = this.strategy.onResult(this.state, p.intent.pairIndex, p.intent.favored, p.intent.trigger, p.intent.tries, false);
       }
     }
@@ -436,6 +467,8 @@ export class PaperTrader {
     const n = p.sweep;
     const t = this.clock();
     if (this.halted) fails.push(`halted: ${this.halted}`);
+    const noTrade = this.canTrade();
+    if (noTrade) fails.push(`writer disarmed: ${noTrade}`);
     if (lastClosedSweep(this.contest, t) >= n || t >= sweepTime(this.contest, n) - this.cfg.postGuardMs) fails.push(`sweep ${n}: past the posting deadline`);
     const { est, r } = this.estimateFor(n, t);
     if (!r || r.ref !== p.ref) fails.push(`reference changed: ${p.ref} -> ${r?.ref ?? "none"}`);

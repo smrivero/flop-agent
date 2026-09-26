@@ -28,7 +28,8 @@ import type { ExecIntent, ExecResult, TradeExecutor } from "../paper.js";
 import { canonicalTerms, makerSigningString, takerSigningString, type Terms } from "../protocol.js";
 import { buildSignedTrade, sha256Hex, type Signer } from "../protocol-writes.js";
 import { getRoom } from "../room.js";
-import { halt } from "../safety.js";
+import { checkGeneration } from "../bootstrap.js";
+import { clearTransient, halt, WriterDisarmed } from "../safety.js";
 import { now, type CcDb } from "../store.js";
 
 export interface LiveTradeRow {
@@ -82,6 +83,11 @@ export class LiveExecutor implements TradeExecutor {
   /** Writers of our room: owner + allow-list, read from technocore once per sweep. */
   private async writers(sweep: number): Promise<Set<string>> {
     if (this.allowCache?.sweep === sweep) return this.allowCache.writers;
+    if (this.transport.readTail) {
+      const tail = await this.transport.readTail(this.room);
+      const g = checkGeneration(this.db, this.room, tail.generation, tail.last_seq ?? tail.messages.length);
+      if (g) { halt(this.db, "room_ownership", g); throw new Error(g); }
+    }
     const owner = await this.transport.readNote("room-owners", this.room);
     const allow = await this.transport.readNote("room-allow", this.room);
     const w = new Set([owner ?? "", ...(allow ?? "").split(/\s+/)].filter(Boolean));
@@ -138,7 +144,12 @@ export class LiveExecutor implements TradeExecutor {
     let a = this.journal.plan({ opKey: `trade:${row.trade_id}`, kind: "trade", signerId: row.maker_id, room: this.room, text: row.text! });
     if (a.state === "PLANNED") a = this.journal.prepare(a);          // outer nonce reserved + persisted
     this.set(i.intentId, { state: "POSTING", attempt_op: a.op_key, post_at: now() });
-    a = await this.journal.send(a, { noResend: true });
+    try {
+      a = await this.journal.send(a, { noResend: true });
+    } catch (e) {
+      if (e instanceof WriterDisarmed) return this.notPosted(i, (e as Error).message);
+      throw e;
+    }
     // 429 = not stored: the SAME signed body may go again, only while it can still land before the deadline.
     while (a.state === "PREPARED" && a.http_status === 429) {
       const wait = retryAfterS(a.response ?? "") * 1000;
@@ -158,7 +169,8 @@ export class LiveExecutor implements TradeExecutor {
       decide_to_sign_ms: ms(r.decided_at, r.sign_start), sign_ms: ms(r.sign_start, r.sign_end), post_ms: ms(r.post_at, r.response_at),
       decide_to_response_ms: ms(r.decided_at, r.response_at), boundary_margin_ms: sweepTime(this.contest, r.sweep) - Date.parse(r.response_at!) });
     if (state === "UNKNOWN") {
-      halt(this.db, "ambiguous_operation", `trade ${r.trade_id} (sweep ${r.sweep}): POST outcome unknown and not found by read-back; not re-sent`);
+      // Never re-sent. No new entries until it is resolved by evidence after the boundary (resolveUnknown).
+      halt(this.db, "unknown_trade", `trade ${r.trade_id} (sweep ${r.sweep}): POST outcome unknown, not found by read-back yet; never re-sent`);
     }
     if (state === "FAILED") {
       this.db.prepare("UPDATE intents SET risk_status = 'NOT_SENT', risk_detail = ? WHERE intent_id = ?").run(JSON.stringify({ state, detail: r.detail }), intentId);
@@ -189,9 +201,39 @@ export class LiveExecutor implements TradeExecutor {
     this.set(intentId, { fold_outcome: reason ? `${outcome}:${reason}` : outcome, state });
   }
 
+  /**
+   * Resolve an UNKNOWN trade by evidence, never by sending: once its sweep's boundary is past (+ grace), read the
+   * room. Found and stamped before the boundary -> CONFIRMED (the referee reads it; it enters our book). Found
+   * after -> LATE. Absent -> NOT_POSTED: even if the request landed later it would be stamped after the boundary,
+   * and `until` = this sweep makes it void:expired -- it can never settle, so the keys stay safe.
+   * Returns the new state, or null while it is too early to decide.
+   */
+  async resolveUnknown(r: LiveTradeRow): Promise<string | null> {
+    if (this.clock() < sweepTime(this.contest, r.sweep) + 30_000) return null;
+    const a = r.attempt_op ? this.journal.get(r.attempt_op) : undefined;
+    const at = a ? await this.journal.locate(a).catch(() => undefined) : null;
+    if (at === undefined) return null;                                          // read failed: try again later
+    let state: string;
+    if (at?.ts) {
+      state = Date.parse(at.ts) > sweepTime(this.contest, r.sweep) ? "LATE" : "CONFIRMED";
+      this.set(r.intent_id, { state, seq: at.seq, stamped_at: at.ts, detail: "UNKNOWN resolved by read-back: found" });
+    } else {
+      state = "NOT_POSTED";
+      this.set(r.intent_id, { state, detail: "UNKNOWN resolved: absent after the boundary (can never settle: until expired)" });
+    }
+    ccLog("LIVE TRADE", { trade_id: r.trade_id, sweep: r.sweep, resolved: state }, "UNKNOWN resolved by evidence (nothing re-sent)");
+    if (!(this.db.prepare("SELECT 1 FROM live_trades WHERE state = 'UNKNOWN'").get())) clearTransient(this.db, "unknown_trade");
+    return state;
+  }
+
   async admissible(intentId: string, sweep: number): Promise<string> {
     let r = this.get(intentId);
     if (!r) return "exclude:no journal row";
+    if (r.state === "UNKNOWN") {
+      const s = await this.resolveUnknown(r);
+      if (s === null) return "defer";
+      r = this.get(intentId)!;
+    }
     if (r.state === "POSTED") {
       await this.confirmPosted();
       r = this.get(intentId)!;
@@ -217,7 +259,10 @@ export class LiveExecutor implements TradeExecutor {
         if (a.state === "PREPARED" || a.state === "PLANNED") {
           if (this.clock() >= i.deadlineMs) { this.notPosted(i, "crash before sending; deadline passed"); continue; }
           if (a.state === "PLANNED") a = this.journal.prepare(a);
-          a = await this.journal.send(a, { noResend: true });
+          try { a = await this.journal.send(a, { noResend: true }); } catch (e) {
+            if (e instanceof WriterDisarmed) { this.notPosted(i, (e as Error).message); continue; }
+            throw e;
+          }
           if (a.state === "UNKNOWN" || a.state === "SENDING") a = await this.journal.readBackOnly(a);
         } else if (a.state === "SENDING" || a.state === "UNKNOWN") {
           a = await this.journal.readBackOnly(a);                        // read only: NEVER re-sent

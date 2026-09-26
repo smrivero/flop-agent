@@ -139,6 +139,15 @@ const MIGRATIONS: { version: number; name: string; up: (db: CcDb) => void }[] = 
       if (!cols.includes("role")) db.exec("ALTER TABLE keys ADD COLUMN role TEXT");
     },
   },
+  {
+    version: 6,
+    name: "audit archive: server receipts and /config snapshots (technocore is not a system of record)",
+    up: (db) => {
+      const cols = (db.prepare("PRAGMA table_info(write_attempts)").all() as { name: string }[]).map((c) => c.name);
+      if (!cols.includes("receipt")) db.exec("ALTER TABLE write_attempts ADD COLUMN receipt TEXT");
+      db.exec("CREATE TABLE IF NOT EXISTS config_snapshots (id INTEGER PRIMARY KEY AUTOINCREMENT, source TEXT NOT NULL, json TEXT NOT NULL, at TEXT NOT NULL)");
+    },
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

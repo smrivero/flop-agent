@@ -11,7 +11,8 @@ export class HttpTransport implements Transport {
 
   async post(path: string, body: unknown): Promise<TransportResponse> {
     try {
-      const res = await this.fetchImpl(`${this.baseUrl}${path}`, {
+      // ?format=json: the reply then carries our record's seq/ts and the room generation (kept as a receipt).
+      const res = await this.fetchImpl(`${this.baseUrl}${path}${path.startsWith("/r/") ? "?format=json" : ""}`, {
         method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify(body), signal: AbortSignal.timeout(this.timeoutMs),
       });
       return { status: res.status, text: await res.text() };
@@ -20,13 +21,13 @@ export class HttpTransport implements Transport {
     }
   }
 
-  async readRoom(room: string, since: number): Promise<{ first_seq: number | null; last_seq: number; messages: RoomMessage[] }> {
+  async readRoom(room: string, since: number): Promise<{ first_seq: number | null; last_seq: number; messages: RoomMessage[]; generation?: number }> {
     const res = await this.fetchImpl(`${this.baseUrl}/r/${room}?format=json&since=${since}&limit=200`, { signal: AbortSignal.timeout(this.timeoutMs) });
     if (!res.ok) throw new Error(`read ${room}: ${res.status}`);
     return JSON.parse((await res.text()).replace(/"nonce":\s*(\d+)/g, '"nonce":"$1"'));
   }
 
-  async readTail(room: string): Promise<{ messages: RoomMessage[] }> {
+  async readTail(room: string): Promise<{ messages: RoomMessage[]; generation?: number; last_seq?: number }> {
     const res = await this.fetchImpl(`${this.baseUrl}/r/${room}?format=json&limit=200`, { signal: AbortSignal.timeout(this.timeoutMs) });
     if (!res.ok) throw new Error(`read ${room}: ${res.status}`);
     return JSON.parse((await res.text()).replace(/"nonce":\s*(\d+)/g, '"nonce":"$1"'));

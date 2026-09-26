@@ -70,7 +70,9 @@ async function main(argv: string[]): Promise<number> {
   const env = { ...process.env };
   // Monitor run by hand on the VPS (`npm run closecall:watch` as root): read the service's env file so it
   // looks at the same data dir. Only fills variables that are not already set; never writes anything.
-  if ((cmd === "watch" || cmd === "status") && !env.CLOSECALL_DATA_DIR) Object.assign(env, { ...serviceEnv(), ...env });
+  if ((cmd === "watch" || cmd === "status") && !env.CLOSECALL_DATA_DIR) {
+    Object.assign(env, { ...serviceEnv(argv.includes("--live") ? "/etc/flop-closecall/closecall-live.env" : undefined), ...env });
+  }
   if (cmd === "paper" || cmd === "observe" || cmd === "dry-run") env.CLOSECALL_MODE = cmd;   // an explicit command always wins; `run` follows CLOSECALL_MODE
   const cfg = loadCloseCallConfig(env);
   const contest = loadContest(cfg.vendorRoot);

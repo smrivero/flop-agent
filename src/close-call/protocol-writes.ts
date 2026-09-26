@@ -54,9 +54,13 @@ function check(cond: unknown, msg: string): asserts cond {
   if (!cond) throw new Error(msg);
 }
 
+/** Everything we sign is printable ASCII and already single-line: the signed bytes ARE the stored bytes. */
+const PRINTABLE_ASCII = /^[\x20-\x7e]+$/;
+
 export function buildSignedMessage(signer: Signer, room: string, nonce: string, text: string): { path: string; body: SignedMessageBody } {
   check(NAME_RE.test(room), `bad room name ${room}`);
   check(NONCE_RE.test(nonce), `bad nonce ${nonce}`);
+  check(PRINTABLE_ASCII.test(text) && sweepText(text) === text, "message must be single-line printable ASCII (no transformation between signing and storing)");
   const swept = sweepText(text);
   check(swept.length > 0 && swept.length <= MAX_MESSAGE_CHARS, `message must be 1..${MAX_MESSAGE_CHARS} chars after the sweep`);
   const sig = signer.sign(messageSigningString(room, nonce, swept));
@@ -68,6 +72,7 @@ export function buildSignedNote(signer: Signer, ns: typeof OWNERS_NS | typeof AL
   opts: { ifAbsent?: boolean; ifValue?: string } = {}): { path: string; body: SignedNoteBody } {
   check(NAME_RE.test(key) && key.startsWith("d-"), `only d- rooms are ownable: ${key}`);
   check(NONCE_RE.test(nonce), `bad nonce ${nonce}`);
+  check(PRINTABLE_ASCII.test(value) && sweepText(value) === value, "note value must be single-line printable ASCII");
   const swept = sweepText(value);
   check(swept.length > 0 && swept.length <= MAX_NOTE_CHARS, `note value must be 1..${MAX_NOTE_CHARS} chars`);
   const sig = signer.sign(noteSigningString(ns, key, nonce, swept));
