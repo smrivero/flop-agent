@@ -20,7 +20,9 @@ import { buildSignedTrade, type Signer } from "./protocol-writes.js";
 import { getRoom } from "./room.js";
 import { activeHalts } from "./safety.js";
 import { getMeta, now } from "./store.js";
-import { contest, tmpDb } from "./test-helpers.js";
+import { contest, tmpDb, VENDOR } from "./test-helpers.js";
+import { isolatedTradeFold } from "./fold.js";
+import { foldConfig } from "./paper.js";
 import { simulateBootstrap } from "./testing/bootstrap-sim.js";
 import { ephemeralSigner } from "./testing/ephemeral-signer.js";
 import { MockTechnocore } from "./testing/mock-technocore.js";
@@ -145,6 +147,42 @@ test("bootstrap dry-run: admin + staging first, then 100 strategy keys; PROTOCOL
   assert.equal(r.server.messages.close1, 2, "only CC-ADMIN writes in close1");
   assert.equal(r.server.allowDids, 102, "2 staging + 100 strategy");
   assert.ok(r.checks.find((c) => /untouched/.test(c.name))!.ok);
+});
+
+test("staging trade with truncated lists (never listed): settled by the official fold on read-back evidence, nothing re-posted", async () => {
+  const C = contest();
+  const foldTest = isolatedTradeFold("python3", VENDOR, foldConfig(C));
+  try {
+    const r = await simulateBootstrap(C, { stages: [0], startSweep: 300, listSettled: false, foldTest });
+    assert.ok(r.ok, JSON.stringify(r.checks.filter((c) => !c.ok)));
+    const db = r.world.db;
+    const ev = JSON.parse(getMeta(db, "test_trade_evidence")!) as { fold: string; referee_list: string; sweep: number; accounts: Record<string, { position: string } | null> };
+    assert.equal(ev.fold, "settled");
+    assert.equal(ev.referee_list, "unlisted", "the simulated referee listed nothing: the fold alone decided");
+    assert.equal(getMeta(db, "test_trade_settled"), String(ev.sweep));
+    assert.deepEqual(Object.values(ev.accounts).map((a) => Number(a!.position)).sort(), [-0.1, 0.1], "CC-TEST-001 long 0.10, CC-TEST-002 short 0.10");
+    const tradePosts = [...r.world.srv.rooms.values()].flat().filter((m) => /"t":"trade"/.test(m.text));
+    assert.equal(tradePosts.length, 1, "the staging trade was posted exactly once");
+  } finally {
+    foldTest.stop();
+  }
+});
+
+test("staging trade: fold settled but the referee lists it void -> grave reconcile_mismatch halt", async () => {
+  const C = contest();
+  const { db } = tmpDb();
+  const foldTest = isolatedTradeFold("python3", VENDOR, foldConfig(C));
+  try {
+    const r = await simulateBootstrap(C, { stages: [0], startSweep: 300, listSettled: false, db, foldTest: async (p) => {
+      db.prepare("INSERT OR IGNORE INTO void_ids (id, n, reason) VALUES (?, ?, 'limits')").run(p.trade.id, p.sweep);   // a listed void
+      return foldTest(p);
+    } });
+    assert.equal(r.ok, false);
+    assert.match(r.final.halted ?? "", /fold settled, referee listed void:limits/);
+    assert.equal(getMeta(db, "test_trade_settled"), null);
+  } finally {
+    foldTest.stop();
+  }
 });
 
 test("bootstrap dry-run with faults: lost requests, timeouts after commit, 429s, a crash after planning, CC-ADMIN missed by the referee", async () => {

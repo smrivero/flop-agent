@@ -11,7 +11,7 @@
 import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { Bootstrap, type StepResult } from "../bootstrap.js";
+import { Bootstrap, type BootstrapDeps, type StepResult } from "../bootstrap.js";
 import { sweepTime, type Contest } from "../contest.js";
 import { WriteJournal } from "../journal.js";
 import { keysByRole, keyStatusCounts, listKeys, roleKeyId, type ConfirmationPolicyName, type KeyRole } from "../keys.js";
@@ -36,6 +36,10 @@ export interface SimOptions {
   policy?: ConfirmationPolicyName;
   room?: string;
   listMints?: boolean;
+  /** false: the referee's flow lists no settled id (the live lists are truncated). */
+  listSettled?: boolean;
+  /** The official fold for the staging trade (fold.ts isolatedTradeFold), as in the real bootstrap. */
+  foldTest?: BootstrapDeps["foldTest"];
   faults?: boolean;
   startSweep: number;
   refereeLagMs?: number;
@@ -65,7 +69,7 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
   const srv = new MockTechnocore();
   srv.clock = () => simNow;
   const signers = new Map<string, Signer>();
-  const referee = new SimReferee(db, srv, contest, { listMints: o.listMints ?? false });
+  const referee = new SimReferee(db, srv, contest, { listMints: o.listMints ?? false, listSettled: o.listSettled });
   let published = o.startSweep;
   referee.seed();
   referee.baseline(o.startSweep);
@@ -112,7 +116,7 @@ export async function simulateBootstrap(contest: Contest, o: SimOptions): Promis
     return new Bootstrap({
       db, contest, journal, transport: srv, signers, policy: o.policy ?? "PROTOCOL", room, clock: () => simNow,
       refreshReferee: publishDue, gate: () => ({ ok: true, problems: [] }), pace: async () => { simNow += perWriteMs; },
-      sleep: async (ms) => { simNow += ms; }, refreshDays: 5,
+      sleep: async (ms) => { simNow += ms; }, refreshDays: 5, foldTest: o.foldTest,
     });
   };
 

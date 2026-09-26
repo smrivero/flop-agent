@@ -123,3 +123,29 @@ export class OfficialFold {
     this.closed = true;
   }
 }
+
+/** One staging trade between two of our keys, replayed alone in the official fold (bootstrap.ts `foldTest`). */
+export interface IsolatedTradeInput { sweep: number; ref: string; close: string; owners: string[]; trade: WireTrade }
+export interface IsolatedTradeResult { outcome: "settled" | "void"; reason: string | null; accounts: Record<string, FoldAccount> }
+export type IsolatedTradeFold = ((p: IsolatedTradeInput) => Promise<IsolatedTradeResult>) & { stop: () => void };
+
+/**
+ * The trade only touches our two accounts, so its outcome is decided by the fold on those inputs alone: both
+ * keys minted one sweep before (10,000 POLF, flat), then the trade at the referee's published ref/close.
+ * Same evidence the live strategy trades settle on; the referee's truncated lists are only a cross-check.
+ */
+export function isolatedTradeFold(python: string, vendorRoot: string, config: Record<string, unknown>): IsolatedTradeFold {
+  let fold: Promise<OfficialFold> | null = null;
+  const run = async (p: IsolatedTradeInput): Promise<IsolatedTradeResult> => {
+    fold ??= OfficialFold.start(python, vendorRoot, config);
+    const f = await fold;
+    await f.reset(config);
+    await f.seed(p.ref);                                   // only sets the global price; it never decides an outcome
+    await f.sweep(p.sweep - 1, p.ref, p.ref, p.owners, []);
+    const res = await f.sweep(p.sweep, p.ref, p.close, [], [p.trade]);
+    const t = res.trades.find((x) => x.id === p.trade.id);
+    const { accounts } = await f.accounts(p.owners, p.close);
+    return { outcome: t?.outcome ?? "void", reason: t ? t.reason ?? null : "not in the fold result", accounts };
+  };
+  return Object.assign(run, { stop: () => { void fold?.then((f) => f.stop()).catch(() => undefined); } });
+}

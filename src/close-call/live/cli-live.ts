@@ -22,6 +22,7 @@ import { lastClosedSweep, loadContest, sweepTime } from "../contest.js";
 import { CloseCallConfigError, loadCloseCallConfig } from "../config.js";
 import { backupGate } from "../backup-gate.js";
 import { Bootstrap, RoomKeeper } from "../bootstrap.js";
+import { isolatedTradeFold } from "../fold.js";
 import { WriteJournal } from "../journal.js";
 import { keyStatusCounts } from "../keys.js";
 import { fetchLimits } from "../limits.js";
@@ -35,6 +36,7 @@ import { openReadonly } from "../monitor.js";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { simulateBootstrap } from "../testing/bootstrap-sim.js";
+import { foldConfig } from "../paper.js";
 import { banner, runLoop } from "../run.js";
 import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
@@ -225,6 +227,7 @@ async function main(argv: string[]): Promise<number> {
     }
     const lock = await acquireLock(cfg.lockPath, "close-call live bootstrap"); // the SAME lock as the live service: never both at once
     setLogSink(cfg.logDir);
+    const foldTest = isolatedTradeFold(cfg.python, cfg.vendorRoot, foldConfig(contest));   // started on first use (the staging trade)
     try {
       const limits = await fetchLimits(cfg.technocoreBaseUrl);
       db.prepare("INSERT INTO config_snapshots (source, json, at) VALUES (?, ?, ?)").run(limits.source, JSON.stringify(limits), new Date().toISOString());
@@ -239,7 +242,7 @@ async function main(argv: string[]): Promise<number> {
         db, contest, journal, transport, signers, policy: cfg.confirmationPolicy, room: cfg.room, clock: Date.now,
         refreshReferee: async () => { await observer.pollOnce(); },
         gate: () => backupGate(db, { keysDir: cfg.keysDir, backupDir: cfg.backupDir, recipient: cfg.backupAgeRecipient }),
-        pace: async () => { await sleep(perWriteMs); }, refreshDays: cfg.roomRefreshDays,
+        pace: async () => { await sleep(perWriteMs); }, refreshDays: cfg.roomRefreshDays, foldTest,
       });
       // --loop: keep stepping (resumable: every step re-derives its position from the DB and the server).
       let lim = limits;
@@ -257,6 +260,7 @@ async function main(argv: string[]): Promise<number> {
         if (r.action === "waiting") await sleep(30_000);
       }
     } finally {
+      foldTest.stop();
       lock.release();
     }
   }

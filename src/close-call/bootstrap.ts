@@ -15,7 +15,9 @@
  *   6 listed    our room in flow.rooms -> REGISTER_CONFIRMED -> READY
  *   7 owners    staging keys' {"t":"owner"} in OUR room (stamped after the sweep that listed it)
  *   8 mints     staging MINT_CONFIRMED -> READY
- *   9 test      0.10 CC-TEST-001 -> CC-TEST-002 in our room, until the referee resolves it
+ *   9 test      0.10 CC-TEST-001 -> CC-TEST-002 in our room; SETTLED by the same evidence as a live trade:
+ *               located in our room, stamped before a published sweep's boundary, outside every missed
+ *               range, then the official fold at that sweep's ref/close (the truncated lists only cross-check)
  *  10 owners    strategy keys (only after the test trade SETTLED), paced to the live write budget
  *  11 mints     strategy MINT_CONFIRMED -> READY                       => done
  *
@@ -24,10 +26,12 @@
  */
 
 import { assessMint, type OwnerMessageRecord } from "./confirmation.js";
-import { lastClosedSweep, sweepForTime, type Contest } from "./contest.js";
+import { lastClosedSweep, sweepForTime, sweepTime, type Contest } from "./contest.js";
 import { CENT, fmt2, floorTo, toMicro } from "./decimal.js";
 import { AmbiguousOperation, retryAfterS, type AttemptRow, type Transport, type WriteJournal, type WriteOp } from "./journal.js";
 import { getKey, keysByRole, listKeys, transitionKey, type ConfirmationPolicyName, type KeyRecord } from "./keys.js";
+import type { IsolatedTradeInput, IsolatedTradeResult } from "./fold.js";
+import type { WireTrade } from "./ledger.js";
 import { ccLog } from "./logger.js";
 import { resolveProbe, type ProbeTrade } from "./probe.js";
 import { newTradeId, ownerMessageText, roomMessageText, type Terms } from "./protocol.js";
@@ -62,6 +66,11 @@ export interface BootstrapDeps {
   /** Awaited after a 429 before sending the same body again. */
   sleep?: (ms: number) => Promise<void>;
   refreshDays?: number;
+  /**
+   * The official fold on the staging trade alone (fold.ts isolatedTradeFold). Without it the staging trade can
+   * only settle by the referee's lists, which are truncated (the dry-run's simulated referee lists everything).
+   */
+  foldTest?: (p: IsolatedTradeInput) => Promise<IsolatedTradeResult>;
 }
 
 const realSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -339,6 +348,7 @@ export class Bootstrap {
       return this.postTrade(terms.id, 0);
     }
     const t = db.prepare("SELECT * FROM trades WHERE trade_id = ?").get(testId) as ProbeTrade & { terms: string; status: string };
+    if (this.d.foldTest && t.status === "posted") return this.testTradeByFold(t);
     const a = resolveProbe(db, t, this.lastPublished());
     const setStatus = (s: string, reason?: string) => db.prepare("UPDATE trades SET status = ?, reason = ?, updated_at = ? WHERE trade_id = ?").run(s, reason ?? null, now(), t.trade_id);
     switch (a.kind) {
@@ -363,6 +373,61 @@ export class Bootstrap {
       case "ambiguous":
         return this.stop("ambiguous_operation", `staging trade ${t.trade_id}: ${a.why}`, "wait-test-trade");
     }
+    return null;
+  }
+
+  /**
+   * Settle the posted staging trade by evidence, read only: the journal's CONFIRMED POST located in our room (seq +
+   * server stamp), the sweep that stamp falls in published (price + flow), the seq outside every missed range, then
+   * the official fold at that sweep's ref/close. The referee's lists are a cross-check: listed against the fold = halt.
+   * Nothing is re-posted from here. null = settled.
+   */
+  private async testTradeByFold(t: ProbeTrade & { terms: string }): Promise<StepResult | null> {
+    const { db, room } = this.d;
+    const wait = (detail: string): StepResult => ({ phase: "wait-test-trade", action: "waiting", detail: `staging trade ${t.trade_id}: ${detail}`, writes: 0 });
+    const terms = JSON.parse(t.terms) as Terms;
+    const att = db.prepare("SELECT * FROM write_attempts WHERE op_key LIKE ? AND state = 'CONFIRMED' ORDER BY created_at, rowid LIMIT 1")
+      .get(`trade:${t.trade_id}:%`) as AttemptRow | undefined;
+    if (!att) return wait("no CONFIRMED POST in the journal yet");
+    const at = await this.d.journal.locate(att);
+    if (!at?.ts) {
+      if (this.lastPublished() > terms.until) return this.stop("manual", `staging trade ${t.trade_id}: POST ${att.op_key} CONFIRMED but not found in ${room}, and until ${terms.until} has passed: investigate`, "wait-test-trade");
+      return wait(`POST ${att.op_key} CONFIRMED; not located in ${room} yet`);
+    }
+    const n = sweepForTime(this.d.contest, Date.parse(at.ts));
+    const row = db.prepare("SELECT ref_px, applied, flow_json FROM sweeps WHERE n = ?").get(n) as { ref_px: string | null; applied: string | null; flow_json: string | null } | undefined;
+    if (!row?.flow_json || !row.ref_px) return wait(`#${at.seq} stamped ${at.ts} -> sweep ${n}: waiting for sweep ${n}'s price and flow posts`);
+    const missed = ((JSON.parse(row.flow_json) as { missed?: [string, number, number][] }).missed ?? []);
+    if (missed.some(([r, a, b]) => r === room && at.seq >= a && at.seq <= b)) {
+      return this.stop("manual", `staging trade ${t.trade_id} #${at.seq} is inside a range the referee missed at sweep ${n}: it was not read; investigate`, "wait-test-trade");
+    }
+    const ref = row.applied ?? (db.prepare("SELECT ref_px FROM sweeps WHERE n = ?").get(n - 1) as { ref_px: string | null } | undefined)?.ref_px;
+    if (!ref) return wait(`no reference price for sweep ${n} yet`);
+    const maker = getKey(db, t.maker_id);
+    const taker = getKey(db, t.taker_id);
+    const late = [maker, taker].filter((k) => !k.minted || k.minted_sweep === null || k.minted_sweep >= n);
+    if (late.length) return this.stop("manual", `staging trade ${t.trade_id} stamped for sweep ${n}, but ${late.map((k) => `${k.id} minted at ${k.minted_sweep}`).join(", ")}: investigate`, "wait-test-trade");
+    const wire: WireTrade = { id: terms.id, maker: terms.maker, side: terms.side, qty: terms.qty, px: terms.px, taker: terms.taker, until: terms.until, countersigner: taker.did };
+    const res = await this.d.foldTest!({ sweep: n, ref, close: row.ref_px, owners: [maker.did, taker.did], trade: wire });
+    const listedSettled = db.prepare("SELECT n FROM settled_ids WHERE id = ?").get(t.trade_id) as { n: number } | undefined;
+    const listedVoid = db.prepare("SELECT n, reason FROM void_ids WHERE id = ? AND reason <> 'settled' ORDER BY n LIMIT 1").get(t.trade_id) as { n: number; reason: string } | undefined;
+    const accounts = Object.fromEntries([maker, taker].map((k) => [k.id, res.accounts[k.did] ?? null]));
+    const evidence = { trade_id: t.trade_id, op: att.op_key, nonce: att.nonce, seq: at.seq, stamped_at: at.ts, sweep: n,
+      boundary: new Date(sweepTime(this.d.contest, n)).toISOString(), ref, close: row.ref_px, fold: res.reason ? `${res.outcome}:${res.reason}` : res.outcome,
+      referee_list: listedSettled ? `settled@${listedSettled.n}` : listedVoid ? `void:${listedVoid.reason}@${listedVoid.n}` : "unlisted", accounts };
+    setMeta(db, "test_trade_evidence", JSON.stringify(evidence));
+    ccLog("BOOTSTRAP", { trade: t.trade_id, sweep: n, seq: at.seq, stamped_at: at.ts, ref, close: row.ref_px, fold: evidence.fold, referee_list: evidence.referee_list,
+      positions: Object.entries(accounts).map(([id, a]) => `${id}:${a?.position ?? "?"}`).join(" ") }, "staging trade resolved by the official fold");
+    const setStatus = (s: string, reason?: string) => db.prepare("UPDATE trades SET status = ?, reason = ?, updated_at = ? WHERE trade_id = ?").run(s, reason ?? null, now(), t.trade_id);
+    if (res.outcome === "settled" && listedVoid) return this.stop("reconcile_mismatch", `staging trade ${t.trade_id}: fold settled, referee listed void:${listedVoid.reason} at ${listedVoid.n}`, "wait-test-trade");
+    if (res.outcome === "void" && listedSettled) return this.stop("reconcile_mismatch", `staging trade ${t.trade_id}: fold void:${res.reason}, referee listed it settled at ${listedSettled.n}`, "wait-test-trade");
+    if (res.outcome === "void") {
+      setStatus("void", res.reason ?? undefined);
+      return this.stop("manual", `staging trade ${t.trade_id} void:${res.reason} at sweep ${n} (official fold): investigate before registering strategy keys`, "wait-test-trade");
+    }
+    setStatus("settled");
+    setMeta(db, "test_trade_settled", String(n));
+    ccLog("BOOTSTRAP", { trade: t.trade_id, sweep: n }, "staging test trade settled: strategy keys may register");
     return null;
   }
 
