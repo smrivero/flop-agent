@@ -139,7 +139,7 @@ function count503(logDir: string, now: number, maxBytes = 4 * 1_048_576): number
  * cleanly), a read-only connection would CREATE -wal/-shm, so the file is read into memory instead,
  * with the header's WAL flag cleared in that private copy.
  */
-function openReadonly(path: string): { db: Database.Database | null; error: string | null } {
+export function openReadonly(path: string): { db: Database.Database | null; error: string | null } {
   if (!existsSync(path)) return { db: null, error: `not found: ${path}` };
   try {
     if (!existsSync(path + "-wal")) {
@@ -299,14 +299,16 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
       recent: recent.map((r) => ({ id: (r.trade_id ?? "-").slice(0, 8), maker: r.maker_id, taker: r.taker_id, side: (r.favored ?? "").toUpperCase(), qty: r.qty, px: r.px, sweep: r.sweep,
         status: (r.outcome ?? (r.risk_status === "OK" ? "pending" : `rejected`)).toUpperCase(), fee: r.mf && r.tf ? (Number(r.mf) + Number(r.tf)).toFixed(2) : null })) };
   } else {
-    const c = q<{ total: number; settled: number; void: number; pending: number; unknown: number }>(exec, `SELECT COUNT(*) total, SUM(status = 'settled') settled,
-      SUM(status IN ('void','never-settled')) void, SUM(status IN ('planned','signed','posted')) pending,
-      SUM(status NOT IN ('settled','void','never-settled','planned','signed','posted')) unknown FROM trades`);
-    const recent = qa<{ trade_id: string; maker_id: string; taker_id: string; side: string; qty: string; px: string; sweep_first: number; status: string; maker_fee: string | null; taker_fee: string | null }>(exec,
-      "SELECT trade_id, maker_id, taker_id, side, qty, px, sweep_first, status, maker_fee, taker_fee FROM trades ORDER BY created_at DESC LIMIT 5");
+    // Live: the LiveExecutor's journal (one row per Strategy K intent), states as the executor records them.
+    const c = q<{ total: number; settled: number; void: number; pending: number; unknown: number }>(exec, `SELECT COUNT(*) total,
+      SUM(state = 'SETTLED') settled, SUM(state IN ('VOID','NOT_POSTED','FAILED','LATE')) void,
+      SUM(state IN ('CREATED','SIGNED','POSTING','POSTED','CONFIRMED')) pending, SUM(state = 'UNKNOWN') unknown FROM live_trades`);
+    const recent = qa<{ trade_id: string; maker_id: string; taker_id: string; favored: string | null; qty: string | null; px: string | null; sweep: number; state: string; mf: string | null; tf: string | null }>(exec,
+      `SELECT l.trade_id, l.maker_id, l.taker_id, i.favored, i.qty, i.px, l.sweep, l.state, COALESCE(i.actual_maker_fee, i.expected_maker_fee) mf,
+       COALESCE(i.actual_taker_fee, i.expected_taker_fee) tf FROM live_trades l LEFT JOIN intents i ON i.intent_id = l.intent_id ORDER BY l.created_at DESC LIMIT 5`);
     trades = { simulated: false, total: c?.total ?? null, settled: c?.settled ?? (c ? 0 : null), void: c?.void ?? (c ? 0 : null), pending: c?.pending ?? (c ? 0 : null), unknown: c?.unknown ?? (c ? 0 : null),
-      recent: recent.map((r) => ({ id: r.trade_id.slice(0, 8), maker: r.maker_id, taker: r.taker_id, side: r.side.toUpperCase(), qty: r.qty, px: r.px, sweep: r.sweep_first,
-        status: r.status.toUpperCase(), fee: r.maker_fee && r.taker_fee ? (Number(r.maker_fee) + Number(r.taker_fee)).toFixed(2) : null })) };
+      recent: recent.map((r) => ({ id: r.trade_id.slice(0, 8), maker: r.maker_id, taker: r.taker_id, side: (r.favored ?? "").toUpperCase(), qty: r.qty ?? "-", px: r.px ?? "-", sweep: r.sweep,
+        status: r.state, fee: r.mf && r.tf ? (Number(r.mf) + Number(r.tf)).toFixed(2) : null })) };
   }
 
   // ---- security

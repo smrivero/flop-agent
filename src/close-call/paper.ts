@@ -17,22 +17,54 @@
  */
 
 import type { CloseCallConfig } from "./config.js";
-import { sweepTime, type Contest } from "./contest.js";
+import { lastClosedSweep, sweepTime, type Contest } from "./contest.js";
 import { fmt2, fmtShort, max, toMicro, toNumber, type Micro } from "./decimal.js";
 import { errorBps, estimateClose, type Estimate } from "./estimator.js";
 import type { FoldSweepResult, OfficialFold } from "./fold.js";
 import type { HyperliquidObserver } from "./hyperliquid.js";
 import { Ledger, type FoldParams, type WireTrade } from "./ledger.js";
 import { ccLog } from "./logger.js";
-import { ensurePaperKeys, getKey, isTradable, keyStatusCounts, transitionKey, wouldSign, type KeyRecord } from "./keys.js";
-import { canonicalTerms, limitsFor, makerSigningString, newTradeId, takerSigningString, termsFromTrade, tradeMessageText, type PricePost } from "./protocol.js";
+import { ensurePaperKeys, getKey, isTradable, keyStatusCounts, listKeys, transitionKey, wouldSign, type KeyRecord } from "./keys.js";
+import { canonicalTerms, limitsFor, makerSigningString, newTradeId, takerSigningString, termsFromTrade, tradeMessageText, type PricePost, type Terms } from "./protocol.js";
 import { closeBand, favoredPrice, maxPairQty, validateTrade } from "./risk.js";
 import { decideStale } from "./stale-policy.js";
 import { loadStrategyState, now, recordReconcile, saveStrategyState, type CcDb } from "./store.js";
 import { halt, haltSummary } from "./safety.js";
 import { strategyK, type KState, type StrategyIntent } from "./strategy/k-ladder.js";
 
-interface PendingTrade { intentId: string; intent: StrategyIntent; wire: WireTrade; estimate: Micro; ref: string }
+interface PendingTrade { intentId: string; sweep: number; intent: StrategyIntent; wire: WireTrade; estimate: Micro; ref: string }
+
+/**
+ * Execution is the ONLY difference between paper and live. The decision engine below (estimate,
+ * Strategy K, pair, favoured side, px, qty, stale policy, risk and fold checks) is identical and
+ * hands each accepted intent to an executor:
+ *   PaperExecutor  simulates: nothing is signed or sent (the intent is simply kept)
+ *   LiveExecutor   (live/executor.ts) re-validates, signs maker+taker, posts once, journals every step
+ */
+export interface ExecIntent {
+  intentId: string; sweep: number; pairIndex: number; makerId: string; takerId: string; terms: Terms; ref: string;
+  decidedAtMs: number; deadlineMs: number;
+}
+export interface ExecResult { posted: boolean; state: string; detail: string }
+export interface TradeExecutor {
+  readonly live: boolean;
+  /** Execute one intent. `precheck` re-runs every risk check against the state RIGHT NOW (empty = OK). */
+  post(i: ExecIntent, precheck: () => Promise<string[]>): Promise<ExecResult>;
+  /** The fold settled or voided a posted trade at the referee's real ref/close. */
+  onSettled?(intentId: string, outcome: string, reason: string | null): void;
+  /** On start: finish or reconcile what a crash interrupted. Never posts after the deadline, never re-posts blindly. */
+  recover?(repost: (intentId: string) => Promise<string[] | null>): Promise<void>;
+  /** Does the executor already hold a journal row for this intent? */
+  has?(intentId: string): boolean;
+}
+export const PAPER_EXECUTOR: TradeExecutor = { live: false, post: async () => ({ posted: true, state: "SIMULATED", detail: "paper: nothing signed or sent" }) };
+
+/** Keys the live strategy may use: real, tradable, never used by a bootstrap/probe trade (those hold a 0.10 position). */
+export function liveStrategyKeys(db: CcDb): KeyRecord[] {
+  const used = new Set((db.prepare("SELECT maker_id m, taker_id t FROM trades").all() as { m: string; t: string }[]).flatMap((r) => [r.m, r.t]));
+  const keys = listKeys(db).filter((k) => k.fake === 0 && isTradable(k.status) && !used.has(k.id));
+  return keys.slice(0, keys.length - (keys.length % 2));
+}
 
 export function foldParams(contest: Contest): FoldParams {
   return { mint: contest.mint, minQty: contest.minQty, window: contest.limitWindow, feeRate: contest.feeRate, lock: contest.lockSweep };
@@ -56,8 +88,13 @@ export class PaperTrader {
   private pending = new Map<number, PendingTrade[]>();
   private ourIds = new Set<string>();
 
+  /** Clock for the pre-POST checks (tests inject one). */
+  clock: () => number = Date.now;
+  private postedThisSweep = new Map<number, WireTrade[]>();
+
   constructor(private db: CcDb, private cfg: CloseCallConfig, private contest: Contest,
-    readonly fold: OfficialFold, readonly lookFold: OfficialFold, private hl: HyperliquidObserver | null) {
+    readonly fold: OfficialFold, readonly lookFold: OfficialFold, private hl: HyperliquidObserver | null,
+    readonly exec: TradeExecutor = PAPER_EXECUTOR) {
     this.ledger = new Ledger(foldParams(contest));
     this.lookLedger = new Ledger(foldParams(contest));
     this.strategy = strategyK(cfg.strategy);
@@ -80,11 +117,16 @@ export class PaperTrader {
       await f.reset(foldConfig(this.contest));
       await f.seed(seed.price);
     }
-    this.keys = ensurePaperKeys(this.db, this.cfg.strategy.keyCount, this.cfg.paperKeyPrefix);
-    for (const k of this.keys) {
-      if (k.status === "GENERATED") transitionKey(this.db, k.id, "REGISTER_PENDING", { reason: "paper: owner message WOULD be posted" });
+    if (this.exec.live) {
+      this.keys = liveStrategyKeys(this.db);
+      if (this.keys.length < 2) throw new Error("live: fewer than 2 READY real keys available to the strategy (bootstrap first)");
+    } else {
+      this.keys = ensurePaperKeys(this.db, this.cfg.strategy.keyCount, this.cfg.paperKeyPrefix);
+      for (const k of this.keys) {
+        if (k.status === "GENERATED") transitionKey(this.db, k.id, "REGISTER_PENDING", { reason: "paper: owner message WOULD be posted" });
+      }
+      this.keys = this.keys.map((k) => getKey(this.db, k.id));
     }
-    this.keys = this.keys.map((k) => getKey(this.db, k.id));
     const rows = this.db.prepare("SELECT * FROM paper_sweeps ORDER BY n").all() as
       { n: number; ref: string; close: string; owners: string; trades: string; lookahead_trades: string | null }[];
     for (const r of rows) {
@@ -101,13 +143,28 @@ export class PaperTrader {
     const open = this.db.prepare("SELECT * FROM intents WHERE outcome IS NULL AND risk_status = 'OK'").all() as Record<string, string>[];
     for (const i of open) this.pending.set(Number(i.sweep), [...(this.pending.get(Number(i.sweep)) ?? []), this.rowToPending(i)]);
     await this.reconcileBooks(null, "replay");
-    ccLog("KEYS", { count: this.keys.length, fake: true, first: this.keys[0]?.id, last: this.keys.at(-1)?.id, statuses: keyStatusCounts(this.db),
+    if (this.exec.recover) {
+      await this.exec.recover(async (intentId) => {
+        const p = [...this.pending.values()].flat().find((x) => x.intentId === intentId);
+        return p ? this.precheck(p) : null;
+      });
+      // Crash between persisting an intent and the executor's first row: execute it now if still in time.
+      if (this.exec.has) {
+        for (const p of [...this.pending.values()].flat()) {
+          if (this.exec.has(p.intentId)) continue;
+          await this.exec.post(this.execIntent(p, this.clock()), () => this.precheck(p));
+        }
+      }
+      this.dropUnsent();
+    }
+    ccLog("KEYS", { count: this.keys.length, fake: !this.exec.live, first: this.keys[0]?.id, last: this.keys.at(-1)?.id, statuses: keyStatusCounts(this.db),
       replayed_sweeps: rows.length, minted: this.minted });
   }
 
   private rowToPending(i: Record<string, string>): PendingTrade {
     return {
       intentId: i.intent_id,
+      sweep: Number(i.sweep),
       intent: { pairIndex: Number(i.pair_index), favored: i.favored as "long" | "short", trigger: i.trigger as StrategyIntent["trigger"], triggerPx: 0, level: { lo: null, hi: null }, tries: 0 },
       wire: { id: i.trade_id, maker: i.maker_did, side: "buy", qty: i.qty, px: i.px, taker: i.taker_did, until: Number(i.until), countersigner: i.taker_did },
       estimate: toMicro(i.estimated_close),
@@ -234,6 +291,11 @@ export class PaperTrader {
         st = this.strategy.onResult(st, intent.pairIndex, intent.favored, intent.trigger, intent.tries, false);
         continue;
       }
+      if (!lchk.accounts.has(buyer.did) || !lchk.accounts.has(seller.did)) {
+        ccLog("RISK", { sweep: n, pair: intent.pairIndex, buyer: buyer.id, seller: seller.id }, "pair not minted in our book yet: intent dropped");
+        st = this.strategy.onResult(st, intent.pairIndex, intent.favored, intent.trigger, intent.tries, false);
+        continue;
+      }
       const px = favoredPrice(intent.favored, est.value, priceMargin, lim ?? limitsFromRef(ref, this.contest));
       const band = closeBand(est.value, qtyMargin);
       const l2 = lchk.clone();
@@ -273,7 +335,7 @@ export class PaperTrader {
       const intentId = `${n}-${intent.pairIndex}-${wire.id.slice(0, 8)}`;
       const status = risk.ok && foldOk ? "OK" : "REJECTED";
       const failed = [...risk.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail ?? ""}`), ...foldNotes];
-      ccLog("PAPER INTENT", {
+      ccLog(this.exec.live ? "LIVE INTENT" : "PAPER INTENT", {
         sweep: n, pair: intent.pairIndex, trigger: intent.trigger, tries: intent.tries, favored: intent.favored,
         maker: buyer.id, maker_did: buyer.did, taker: seller.id, taker_did: seller.did, side: "buy", qty: wire.qty, px: wire.px, until,
         ref: prev.ref_px, ref_source: r.source, limits: lim ? [fmt2(lim[0]), fmt2(lim[1])] : "formula", estimated_close: fmtShort(est.value), estimator: est.used,
@@ -281,7 +343,8 @@ export class PaperTrader {
         expected_maker_fee: risk.expected.makerFee, expected_taker_fee: risk.expected.takerFee,
         expected_maker_collateral: risk.expected.makerCollateral, expected_taker_collateral: risk.expected.takerCollateral,
         trade_id: wire.id, risk: status, failed: failed.length ? failed : undefined,
-        maker_signature: "WOULD BE REQUIRED", taker_signature: "WOULD BE REQUIRED", post: "WOULD BE POSTED ONCE (complete trade)",
+        ...(this.exec.live ? { execution: "live: re-checked, signed and posted once by the LiveExecutor" }
+          : { maker_signature: "WOULD BE REQUIRED", taker_signature: "WOULD BE REQUIRED", post: "WOULD BE POSTED ONCE (complete trade)" }),
       });
       if (commit) {
         this.db.prepare(`INSERT INTO intents (intent_id, sweep, pair_index, trigger, favored, maker_id, taker_id, maker_did, taker_did, side, qty, px, until,
@@ -295,7 +358,7 @@ export class PaperTrader {
           JSON.stringify({ ref_source: r.source, checks: risk.checks, fold: foldNotes }), now());
       }
       if (status === "OK") {
-        const p: PendingTrade = { intentId, intent, wire, estimate: est.value, ref: prev.ref_px };
+        const p: PendingTrade = { intentId, sweep: n, intent, wire, estimate: est.value, ref: prev.ref_px };
         accepted.push(p);
         this.ourIds.add(wire.id);
       } else {
@@ -303,12 +366,82 @@ export class PaperTrader {
         st = this.strategy.onResult(st, intent.pairIndex, intent.favored, intent.trigger, intent.tries, false);
       }
     }
-    if (commit) {
-      this.state = st;
-      saveStrategyState(this.db, "K", this.state);
-      if (accepted.length) this.pending.set(n, accepted);
+    if (!commit) return accepted;
+    // Persist intents + strategy state BEFORE any POST: a crash from here on can never re-trigger the same
+    // entry or mint a new trade id for it (recovery works from the stored intents and live_trades rows).
+    this.state = st;
+    saveStrategyState(this.db, "K", this.state);
+    const sent: PendingTrade[] = [];
+    for (const p of accepted) {
+      const r = await this.exec.post(this.execIntent(p, nowMs), () => this.precheck(p));
+      if (r.posted) {
+        sent.push(p);
+        this.postedThisSweep.set(n, [...(this.postedThisSweep.get(n) ?? []), p.wire]);
+      } else {
+        this.db.prepare("UPDATE intents SET risk_status = 'NOT_SENT', risk_detail = ? WHERE intent_id = ?").run(JSON.stringify({ state: r.state, detail: r.detail }), p.intentId);
+        ccLog("RISK", { sweep: n, pair: p.intent.pairIndex, trade_id: p.wire.id, state: r.state, detail: r.detail }, "intent not executed: pair released for a retry");
+        this.state = this.strategy.onResult(this.state, p.intent.pairIndex, p.intent.favored, p.intent.trigger, p.intent.tries, false);
+      }
     }
-    return accepted;
+    saveStrategyState(this.db, "K", this.state);
+    if (sent.length) this.pending.set(n, sent);
+    return sent;
+  }
+
+  /** The executor's view of an accepted intent: the decision, unchanged. */
+  execIntent(p: PendingTrade, decidedAtMs: number): ExecIntent {
+    const n = p.sweep;
+    return {
+      intentId: p.intentId, sweep: n, pairIndex: p.intent.pairIndex, makerId: this.keys[2 * p.intent.pairIndex].id, takerId: this.keys[2 * p.intent.pairIndex + 1].id,
+      ref: p.ref, decidedAtMs, deadlineMs: sweepTime(this.contest, n) - this.cfg.postGuardMs,
+      terms: termsFromTrade({ id: p.wire.id, maker: p.wire.maker, side: "buy", qty: toMicro(p.wire.qty), px: toMicro(p.wire.px), taker: p.wire.taker, until: p.wire.until }),
+    };
+  }
+
+  /** Intents the executor did not send (recovery): out of the pending book, pair released. */
+  private dropUnsent(): void {
+    const unsent = new Set((this.db.prepare("SELECT intent_id FROM intents WHERE risk_status = 'NOT_SENT' AND outcome IS NULL").all() as { intent_id: string }[]).map((r) => r.intent_id));
+    for (const [n, list] of this.pending) {
+      const keep = list.filter((p) => !unsent.has(p.intentId));
+      for (const p of list.filter((x) => unsent.has(x.intentId))) {
+        this.state = this.strategy.onResult(this.state, p.intent.pairIndex, p.intent.favored, p.intent.trigger, p.intent.tries, false);
+      }
+      if (keep.length) this.pending.set(n, keep); else this.pending.delete(n);
+    }
+    saveStrategyState(this.db, "K", this.state);
+  }
+
+  /**
+   * Every check again, against the state right now, immediately before a live POST (empty = OK):
+   * not halted, still before the deadline, same reference, stale policy not halting, limits, balances,
+   * collateral, fees, key states (validateTrade on the current book plus our trades already posted this sweep).
+   */
+  async precheck(p: PendingTrade): Promise<string[]> {
+    const fails: string[] = [];
+    const n = p.sweep;
+    const t = this.clock();
+    if (this.halted) fails.push(`halted: ${this.halted}`);
+    if (lastClosedSweep(this.contest, t) >= n || t >= sweepTime(this.contest, n) - this.cfg.postGuardMs) fails.push(`sweep ${n}: past the posting deadline`);
+    const { est, r } = this.estimateFor(n, t);
+    if (!r || r.ref !== p.ref) fails.push(`reference changed: ${p.ref} -> ${r?.ref ?? "none"}`);
+    if (!est) fails.push("no estimate");
+    if (r && est) {
+      const lastPublished = (this.db.prepare("SELECT MAX(n) m FROM sweeps WHERE ref_px IS NOT NULL").get() as { m: number | null }).m ?? 0;
+      const hl = this.hl?.latest ?? null;
+      const stale = decideStale(this.cfg.stalePolicy, { ageS: r.ageS, delayMin: Math.max(0, (t - sweepTime(this.contest, lastPublished + 1)) / 60_000),
+        divergenceBps: hl ? Math.abs(Number(hl.px) - Number(r.ref)) / Number(r.ref) * 10_000 : null, refEstimated: r.source !== "referee" });
+      if (stale.decision === "HALT_NEW_ENTRIES") fails.push(`stale policy: ${stale.reason}`);
+      const others = new Set(this.ourIds);
+      others.delete(p.wire.id);
+      const risk = validateTrade(p.wire, {
+        ledger: this.ledgerForChecks(), sweep: n, lockSweep: this.contest.lockSweep, ref: toMicro(r.ref), postedLimits: r.limits, estimate: est.value,
+        qtyMargin: this.cfg.strategy.qtyMargin, reserve: this.cfg.strategy.reserve,
+        knownSettledIds: (id) => !!this.db.prepare("SELECT 1 FROM settled_ids WHERE id = ?").get(id),
+        ourIds: others, earlierTrades: this.postedThisSweep.get(n) ?? [], keyStatus: (did) => this.status(did),
+      });
+      for (const c of risk.checks.filter((x) => !x.ok && x.name !== "fee_close_band")) fails.push(`${c.name}: ${c.detail ?? ""}`);
+    }
+    return fails;
   }
 
   /** The referee posted sweep n: resolve the estimate and settle our paper intents with the real ref/close. */
@@ -320,14 +453,18 @@ export class PaperTrader {
       return;
     }
     this.resolveEstimate(n, price);
-    if (!this.minted) {
+    if (!this.minted && !this.exec.live) {
       await this.paperMint(n, refStr, close);
       return;
     }
     const pend = this.pending.get(n) ?? [];
     this.pending.delete(n);
-    if (!pend.length) return;
-    const owners: string[] = [];
+    this.postedThisSweep.delete(n);
+    // Live: our real keys enter our book the first sweep after they are READY (their mint is confirmed by
+    // PROTOCOL evidence before that, so the referee minted them no later than this sweep).
+    const owners: string[] = this.exec.live ? this.keys.filter((k) => !this.ledger.accounts.has(k.did)).map((k) => k.did) : [];
+    if (!pend.length && !owners.length) return;
+    if (owners.length) ccLog("KEYS", { sweep: n, entering_book: owners.length }, "live keys minted in our book (official fold)");
     const trades = pend.map((p) => p.wire);
     const res = (await this.fold.sweep(n, refStr, close, owners, trades)) as FoldSweepResult;
     const mirror = this.ledger.sweep(n, toMicro(refStr), toMicro(close), owners, trades);
@@ -379,7 +516,9 @@ export class PaperTrader {
         }
       }
       this.state = this.strategy.onResult(this.state, p.intent.pairIndex, p.intent.favored, p.intent.trigger, p.intent.tries, settled);
+      this.exec.onSettled?.(p.intentId, out.outcome, out.reason ?? null);
     }
+    if (owners.length) this.minted = true;
     saveStrategyState(this.db, "K", this.state);
     await this.reconcileBooks(n, "settle");
     await this.summary(n, close);
@@ -429,6 +568,38 @@ export class PaperTrader {
     return out;
   }
 
+  /**
+   * Live: our book is the official fold fed with OUR trades at the referee's own ref/close, so its outcome
+   * is the referee's. Every one of our trade ids the referee does list is checked against it; any
+   * disagreement is a grave halt (the observer keeps running). Lists are truncated at 4,096 chars, so
+   * an unlisted id stays "unlisted" (verified only by the fold).
+   */
+  verifyWithReferee(): { checked: number; mismatches: number } {
+    if (!this.exec.live) return { checked: 0, mismatches: 0 };
+    const rows = this.db.prepare(`SELECT intent_id, trade_id, sweep, fold_outcome FROM live_trades WHERE fold_outcome IS NOT NULL AND referee_outcome IS NULL`).all() as
+      { intent_id: string; trade_id: string; sweep: number; fold_outcome: string }[];
+    let mismatches = 0;
+    for (const r of rows) {
+      const settled = this.db.prepare("SELECT n FROM settled_ids WHERE id = ?").get(r.trade_id) as { n: number } | undefined;
+      const voided = this.db.prepare("SELECT n, reason FROM void_ids WHERE id = ? AND reason <> 'settled' ORDER BY n LIMIT 1").get(r.trade_id) as { n: number; reason: string } | undefined;
+      const published = this.db.prepare("SELECT 1 FROM sweeps WHERE n = ? AND flow_json IS NOT NULL").get(r.sweep);
+      let ref: string | null = null;
+      if (settled) ref = "settled";
+      else if (voided) ref = `void:${voided.reason}`;
+      else if (published) ref = "unlisted";
+      if (!ref) continue;
+      const bad = (ref === "settled" && r.fold_outcome !== "settled") || (ref.startsWith("void") && r.fold_outcome === "settled");
+      this.db.prepare("UPDATE live_trades SET referee_outcome = ?, referee_at = ?, updated_at = ? WHERE intent_id = ?").run(ref, now(), now(), r.intent_id);
+      ccLog("LIVE RESULT", { trade_id: r.trade_id, sweep: r.sweep, fold: r.fold_outcome, referee: ref, agree: !bad });
+      if (bad) {
+        mismatches++;
+        recordReconcile(this.db, r.sweep, "L3-referee-vs-fold", "MISMATCH", { trade_id: r.trade_id, fold: r.fold_outcome, referee: ref });
+        halt(this.db, "reconcile_mismatch", `our trade ${r.trade_id}: fold ${r.fold_outcome}, referee ${ref} (sweep ${r.sweep})`, this.alerts ?? undefined);
+      }
+    }
+    return { checked: rows.length, mismatches };
+  }
+
   private resolveEstimate(n: number, price: PricePost): void {
     const row = this.db.prepare("SELECT estimated_close FROM estimates WHERE n = ?").get(n) as { estimated_close: string } | undefined;
     const boundary = sweepTime(this.contest, n);
@@ -476,7 +647,7 @@ export class PaperTrader {
     const top = [...scores].sort((a, b) => b.score - a.score).slice(0, 3);
     const snap = this.db.prepare(`INSERT OR REPLACE INTO positions (n, key_id, book, cash, position, fees, value, mark, at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`);
     for (const k of this.keys) {
-      for (const [book, acc] of [["paper", fa.accounts[k.did]], ["lookahead", la.accounts[k.did]]] as const) {
+      for (const [book, acc] of [[this.exec.live ? "live" : "paper", fa.accounts[k.did]], ["lookahead", la.accounts[k.did]]] as const) {
         if (acc && Number(acc.position) !== 0) snap.run(n, k.id, book, acc.cash, acc.position, acc.fees, acc.value, markPx, now());
       }
     }

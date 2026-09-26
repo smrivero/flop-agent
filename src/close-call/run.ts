@@ -24,14 +24,19 @@ import { startHealthServer } from "./http.js";
 import { HyperliquidObserver } from "./hyperliquid.js";
 import { ccLog } from "./logger.js";
 import { RefereeObserver } from "./observer.js";
-import { foldConfig, PaperTrader } from "./paper.js";
+import { foldConfig, PAPER_EXECUTOR, PaperTrader, type TradeExecutor } from "./paper.js";
 import type { PricePost } from "./protocol.js";
 import { reconcileReferee } from "./reconcile.js";
 import { clearTransient, halt, isHalted } from "./safety.js";
 import { snapshot } from "./status.js";
 import { getMeta, healthEvent, setMeta, type CcDb } from "./store.js";
 
-export interface RunOptions { maxMinutes?: number; paper: boolean }
+export interface RunOptions {
+  maxMinutes?: number;
+  paper: boolean;
+  /** Live: the LiveExecutor (built by live/cli-live.ts, the only place that can). Same decision engine as paper. */
+  executor?: TradeExecutor & { confirmPosted?: () => Promise<number> };
+}
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
@@ -50,8 +55,9 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
   process.once("SIGTERM", onSig);
 
   const alerts = Alerts.fromConfig(db, cfg);
-  const rt: RuntimeState = { startedAt: Date.now(), observer: "starting", observerLastOkAt: null, strategy: opts.paper ? "running" : "disabled",
-    executor: opts.paper ? "paper" : "disabled", lastError: null, reconnects: 0, timeouts: 0 };
+  const trading = opts.paper || !!opts.executor;
+  const rt: RuntimeState = { startedAt: Date.now(), observer: "starting", observerLastOkAt: null, strategy: trading ? "running" : "disabled",
+    executor: opts.executor ? "live" : opts.paper ? "paper" : "disabled", lastError: null, reconnects: 0, timeouts: 0 };
 
   const prevBeat = getMeta(db, "heartbeat");
   const cleanStop = getMeta(db, "clean_stop") === "1";
@@ -68,9 +74,9 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
   let paper: PaperTrader | null = null;
   let server: Server | null = null;
 
-  ccLog("START", { mode: opts.paper ? "paper" : "observe", referee_poll_ms: cfg.refereePollMs, hl_poll_ms: cfg.hlPollMs, decision_lead_ms: cfg.decisionLeadMs,
+  ccLog("START", { mode: opts.executor ? "live" : opts.paper ? "paper" : "observe", referee_poll_ms: cfg.refereePollMs, hl_poll_ms: cfg.hlPollMs, decision_lead_ms: cfg.decisionLeadMs,
     estimator: cfg.estimator, stale_policy: cfg.stalePolicy, confirmation_policy: cfg.confirmationPolicy, strategy: opts.paper ? cfg.strategy : undefined,
-    writes: "NONE (paper/observe: no writer exists in this process)" });
+    writes: opts.executor ? "LIVE: signed trades are posted by the LiveExecutor" : "NONE (paper/observe: no writer exists in this process)" });
 
   const guard = async <T>(stage: string, fn: () => Promise<T> | T): Promise<T | undefined> => {
     try {
@@ -93,13 +99,13 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
     await guard("reconcile", () => reconcileReferee(db));
     rt.observer = "running";
 
-    if (opts.paper) {
+    if (trading) {
       const main = await OfficialFold.start(cfg.python, cfg.vendorRoot, foldConfig(contest));
       const look = await OfficialFold.start(cfg.python, cfg.vendorRoot, foldConfig(contest));
       folds.push(main, look);
       ccLog("FOLD", { vendor: cfg.vendorRoot, manifest_sha256: main.vendor.manifestSha256, fold_sha256: main.vendor.foldSha256, bytes: main.vendor.foldBytes },
         "official fold verified against the referee's pinned package and started");
-      paper = new PaperTrader(db, cfg, contest, main, look, hl);
+      paper = new PaperTrader(db, cfg, contest, main, look, hl, opts.executor ?? PAPER_EXECUTOR);
       paper.alerts = alerts;
       await paper.start();
     }
@@ -160,6 +166,10 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
           }
         }
         if (events.length) await guard("reconcile", () => reconcileReferee(db));
+        if (events.length && paper && opts.executor) {
+          await guard("live-confirm", () => opts.executor!.confirmPosted?.());
+          await guard("live-verify", () => paper!.verifyWithReferee());
+        }
         const snap = snapshot(db);
         if (snap.sweep !== null && snap.sweep !== lastStateSweep && snap.owners !== null) {
           lastStateSweep = snap.sweep;

@@ -65,6 +65,8 @@ ln -sfn "$RT" "$APP/node_modules"
 
 # 6. unit + wrapper
 install -m 0644 "$APP/deploy/closecall/flop-closecall.service" "$UNIT"
+# The LIVE unit is installed but never enabled or started here: that is a manual step after live-check PASS.
+install -m 0644 "$APP/deploy/closecall/flop-closecall-live.service" /etc/systemd/system/flop-closecall-live.service
 install -m 0755 "$APP/scripts/closecall-ctl.sh" /usr/local/bin/flop-closecall
 systemctl daemon-reload
 systemctl enable flop-closecall.service >/dev/null

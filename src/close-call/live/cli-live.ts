@@ -8,6 +8,8 @@
  *   bootstrap --dry-run [--stages 2,100] [--faults] [--miss-first] [--policy P] [--json]
  *                                        the full bootstrap against an in-memory server + simulated referee
  *   bootstrap                            the real bootstrap: NOT CONNECTED in this build (refuses, exit 3)
+ *   check                                `live-check`: every live precondition, read only, nothing written or sent
+ *   run                                  the live service (Strategy K through the LiveExecutor). Refuses unless check PASSes.
  *
  * The real bootstrap additionally needs CLOSECALL_MODE=live + the exact CLOSECALL_LIVE_ENABLED ack
  * (config.ts), CLOSECALL_ROOM, the backup gate, its own lock, and LIVE_WRITER_CONNECTED = true
@@ -28,7 +30,10 @@ import { getRoom } from "../room.js";
 import { halt, haltSummary } from "../safety.js";
 import { openCloseCallDb } from "../store.js";
 import { simulateBootstrap } from "../testing/bootstrap-sim.js";
+import { banner, runLoop } from "../run.js";
+import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
+import { liveReadiness, renderReadiness } from "./readiness.js";
 import { generateKeys, KeygenRefused, loadSigners, verifyRestoredKeyDir } from "./keygen.js";
 
 /** Flipping this is the act of connecting the live writer. Keep false until the reviewed go-live change. */
@@ -69,6 +74,36 @@ async function main(argv: string[]): Promise<number> {
     for (const c of r.checks) out(`  ${c.ok ? "OK  " : "FAIL"} ${c.name}${c.detail ? ` (${c.detail})` : ""}`);
     out(`result: ${r.ok ? "OK" : "FAILED"}  final=${JSON.stringify(r.final)}`);
     return r.ok ? 0 : 1;
+  }
+
+  if (cmd === "check") {
+    const r = liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED);
+    out(renderReadiness(r));
+    return r.pass ? 0 : 1;
+  }
+
+  if (cmd === "run") {
+    const r = liveReadiness(cfg, contest, LIVE_WRITER_CONNECTED);
+    process.stdout.write(banner("live") + "\n");
+    if (!r.pass) {
+      process.stderr.write(renderReadiness(r) + "\n[CLOSECALL][HALT] live readiness FAILED: refusing to start. NO WRITE.\n");
+      return 3;
+    }
+    const lock = await acquireLock(cfg.lockPath, "close-call live run");
+    setLogSink(cfg.logDir);
+    const ldb = openCloseCallDb(cfg.liveDbPath, { checkIntegrity: true });
+    try {
+      const signers = loadSigners(ldb);
+      const transport = new HttpTransport(cfg.technocoreBaseUrl);
+      const journal = new WriteJournal(ldb, signers, transport, { onAmbiguous: (row, why) => halt(ldb, "ambiguous_operation", `${row.op_key}: ${why}`) });
+      const executor = new LiveExecutor(ldb, signers, journal, transport, cfg.room!, contest, cfg.postGuardMs);
+      ccLog("MODE", { mode: "live", db: cfg.liveDbPath, room: cfg.room, keys: signers.size, policy: cfg.confirmationPolicy }, "LIVE MODE: Strategy K intents are signed and posted");
+      await runLoop(ldb, cfg, contest, { paper: false, executor, maxMinutes: arg("--minutes") ? Number(arg("--minutes")) : undefined });
+      return 0;
+    } finally {
+      ldb.close();
+      lock.release();
+    }
   }
 
   const db = openCloseCallDb(cfg.liveDbPath);
@@ -127,7 +162,7 @@ async function main(argv: string[]): Promise<number> {
     }
   }
 
-  process.stderr.write("usage: cli-live <status | keygen --total N --i-understand-these-are-real-keys | restore-verify <dir> | bootstrap --dry-run [...]>\n");
+  process.stderr.write("usage: cli-live <check | run | status | keygen --total N --i-understand-these-are-real-keys | restore-verify <dir> | bootstrap --dry-run [...]>\n");
   return 2;
 }
 

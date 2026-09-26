@@ -119,6 +119,18 @@ const MIGRATIONS: { version: number; name: string; up: (db: CcDb) => void }[] = 
     name: "void ids listed by the referee",
     up: (db) => db.exec(`CREATE TABLE IF NOT EXISTS void_ids (id TEXT NOT NULL, n INTEGER NOT NULL, reason TEXT NOT NULL, PRIMARY KEY (id, n, reason))`),
   },
+  {
+    version: 4,
+    name: "live trade journal (one row per strategy intent executed live)",
+    up: (db) => db.exec(`
+      CREATE TABLE IF NOT EXISTS live_trades (
+        intent_id TEXT PRIMARY KEY, trade_id TEXT NOT NULL UNIQUE, sweep INTEGER NOT NULL, pair_index INTEGER,
+        maker_id TEXT NOT NULL, taker_id TEXT NOT NULL, terms TEXT NOT NULL, payload_sha256 TEXT NOT NULL, text TEXT,
+        state TEXT NOT NULL, attempt_op TEXT, seq INTEGER, stamped_at TEXT, fold_outcome TEXT, referee_outcome TEXT, detail TEXT,
+        decided_at TEXT, sign_start TEXT, sign_end TEXT, post_at TEXT, response_at TEXT, referee_at TEXT,
+        created_at TEXT NOT NULL, updated_at TEXT NOT NULL);
+      CREATE INDEX IF NOT EXISTS live_trades_state ON live_trades (state);`),
+  },
 ];
 
 export const SCHEMA_VERSION = MIGRATIONS[MIGRATIONS.length - 1].version;

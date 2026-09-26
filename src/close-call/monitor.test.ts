@@ -84,8 +84,8 @@ test("live (simulated): LIVE title, WRITES ENABLED, REAL KEYS, real trades from 
   const livePath = join(f.dir, "live.sqlite3");
   const live = openCloseCallDb(livePath);
   for (let i = 1; i <= 2; i++) live.prepare("INSERT INTO keys (id, did, key_path, fake, status, updated_at) VALUES (?, ?, '/k', 0, 'READY', ?)").run(keyId(i), `did:key:z6Mk${String(i).repeat(44)}`, now());
-  live.prepare(`INSERT INTO trades (trade_id, kind, sweep_first, until, maker_id, taker_id, side, qty, px, terms, status, created_at, updated_at)
-    VALUES ('feedbeef00112233', 'test', ?, ?, 'CC001', 'CC002', 'buy', '0.10', '225.00', '{}', 'posted', ?, ?)`).run(N, N + 6, now(), now());
+  live.prepare(`INSERT INTO live_trades (intent_id, trade_id, sweep, pair_index, maker_id, taker_id, terms, payload_sha256, state, created_at, updated_at)
+    VALUES ('i-live', 'feedbeef00112233', ?, 0, 'CC001', 'CC002', '{}', 'x', 'POSTED', ?, ?)`).run(N, now(), now());
   const out = await text(src(f.path, f.dir, { env: { CLOSECALL_MODE: "live", CLOSECALL_LIVE_ENABLED: LIVE_ACK, CLOSECALL_LIVE_DB_PATH: livePath }, health: healthDoc("live") }));
   for (const s of ["CLOSE CALL — LIVE", "WRITES: ENABLED", "REAL KEYS", "TRADES (REAL)", "feedbeef", "POSTED", "pending            1"]) assert.ok(out.includes(s), `missing: ${s}`);
   assert.ok(!out.includes("FAKE KEYS") && !out.includes("WRITES: DISABLED"));

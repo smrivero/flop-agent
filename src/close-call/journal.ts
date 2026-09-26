@@ -146,8 +146,11 @@ export class WriteJournal {
     return (JSON.parse(row.body) as { request: { path: string; body: { nonce: string; text?: string; value?: string; did: string } } }).request;
   }
 
-  /** Send the persisted request exactly as signed. */
-  async send(row: AttemptRow): Promise<AttemptRow> {
+  /**
+   * Send the persisted request exactly as signed. With `noResend` (live trades) a refusal is final
+   * (FAILED) and nothing is ever re-sent: the caller reconciles with readBackOnly().
+   */
+  async send(row: AttemptRow, opts: { noResend?: boolean } = {}): Promise<AttemptRow> {
     if (row.state === "PLANNED") row = this.prepare(row);
     const req = this.request(row);
     row = this.set(row, { state: "SENDING", tries: row.tries + 1 });
@@ -159,7 +162,22 @@ export class WriteJournal {
       return this.set(row, { state: "UNKNOWN", error: (e as Error).message });
     }
     if (res.status >= 200 && res.status < 300) return this.set(row, { state: "CONFIRMED", http_status: res.status, response: res.text.slice(0, 2000) });
+    if (opts.noResend) {
+      ccLog("EXECUTOR", { op: row.op_key, status: res.status, body: res.text.slice(0, 200) }, "write refused (no automatic re-send)");
+      return this.set(row, { state: "FAILED", http_status: res.status, response: res.text.slice(0, 2000), error: `HTTP ${res.status}` });
+    }
     return this.onRefusal(row, res);
+  }
+
+  /** Reconcile an UNKNOWN / SENDING row by reading the server only. Never sends anything. */
+  async readBackOnly(row: AttemptRow): Promise<AttemptRow> {
+    try {
+      const seen = await this.present(row);
+      if (seen.present) return this.set(row, { state: "CONFIRMED", error: "found by read-back" });
+      return this.set(row, { state: "UNKNOWN", error: "not found by read-back (not re-sent)" });
+    } catch (e) {
+      return this.set(row, { state: "UNKNOWN", error: `read-back failed: ${(e as Error).message}` });
+    }
   }
 
   private async onRefusal(row: AttemptRow, res: TransportResponse): Promise<AttemptRow> {

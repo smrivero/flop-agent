@@ -96,6 +96,8 @@ export interface CloseCallConfig {
   backupAgeRecipient: string | null;
   /** Fraction of the live per-IP write limit the bootstrap may use (the IP is shared with other bots). */
   writeBudgetFraction: number;
+  /** Live: no trade is posted later than this many ms before its sweep's boundary. */
+  postGuardMs: number;
 }
 
 function num(env: NodeJS.ProcessEnv, name: string, def: number, min: number, max: number): number {
@@ -205,6 +207,7 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
     room: roomName(env.CLOSECALL_ROOM),
     backupAgeRecipient: ageRecipient(env.CLOSECALL_BACKUP_AGE_RECIPIENT),
     writeBudgetFraction: num(env, "CLOSECALL_WRITE_BUDGET_FRACTION", 0.25, 0.01, 0.9),
+    postGuardMs: num(env, "CLOSECALL_POST_GUARD_MS", 3_000, 500, 60_000),
   };
 }
 

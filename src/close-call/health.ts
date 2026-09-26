@@ -16,7 +16,7 @@ export interface RuntimeState {
   observer: "running" | "starting" | "error" | "stopped";
   observerLastOkAt: number | null;
   strategy: "running" | "halted" | "disabled";
-  executor: "paper" | "disabled";
+  executor: "paper" | "live" | "disabled";
   lastError: string | null;
   reconnects: number;
   timeouts: number;

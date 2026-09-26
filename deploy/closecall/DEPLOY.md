@@ -240,6 +240,20 @@ flop-closecall keys --backup-verify --archive secrets-<STAMP>.tar.age --code <VE
 | real bootstrap | `flop-closecall live bootstrap` refuses (exit 3) in this build |
 | generate real keys (gate required; do **not** run yet) | `flop-closecall live keygen --total 2 --i-understand-these-are-real-keys` |
 
+## 5d. Live service (only after live-check PASS)
+
+- Live runs as a **second** unit, `flop-closecall-live`. It has its own env, DB, lock, logs and health port
+  (8788), so the paper service keeps running beside it.
+- The installer installs the unit but never enables or starts it.
+
+```bash
+install -m 0640 -o root -g flopcc /opt/flop-closecall/deploy/closecall/closecall-live.env.example /etc/flop-closecall/closecall-live.env  # then edit ROOM + recipient
+flop-closecall live-check
+systemctl start flop-closecall-live && sleep 30 && journalctl -u flop-closecall-live -n 30 --no-pager && flop-closecall --live status --no-color
+```
+
+Monitor: `flop-closecall --live watch`. Stop: `systemctl stop flop-closecall-live`.
+
 ## 6. Stop / uninstall
 
 Stopping:

@@ -313,6 +313,65 @@ that follows the published rules. It uses throwaway in-memory keys; mints are ne
   referee): no duplicate, every write CONFIRMED, test trade settled once.
 - Under STRICT with unlisted mints, CC001 waits indefinitely and nothing else is written.
 
+## Live execution (implemented, NOT connected)
+
+```
+                 decision engine (paper.ts: estimate -> Strategy K -> pair, side, px, qty, until -> risk + official fold)
+                                   | the SAME intent
+                 +-----------------+------------------+
+          PaperExecutor (simulates)          LiveExecutor (live/executor.ts)
+```
+
+**The LiveExecutor never decides.** It takes the intent unchanged and does the following:
+1. persists `live_trades` CREATED (trade id and payload hash fixed forever);
+2. checks keys READY/ACTIVE, room READY, the maker in the room's writers;
+3. runs `precheck()`, the engine's own re-validation right now:
+   - not halted, still before the deadline, same reference;
+   - stale policy is not HALT;
+   - limits, balances, collateral, fees and key states on the current book, including our trades already
+     posted this sweep;
+4. signs maker and taker **once**, verifies both, and freezes the text (SIGNED);
+5. POSTs once through the write journal (outer nonce persisted per DID and room);
+6. records POSTED, FAILED or UNKNOWN, with timings: decide → sign → post → response → stamp.
+
+After that:
+- `confirmPosted()` locates the message: CONFIRMED if it was stamped before the boundary, LATE otherwise.
+- The fold then gives SETTLED or VOID.
+- `verifyWithReferee()` compares against the referee's lists. Settled vs void in either direction is a grave
+  halt; an id missing from the truncated lists is "unlisted".
+
+**Intents and strategy state are persisted before any POST.**
+
+**Recovery after a crash:**
+
+| state at the crash | on restart |
+|---|---|
+| no `live_trades` row, or CREATED/SIGNED | executed if still before the deadline, same trade id and same signed text; otherwise NOT_POSTED and the pair is released |
+| POSTING, journal PREPARED | sent if before the deadline |
+| POSTING, journal SENDING/UNKNOWN | read-back **only**: found → POSTED; not found → UNKNOWN + grave halt, never re-sent |
+| POSTED onwards | nothing to do |
+
+**Gates.** `live run` refuses unless `live-check` passes:
+- CLOSECALL_MODE=live plus the ack;
+- LIVE_WRITER_CONNECTED;
+- a separate DB and lock;
+- READY keys with key files self-tested;
+- the backup gate: an age archive plus the Mac restore verification of exactly these key files;
+- the room READY, the bootstrap done, a valid policy;
+- sane nonces;
+- fresh referee and Hyperliquid data;
+- not halted;
+- no pending writes and no UNKNOWN trades.
+
+**Paper vs live, what still differs:**
+- Keys: the fake CC001..CCnnn, versus real READY keys minus those used by the bootstrap test trade. They
+  hold a 0.10 position, so the pair numbering shifts.
+- Mint in our book: the paper keys mint at the first sweep; the live keys enter the book at the first sweep
+  after the service starts.
+- Truth: the paper book is the fold. The live book is also the fold, but it is checked against the referee's
+  lists, which are truncated, so many ids stay "unlisted".
+- An UNKNOWN POST halts live execution for an operator decision; paper never has one.
+
 ## Plan to production
 
 Done:
