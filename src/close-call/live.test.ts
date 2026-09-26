@@ -84,7 +84,7 @@ test("keygen: refused before a verified backup; after it, 0600 files in a 0700 d
   assert.equal(keys.length, 2);
   assert.ok(keys.every((k) => k.fake === 0 && k.status === "GENERATED" && k.key_path));
   assert.ok(!JSON.stringify(keys).includes("seed"), "the DB holds did + path only");
-  const signers = loadSigners(v.db);
+  const signers = loadSigners(v.db, v.keysDir);
   const s = signers.get("CC001")!;
   assert.ok(verifyEd25519(s.did, s.sign("x"), "x"));
   // the new keys are not in the verified backup: the gate is closed for keygen AND for live writes

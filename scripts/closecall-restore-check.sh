@@ -22,12 +22,12 @@ if [ "${LOCAL:-0}" = "1" ]; then
     ENVF=$(ls "$RT"/etc/flop-closecall/closecall-live.env 2>/dev/null || true)
     if [ -n "$DB" ] && [ -n "$ENVF" ]; then
       D="$RT/drill"; install -d -m 700 "$D" "$D/backups"
-      cp -a "$KD" "$D/keys"; install -m 600 "$DB" "$D/live.sqlite3"
+      cp -a "$KD" "$D/keys"; chmod 700 "$D/keys"; install -m 600 "$DB" "$D/live.sqlite3"
       cp -a "$(dirname "$FILE")"/secrets-*.tar.age "$(dirname "$FILE")"/secrets-*.manifest.json "$D/backups/" 2>/dev/null || true
-      echo "== restore drill: live-check --offline on the rebuilt state =="
+      echo "== disaster-recovery drill on the rebuilt state in $D (offline; nothing references the original machine) =="
       ( set -a; . "$ENVF"; set +a
         CLOSECALL_DATA_DIR="$D" CLOSECALL_DB_PATH="$D/live.sqlite3" CLOSECALL_LIVE_DB_PATH="$D/live.sqlite3" CLOSECALL_LOCK_PATH="$D/live.lock" \
-          npx tsx src/close-call/live/cli-live.ts check --offline ) || true
+          npx tsx src/close-call/live/cli-live.ts restore-drill --archive "$D/backups/$(basename "$FILE")" ) || true
     else
       echo "(no live DB snapshot / env in this archive: key check only)"
     fi

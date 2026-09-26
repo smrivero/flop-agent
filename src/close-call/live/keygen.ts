@@ -36,12 +36,15 @@ export function loadSigner(path: string): Signer {
   return s;
 }
 
-/** Signers for every real key recorded in the live DB. Refuses on any missing / loose / mismatching file. */
-export function loadSigners(db: CcDb): Map<string, Signer> {
+/**
+ * Signers for every real key recorded in the live DB, loaded BY ID from the CURRENT keys dir (<keysDir>/<id>.json).
+ * The stored key_path is history only: a restored DB in another data dir never points back at the old machine.
+ * Refuses on any missing / loose / mismatching file.
+ */
+export function loadSigners(db: CcDb, keysDir: string): Map<string, Signer> {
   const out = new Map<string, Signer>();
   for (const k of listKeys(db).filter((x) => x.fake === 0)) {
-    if (!k.key_path) throw new KeyFileError(`${k.id}: no key_path recorded`);
-    const s = loadSigner(k.key_path);
+    const s = loadSigner(join(keysDir, `${k.id}.json`));
     if (s.did !== k.did) throw new KeyFileError(`${k.id}: key file did differs from the recorded did`);
     out.set(k.id, s);
   }

@@ -39,6 +39,7 @@ import { banner, runLoop } from "../run.js";
 import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
 import { liveReadiness, renderReadiness } from "./readiness.js";
+import { renderDrill, restoreDrill } from "./restore-drill.js";
 import { generateKeys, KeygenRefused, loadSigners, verifyRestoredKeyDir } from "./keygen.js";
 
 
@@ -51,6 +52,13 @@ async function main(argv: string[]): Promise<number> {
   const arg = (name: string) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
   const cfg = loadCloseCallConfig();
   const contest = loadContest(cfg.vendorRoot);
+
+  if (cmd === "restore-drill") {
+    // Run on a RESTORED live data dir (CLOSECALL_DATA_DIR / DB paths point at it); offline, read only.
+    const r = restoreDrill(cfg, arg("--archive") ?? null);
+    out(renderDrill(r));
+    return r.pass ? 0 : 1;
+  }
 
   if (cmd === "restore-verify") {
     const dir = argv[1];
@@ -80,8 +88,11 @@ async function main(argv: string[]): Promise<number> {
   }
 
   const envFile = process.env.CLOSECALL_ENV_FILE ?? null;
+  const stage = arg("--stage") === "bootstrap" ? "bootstrap" as const : "check" as const;
   if (cmd === "check") {
-    const r = await liveReadiness(cfg, contest, "check", { offline: has("--offline"), envFile });
+    // --stage bootstrap: what must hold BEFORE the first write (it does not require what the bootstrap creates)
+    const r = await liveReadiness(cfg, contest, stage, { offline: has("--offline"), envFile });
+    if (stage === "bootstrap") out("STAGE: bootstrap (pre-write gate)");
     out(renderReadiness(r));
     return r.pass ? 0 : 1;
   }
@@ -101,7 +112,7 @@ async function main(argv: string[]): Promise<number> {
     ldb.prepare("INSERT INTO meta (key, value) VALUES ('last_readiness', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value")
       .run(JSON.stringify({ at: new Date().toISOString(), pass: r.pass, rows: r.rows }));
     try {
-      const signers = loadSigners(ldb);
+      const signers = loadSigners(ldb, cfg.keysDir);
       const transport = new HttpTransport(cfg.technocoreBaseUrl);
       const canWrite = () => { const w = writerState(cfg); return w.armed ? null : w.reason; };
       const journal = new WriteJournal(ldb, signers, transport, { onAmbiguous: (row, why) => halt(ldb, "ambiguous_operation", `${row.op_key}: ${why}`), canWrite });
@@ -137,8 +148,8 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "arm") {
     const probe = { ...cfg, liveWriter: "armed" as const };
     if (!rearm(cfg.dataDir)) { out(`no kill switch present; writer: ${writerState(cfg).reason}`); return 0; }
-    const r = await liveReadiness(cfg, contest, "check", { envFile });
-    if (!r.pass) { disarm(cfg.dataDir, "re-armed refused: live-check FAIL"); out(renderReadiness(r)); out("ARM REFUSED: kill switch put back."); return 3; }
+    const r = await liveReadiness(cfg, contest, stage, { envFile });
+    if (!r.pass) { disarm(cfg.dataDir, `re-armed refused: live-check (${stage}) FAIL`); out(renderReadiness(r)); out("ARM REFUSED: kill switch put back."); return 3; }
     out(`ARMED: ${writerState(probe).reason}`);
     return 0;
   }
@@ -205,13 +216,20 @@ async function main(argv: string[]): Promise<number> {
       return 3;
     }
     if (!cfg.room) { process.stderr.write("CLOSECALL_ROOM is not set\n"); return 2; }
+    // The pre-write gate, every time (resume included). Journal rows in flight are allowed: the bootstrap reconciles them first.
+    const pre = await liveReadiness(cfg, contest, "bootstrap", { envFile });
+    const blocking = pre.rows.filter((x) => !x.ok && !x.bootOptional && x.name !== "pending writes");
+    if (blocking.length) {
+      process.stderr.write(`${renderReadiness(pre)}\n[CLOSECALL][HALT] pre-bootstrap gate FAILED (${blocking.map((x) => x.name).join(", ")}): refusing. NO WRITE.\n`);
+      return 3;
+    }
     const lock = await acquireLock(cfg.lockPath, "close-call live bootstrap"); // the SAME lock as the live service: never both at once
     setLogSink(cfg.logDir);
     try {
       const limits = await fetchLimits(cfg.technocoreBaseUrl);
       db.prepare("INSERT INTO config_snapshots (source, json, at) VALUES (?, ?, ?)").run(limits.source, JSON.stringify(limits), new Date().toISOString());
       const perWriteMs = Math.ceil(60_000 / Math.max(1, Math.floor(limits.writesPerMinPerIp * cfg.writeBudgetFraction)));
-      const signers = loadSigners(db);
+      const signers = loadSigners(db, cfg.keysDir);
       const transport = new HttpTransport(cfg.technocoreBaseUrl);
       const observer = new RefereeObserver(db, cfg.technocoreBaseUrl, cfg.rawLogDir);
       const journal = new WriteJournal(db, signers, transport, { onAmbiguous: (row, why) => halt(db, "ambiguous_operation", `${row.op_key}: ${why}`),

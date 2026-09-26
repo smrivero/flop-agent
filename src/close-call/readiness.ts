@@ -26,7 +26,49 @@ import { getMeta } from "./store.js";
 import { REFEREE_DID } from "./protocol.js";
 import { REFEREE_PACKAGE_SHA256, verifyVendor } from "./fold.js";
 
-export interface ReadinessRow { name: string; ok: boolean; value: string; blocksRun?: boolean }
+export interface ReadinessRow { name: string; ok: boolean; value: string; blocksRun?: boolean; bootOptional?: boolean }
+
+/** `bootstrap` = what must hold BEFORE the first write (it does not require what the bootstrap itself creates). */
+export type ReadinessMode = "check" | "run" | "bootstrap";
+
+/** Rows that describe what the bootstrap CREATES: not required before it. */
+const BOOT_OPTIONAL = new Set(["writer", "staging trade", "strategy keys", "room state", "bootstrap", "referee seed", "state backup (DB)"]);
+
+export interface RoomServerState {
+  state: "VIRGIN" | "OURS" | "FOREIGN" | "DELETED" | "UNCLAIMABLE";
+  foreign: number; detail: string; generationOk: boolean; generationDetail: string;
+}
+
+/**
+ * What the server says about our room, with local evidence:
+ *   VIRGIN       no owner/allow/nonce note, no message, generation 0, and we never configured it (nothing to lose)
+ *   OURS         owner note = CC-ADMIN (allow-list checked for foreign DIDs)
+ *   FOREIGN      someone else owns it
+ *   DELETED      we had configured it (recorded generation / local room state) and the server lost it
+ *   UNCLAIMABLE  messages but no owner note: can never be claimed
+ */
+export function classifyRoom(x: { owner: string | null; allow: string | null; nonce: string | null; lastSeq: number; generation: number;
+  adminDid: string; ourDids: Set<string>; storedGeneration: number | null; everConfigured: boolean }): RoomServerState {
+  const allow = (x.allow ?? "").split(/\s+/).filter(Boolean);
+  const foreign = allow.filter((d) => !x.ourDids.has(d)).length;
+  const empty = x.owner === null && x.allow === null && x.nonce === null && x.lastSeq === 0 && x.generation === 0;
+  const gen = (ok: boolean, d: string) => ({ generationOk: ok, generationDetail: d });
+  if (empty && !x.everConfigured) {
+    return { state: "VIRGIN", foreign: 0, detail: "VIRGIN (not created): owner ABSENT, allow ABSENT, nonce ABSENT, messages 0, generation 0", ...gen(true, "0 / NOT CREATED (the bootstrap pins it)") };
+  }
+  if (x.everConfigured && (x.owner === null || (x.storedGeneration !== null && (x.lastSeq === 0 || x.generation === 0)))) {
+    return { state: "DELETED", foreign, detail: `DELETED / GENERATION LOST: we configured it (recorded generation ${x.storedGeneration ?? "none"}), server now: owner ${x.owner === null ? "ABSENT" : "present"}, messages ${x.lastSeq}, generation ${x.generation}`,
+      ...gen(false, `GENERATION LOST: recorded ${x.storedGeneration ?? "none"}, server ${x.generation} (${x.lastSeq} messages)`) };
+  }
+  if (x.owner === null) {
+    return { state: x.lastSeq > 0 ? "UNCLAIMABLE" : "VIRGIN", foreign, detail: x.lastSeq > 0 ? `UNCLAIMABLE: ${x.lastSeq} messages and no owner note` : "owner ABSENT (notes only?)", ...gen(x.lastSeq === 0, `server ${x.generation}`) };
+  }
+  if (x.owner !== x.adminDid) return { state: "FOREIGN", foreign, detail: `FOREIGN owner ${x.owner.slice(0, 24)}…`, ...gen(false, `server ${x.generation}`) };
+  const g = x.storedGeneration === null
+    ? gen(true, x.lastSeq === 0 ? "notes only, no message yet (pinned at the first messages)" : `server ${x.generation}, recorded none yet`)
+    : gen(x.generation === x.storedGeneration && x.lastSeq > 0, x.generation === x.storedGeneration ? `server ${x.generation} = recorded` : `CHANGED: recorded ${x.storedGeneration}, server ${x.generation}`);
+  return { state: "OURS", foreign, detail: `OURS: owner CC-ADMIN, allow-list ${x.allow === null ? "ABSENT" : `${allow.length} DIDs`}${foreign ? `, ${foreign} FOREIGN` : ""}, nonce ${x.nonce ?? "ABSENT"}, messages ${x.lastSeq}`, ...g };
+}
 
 export interface ReadinessDeps {
   now?: () => number;
@@ -67,7 +109,7 @@ async function serverNonces(base: string, room: string, f: typeof fetch): Promis
   return out;
 }
 
-export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode: "check" | "run" = "check", deps: ReadinessDeps = {}): Promise<{ pass: boolean; rows: ReadinessRow[] }> {
+export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode: ReadinessMode = "check", deps: ReadinessDeps = {}): Promise<{ pass: boolean; rows: ReadinessRow[] }> {
   const rows: ReadinessRow[] = [];
   const add = (name: string, ok: boolean, value: string, blocksRun = true) => rows.push({ name, ok, value, blocksRun });
   const nowMs = (deps.now ?? Date.now)();
@@ -121,8 +163,8 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
     add("referee seed", !!seed && seed.package === REFEREE_PACKAGE_SHA256 && seedFrom === REFEREE_DID,
       seed ? `package ${seed.package === REFEREE_PACKAGE_SHA256 ? "= pinned" : `CHANGED ${seed.package.slice(0, 12)}…`}, signed by ${seedFrom === REFEREE_DID ? "the referee" : `UNEXPECTED ${seedFrom}`}` : "no seed observed in the live DB yet");
     add("paper keys absent", listKeys(db).every((k) => k.fake === 0), `${listKeys(db).filter((k) => k.fake).length} fake keys in the live DB`);
-    add("admin key", !!admin && (isTradable(admin.status) || admin.status === "MINT_CONFIRMED"), admin ? `${admin.id} ${admin.status}` : "missing (CC-ADMIN)");
-    add("staging keys", staging.length === 2 && staging.every((k) => isTradable(k.status)), staging.map((k) => `${k.id}:${k.status}`).join(" ") || "none");
+    add("admin key", !!admin && (mode === "bootstrap" || isTradable(admin.status) || admin.status === "MINT_CONFIRMED"), admin ? `${admin.id} ${admin.status}` : "missing (CC-ADMIN)");
+    add("staging keys", staging.length === 2 && (mode === "bootstrap" || staging.every((k) => isTradable(k.status))), staging.map((k) => `${k.id}:${k.status}`).join(" ") || "none");
     add("staging trade", !!getMeta(db, "test_trade_settled"), getMeta(db, "test_trade_settled") ? `settled at sweep ${getMeta(db, "test_trade_settled")}` : "not settled yet");
     const readyStrategy = strategy.filter((k) => isTradable(k.status));
     add("strategy keys", readyStrategy.length >= 2 && readyStrategy.length === strategy.length, `${readyStrategy.length} READY of ${strategy.length} (${liveStrategyKeys(db).length / 2} pairs)`);
@@ -182,20 +224,31 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
       const have = cfg.decisionLeadMs - cfg.postGuardMs;
       add("deadline margin", need < have && cfg.postGuardMs >= 2 * tc.p95, `budget ${have} ms (lead ${cfg.decisionLeadMs} - guard ${cfg.postGuardMs}) vs ${need} ms needed for ${cfg.maxTradesPerSweep} trades at p95; guard ${cfg.postGuardMs} ms vs 2 x p95 = ${2 * tc.p95} ms`);
       if (cfg.room && admin) {
-        const own = await timed(async () => {
-          const o = await (await f(`${cfg.technocoreBaseUrl}/kv/room-owners/${cfg.room}`, { signal: AbortSignal.timeout(10_000) })).text();
-          const a = await (await f(`${cfg.technocoreBaseUrl}/kv/room-allow/${cfg.room}`, { signal: AbortSignal.timeout(10_000) })).text();
-          const strip = (t: string) => { const i = t.indexOf("\n\n"); return (i >= 0 ? t.slice(i + 2) : t).split("\n")[0].trim(); };
-          return { owner: strip(o), allow: strip(a).split(/\s+/).filter(Boolean) };
+        // Every read is status-aware: a 404 on a note is the semantic state ABSENT, never a value to parse.
+        const readNote = async (ns: string) => {
+          const res = await f(`${cfg.technocoreBaseUrl}/kv/${ns}/${cfg.room}`, { signal: AbortSignal.timeout(10_000) });
+          if (res.status === 404) { await res.text(); return null; }
+          if (!res.ok) throw new Error(`${ns}: HTTP ${res.status}`);
+          const t = await res.text();
+          const i = t.indexOf("\n\n");
+          return (i >= 0 ? t.slice(i + 2) : t).split("\n")[0].trim() || null;
+        };
+        const srv = await timed(async () => {
+          const res = await f(`${cfg.technocoreBaseUrl}/r/${cfg.room}?format=json&limit=1`, { signal: AbortSignal.timeout(10_000) });
+          if (!res.ok) throw new Error(`room read: HTTP ${res.status}`);
+          const view = JSON.parse(await res.text()) as { last_seq?: number; generation?: number };
+          return { owner: await readNote("room-owners"), allow: await readNote("room-allow"), nonce: await readNote("room-nonce"),
+            lastSeq: view.last_seq ?? 0, generation: view.generation ?? 0 };
         });
-        const okOwner = own.value?.owner === admin.did;
-        const foreign = own.value ? own.value.allow.filter((d) => !ourDids.has(d)) : [];
-        add("room on server", okOwner && foreign.length === 0, own.error ? `read failed: ${own.error}` : `owner ${okOwner ? "CC-ADMIN" : `NOT ours (${own.value?.owner || "missing"})`}, allow-list ${own.value?.allow.length} DIDs${foreign.length ? `, ${foreign.length} foreign` : ""}`);
-        const gen = await timed(async () => (JSON.parse(await (await f(`${cfg.technocoreBaseUrl}/r/${cfg.room}?format=json&limit=1`, { signal: AbortSignal.timeout(10_000) })).text()) as { generation?: number; last_seq?: number }));
         const stored = getMeta(db, `room_generation:${cfg.room}`);
-        const g = gen.value?.generation;
-        add("room generation", !gen.error && (gen.value?.last_seq ?? 0) > 0 && (stored === null || g === undefined || Number(stored) === g),
-          gen.error ? `read failed: ${gen.error}` : (gen.value?.last_seq ?? 0) === 0 ? "room has no messages (deleted?)" : `server ${g ?? "n/a"}, recorded ${stored ?? "none yet"}`);
+        const localState = (db.prepare("SELECT status FROM rooms_state WHERE name = ?").get(cfg.room) as { status: string } | undefined)?.status ?? "UNCREATED";
+        const everConfigured = stored !== null || localState !== "UNCREATED";
+        const rs = srv.value ? classifyRoom({ ...srv.value, adminDid: admin.did, ourDids, storedGeneration: stored === null ? null : Number(stored), everConfigured }) : null;
+        add("room on server", !!rs && (rs.state === "OURS" || (rs.state === "VIRGIN" && mode === "bootstrap")) && rs.foreign === 0,
+          srv.error ? `read failed: ${srv.error}` : rs!.detail, true);
+        rows[rows.length - 1].bootOptional = false;
+        add("room generation", !!rs && rs.generationOk && (rs.state !== "VIRGIN" || mode === "bootstrap"),
+          srv.error ? `read failed: ${srv.error}` : rs!.generationDetail);
         // Notes share /kv/room-nonce/<room>: the server counter must not be ahead of our last signed note.
         const rn = await timed(async () => { const res = await f(`${cfg.technocoreBaseUrl}/kv/room-nonce/${cfg.room}`, { signal: AbortSignal.timeout(10_000) }); if (!res.ok) return null; const t = await res.text(); const i = t.indexOf("\n\n"); return (i >= 0 ? t.slice(i + 2) : t).split("\n")[0].trim(); });
         const localNote = (db.prepare("SELECT MAX(CAST(last_nonce AS INTEGER)) m FROM nonces WHERE scope = ?").get(`note:${cfg.room}`) as { m: number | null }).m;
@@ -217,8 +270,9 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
   return finish(rows, mode);
 }
 
-function finish(rows: ReadinessRow[], mode: "check" | "run"): { pass: boolean; rows: ReadinessRow[] } {
-  return { pass: rows.every((r) => r.ok || (mode === "run" && r.blocksRun === false)), rows };
+function finish(rows: ReadinessRow[], mode: ReadinessMode): { pass: boolean; rows: ReadinessRow[] } {
+  for (const r of rows) if (r.bootOptional === undefined) r.bootOptional = BOOT_OPTIONAL.has(r.name);
+  return { pass: rows.every((r) => r.ok || (mode === "run" && r.blocksRun === false) || (mode === "bootstrap" && r.bootOptional)), rows };
 }
 
 export function renderReadiness(r: { pass: boolean; rows: ReadinessRow[] }): string {
