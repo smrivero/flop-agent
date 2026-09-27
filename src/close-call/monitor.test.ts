@@ -76,7 +76,7 @@ test("paper: title, WRITES DISABLED, fake keys, simulated trades, market and str
     assert.ok(out.includes(s), `missing: ${s}\n${out}`);
   }
   assert.ok(!out.includes("SERVICE DOWN"));
-  assert.match(out, /our global rank\s+N\/A/);
+  assert.match(out, /our rank\s+N\/A/);
 });
 
 test("live (simulated): LIVE title, WRITES ENABLED, REAL KEYS, real trades from the live DB", async () => {
@@ -291,8 +291,22 @@ test("LIVE --compact fits one screen; confirmed receipts are not nonce errors; a
   const compact = render(await collect(liveSrc(x)), { color: false, width: 150, compact: true });
   const lines = compact.split("\n");
   assert.ok(lines.length <= 40, `compact is ${lines.length} lines`);
-  for (const s of ["CLOSE CALL — LIVE", "TRADES (REAL)", "SAFETY", "STRATEGY K", "POSITIONS", "LEADERBOARD", "our global rank", "LIVE", "readiness", "PASS", "journal", "102/102"]) assert.ok(compact.includes(s), `missing ${s}\n${compact}`);
+  for (const s of ["CLOSE CALL — LIVE", "TRADES (REAL)", "SAFETY", "STRATEGY K", "POSITIONS", "LEADERBOARD", "our rank", "LIVE", "readiness", "PASS", "journal", "102/102"]) assert.ok(compact.includes(s), `missing ${s}\n${compact}`);
   for (const s of ["KEY CLASSES", "ENVIRONMENT", "LIVE JOURNAL", "  CREATED"]) assert.ok(!compact.includes(s), `compact still has ${s}`);
+});
+
+test("leaderboard rank compares at the referee's mark (global), not at the close (27 Sep: +224 vs +40.91)", async () => {
+  const x = liveDir();
+  // CC006 short 43.31 snapshotted at close 225.51 with value 10,000 - 14.73; the referee values everything at global 222.47
+  x.db.prepare("INSERT INTO positions (n, key_id, book, cash, position, fees, value, mark, at) VALUES (666, 'CC006', 'live', '1', '-43.31', '0', ?, '225.51', ?)").run(String(10_000 - 14.73), now());
+  x.db.prepare("INSERT INTO positions (n, key_id, book, cash, position, fees, value, mark, at) VALUES (666, 'CC001', 'live', '1', '43.99', '0', ?, '225.51', ?)").run(String(10_000 + 40.91), now());
+  x.db.prepare(`INSERT INTO sweeps (n, ref_px, mark, pnl_top, first_seen_at, updated_at) VALUES (666, '225.51', '222.47', ?, ?, ?)
+    ON CONFLICT(n) DO UPDATE SET ref_px = excluded.ref_px, mark = excluded.mark, pnl_top = excluded.pnl_top`)
+    .run(JSON.stringify([["did:key:zA", "224.01"], ["did:key:zB", "211.26"], ["did:key:zC", "150.00"], ["did:key:zD", "100.00"]]), now(), now());
+  const out = await text(liveSrc(x));
+  assert.match(out, /mark 222\.47 \(global\)/);
+  assert.match(out, /#1 CC006\s+\+116\.93/, "short re-valued at the referee's mark: -14.73 + 43.31 x 3.04");
+  assert.match(out, /our rank\s+≈#4 \(CC006 \+116\.93\)/);
 });
 
 test("LIVE candidate: writer disarmed (config or kill switch) -> LIVE CANDIDATE, WRITES DISABLED, readiness FAIL", async () => {

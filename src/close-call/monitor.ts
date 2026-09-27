@@ -46,7 +46,7 @@ export interface MonitorData {
   keys: { total: number; by: Record<string, number>; kind: "FAKE" | "REAL" | "N/A" };
   positions: { sweep: N<number>; markSweep: N<number>; mark: N<string>; long: N<number>; short: N<number>; flat: N<number>; longQty: N<number>; shortQty: N<number>; cash: N<number>;
     collateral: N<number>; fees: N<number>; realized: N<number>; markPnl: N<number>; top: { id: string; side: string; entry: N<string>; qty: number; score: number }[] };
-  leaderboard: { sweep: N<number>; global: { who: string; score: string }[]; ours: { id: string; score: number }[]; rank: string };
+  leaderboard: { sweep: N<number>; mark: N<string>; global: { who: string; score: string }[]; ours: { id: string; score: number }[]; rank: string };
   strategy: { status: string; threshold: number; lo: N<number>; hi: N<number>; nextLo: N<number>; nextHi: N<number>; pairsUsed: N<number>; pairsUnused: N<number>;
     lastTrigger: N<string>; lastTriggerSweep: N<number>; estimator: N<string>; stale: N<StaleDecision>; staleReason: N<string> };
   trades: { simulated: boolean; total: N<number>; settled: N<number>; void: N<number>; pending: N<number>; unknown: N<number>;
@@ -267,18 +267,27 @@ export async function collect(src: MonitorSources): Promise<MonitorData> {
   };
 
   // ---- leaderboard
-  const lb = q<{ n: number; pnl_top: string }>(db, "SELECT n, pnl_top FROM sweeps WHERE pnl_top IS NOT NULL ORDER BY n DESC LIMIT 1");
+  // The referee's pnl list is valued at ITS mark (= the global price, checked by L1), not at the close: our keys are
+  // re-valued at that same mark before comparing, otherwise the rank compares two different prices.
+  const lb = q<{ n: number; pnl_top: string; mark: string | null }>(db, "SELECT n, pnl_top, mark FROM sweeps WHERE pnl_top IS NOT NULL ORDER BY n DESC LIMIT 1");
   const globalTop = lb ? safe(() => JSON.parse(lb.pnl_top) as [string, string][], []) : [];
+  const refMark = lb?.mark ?? null;
+  const atRef = prow0.filter((r) => r.value !== null && r.mark !== null && refMark !== null)
+    .map((r) => ({ id: r.key_id, score: +((Number(r.value) + Number(r.position) * (Number(refMark) - Number(r.mark)) - 10_000).toFixed(2)) }))
+    .sort((a, b) => b.score - a.score);
   let rank = "N/A";
   if (live && globalTop.length) {
     const ours = new Set(qa<{ did: string }>(exec, "SELECT did FROM keys WHERE fake = 0").map((r) => r.did));
     const i = globalTop.findIndex(([d]) => ours.has(d));
-    if (i >= 0) rank = `#${i + 1}`;
-    else if (scored.length && scored[0].score < Number(globalTop[globalTop.length - 1][1])) rank = `below #${globalTop.length} (not in the published top)`;
+    if (i >= 0) rank = `#${i + 1} (listed)`;
+    else if (atRef.length) {
+      const above = globalTop.filter(([, sc]) => Number(sc) > atRef[0].score).length;
+      rank = above < globalTop.length ? `≈#${above + 1} (${atRef[0].id} ${signed(atRef[0].score, 2)})` : `below #${globalTop.length} (need > ${globalTop[globalTop.length - 1][1]})`;
+    }
   }
   const leaderboard: MonitorData["leaderboard"] = {
-    sweep: lb?.n ?? null, global: globalTop.slice(0, 3).map(([d, s]) => ({ who: `…${d.slice(-8)}`, score: s })),
-    ours: scored.slice(0, 3).map((s) => ({ id: s.id, score: s.score })), rank: live ? rank : "N/A (paper keys are not in the game)",
+    sweep: lb?.n ?? null, mark: refMark, global: globalTop.slice(0, 3).map(([d, s]) => ({ who: `…${d.slice(-8)}`, score: s })),
+    ours: (atRef.length ? atRef : scored).slice(0, 3).map((s) => ({ id: s.id, score: s.score })), rank: live ? rank : "N/A (paper keys are not in the game)",
   };
 
   // ---- strategy K
@@ -486,10 +495,10 @@ export function render(d: MonitorData, opts: { color: boolean; width: number; co
   ]);
 
   const lb = d.leaderboard;
-  blocks.push([p.bold("LEADERBOARD") + p.dim(lb.sweep !== null ? ` @${lb.sweep}` : ""),
+  blocks.push([p.bold("LEADERBOARD") + p.dim(lb.sweep !== null ? ` @${lb.sweep}${lb.mark ? ` mark ${lb.mark} (global)` : ""}` : ""),
     p.dim("GLOBAL"), ...(lb.global.length ? lb.global.map((g, i) => row(`#${i + 1} ${g.who}`, `+${g.score}`)) : [NA]),
-    p.dim("OUR TOP"), ...(lb.ours.length ? lb.ours.map((o, i) => row(`#${i + 1} ${o.id}`, signed(o.score, 2))) : [NA]),
-    row("our global rank", lb.rank),
+    p.dim(lb.mark ? `OUR TOP (at the same mark ${lb.mark})` : "OUR TOP"), ...(lb.ours.length ? lb.ours.map((o, i) => row(`#${i + 1} ${o.id}`, signed(o.score, 2))) : [NA]),
+    row("our rank", lb.rank),
   ]);
 
   const s = d.strategy;
