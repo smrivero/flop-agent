@@ -41,6 +41,27 @@ export interface StrategyKConfig {
   untilPolicy: UntilPolicy;
 }
 
+/**
+ * CONTRA (strategy/contra.ts), a module separate from Strategy K. The reserved keys are taken out of K's key list
+ * whenever `keys` is set (so they stay virgin while the operator decides); CONTRA trades only when `enabled`.
+ */
+export interface ContraConfig {
+  /** Kill switch, independent of the live writer: no CONTRA intent unless true (default false). */
+  enabled: boolean;
+  /** Reserved keys, in order: champion LONG, its counterparties, champion SHORT, its counterparties. [] = none. */
+  keys: string[];
+  /** Take profit and reverse when the estimate moves this far in the champion's favour (0.0025 = 0.25%). */
+  threshold: number;
+  /** Counterparties per champion (each leg burns one, never reused). */
+  counterparties: number;
+  /**
+   * Cash each side keeps unspent on an OPEN/REOPEN leg (0.04 = 4%). An all-in champion could not pay the fee of its
+   * own close (~1.1% of the position), and a fresh counterparty buying the close ~2.4% above the entry price could not
+   * take the whole position: without this reserve the close is partial and the reopen becomes a flip (refused).
+   */
+  reserve: number;
+}
+
 export interface StalePolicyConfig {
   mode: StaleMode;
   /** adaptive: referee age_s at or above this -> REDUCE (wider margins). */
@@ -74,6 +95,7 @@ export interface CloseCallConfig {
   hlStaleMs: number;
   refereeStaleAgeS: number;
   strategy: StrategyKConfig;
+  contra: ContraConfig;
   stalePriceMargin: number;
   staleQtyMargin: number;
   stalePolicy: StalePolicyConfig;
@@ -178,6 +200,7 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
       reserve: num(env, "CLOSECALL_RESERVE", 0, 0, 0.5),
       untilPolicy: oneOf(env, "CLOSECALL_UNTIL_POLICY", ["this-sweep", "next-sweep"] as const, "this-sweep"),
     },
+    contra: contraConfig(env),
     stalePriceMargin: num(env, "CLOSECALL_STALE_PRICE_MARGIN", 0.004, 0, 0.04),
     staleQtyMargin: num(env, "CLOSECALL_STALE_QTY_MARGIN", 0.012, 0, 0.05),
     stalePolicy: {
@@ -218,6 +241,31 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
     liveWriter: oneOf(env, "CLOSECALL_LIVE_WRITER", ["armed", "disarmed"] as const, "disarmed"),
     maxTradesPerSweep: num(env, "CLOSECALL_MAX_TRADES_PER_SWEEP", 6, 1, 50),
   };
+}
+
+/** CLOSECALL_CONTRA_KEYS=CC061-CC100 (a range) or a comma list; CLOSECALL_CONTRA_ENABLED=true to trade. */
+function contraConfig(env: NodeJS.ProcessEnv): ContraConfig {
+  const counterparties = num(env, "CLOSECALL_CONTRA_COUNTERPARTIES", 19, 1, 48);
+  const threshold = num(env, "CLOSECALL_CONTRA_THRESHOLD", 0.0025, 0.0005, 0.1);
+  const raw = env.CLOSECALL_CONTRA_KEYS?.trim() ?? "";
+  let keys: string[] = [];
+  const range = raw.match(/^CC(\d{3})-CC(\d{3})$/);
+  if (range) {
+    const [a, b] = [Number(range[1]), Number(range[2])];
+    if (b < a) throw new CloseCallConfigError(`CLOSECALL_CONTRA_KEYS range is backwards: ${raw}`);
+    keys = Array.from({ length: b - a + 1 }, (_, i) => `CC${String(a + i).padStart(3, "0")}`);
+  } else if (raw) {
+    keys = raw.split(",").map((k) => k.trim()).filter(Boolean);
+    if (keys.some((k) => !/^CC\d{3}$/.test(k))) throw new CloseCallConfigError(`CLOSECALL_CONTRA_KEYS must be CCnnn-CCnnn or a CCnnn list, got ${JSON.stringify(raw)}`);
+  }
+  if (new Set(keys).size !== keys.length) throw new CloseCallConfigError("CLOSECALL_CONTRA_KEYS lists a key twice");
+  if (keys.length && keys.length !== 2 * (1 + counterparties)) {
+    throw new CloseCallConfigError(`CLOSECALL_CONTRA_KEYS must hold exactly ${2 * (1 + counterparties)} keys (2 champions x (1 + ${counterparties} counterparties)), got ${keys.length}`);
+  }
+  const enabled = bool(env, "CLOSECALL_CONTRA_ENABLED", false);
+  if (enabled && !keys.length) throw new CloseCallConfigError("CLOSECALL_CONTRA_ENABLED=true needs CLOSECALL_CONTRA_KEYS");
+  const reserve = num(env, "CLOSECALL_CONTRA_RESERVE", 0.04, 0, 0.5);
+  return { enabled, keys, threshold, counterparties, reserve };
 }
 
 function roomName(raw: string | undefined): string | null {

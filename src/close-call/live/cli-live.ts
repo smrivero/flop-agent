@@ -3,6 +3,8 @@
  *
  *   status                               live DB: keys, room, backup gate, pending writes, halts (no network)
  *   unhalt --code <code>                 clear a GRAVE halt in the LIVE DB (the code is in `live status`)
+ *   contra-shadow [--warmup 24] [--minutes 30]
+ *                                        CONTRA on the live feed, hypothetically (read-only; fake keys; nothing signed or sent)
  *   import-seed --from <paper DB>        one-time: the referee's signed seed post (rotated out of technocore's ring),
  *                                        verified on its own, from the paper DB opened read-only. Nothing else copied.
  *   keygen --total N --i-understand-these-are-real-keys
@@ -45,6 +47,7 @@ import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
 import { liveReadiness, renderReadiness } from "./readiness.js";
 import { renderDrill, restoreDrill } from "./restore-drill.js";
+import { contraShadow } from "../contra-shadow.js";
 import { importSeed, seedImportProvenance, SeedImportRefused } from "./import-seed.js";
 import { generateKeys, KeygenRefused, loadSigners, verifyRestoredKeyDir } from "./keygen.js";
 
@@ -58,6 +61,12 @@ async function main(argv: string[]): Promise<number> {
   const arg = (name: string) => { const i = argv.indexOf(name); return i >= 0 ? argv[i + 1] : undefined; };
   const cfg = loadCloseCallConfig();
   const contest = loadContest(cfg.vendorRoot);
+
+  if (cmd === "contra-shadow") {
+    // Hypothetical CONTRA on the live feed: live DB read-only, fake keys, nothing signed or sent, no lock.
+    await contraShadow(cfg, contest, { warmup: Number(arg("--warmup") ?? 24), minutes: Number(arg("--minutes") ?? 30), from: arg("--from") ? Number(arg("--from")) : undefined, out });
+    return 0;
+  }
 
   if (cmd === "restore-drill") {
     // Run on a RESTORED live data dir (CLOSECALL_DATA_DIR / DB paths point at it); offline, read only.

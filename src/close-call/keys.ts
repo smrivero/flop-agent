@@ -60,7 +60,7 @@ export const POLICY_ACCEPTS: Record<ConfirmationPolicyName, readonly EvidenceSou
 };
 
 export class IllegalTransition extends Error {}
-export type StrategyRole = "long*" | "short*" | "long" | "short" | null;
+export type StrategyRole = "long*" | "short*" | "long" | "short" | `contra-${"champion" | "cp"}-${"long" | "short"}` | null;
 
 export interface KeyRecord {
   id: string;
