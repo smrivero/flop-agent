@@ -53,29 +53,40 @@ export class RefereeObserver {
     private staleAgeS = 300,
   ) {}
 
-  /** Read every referee room forward from its cursor. Never throws on a single room's failure. */
-  async pollOnce(): Promise<ObserverEvent[]> {
-    if (this.backoffMs > 0) {
-      const wait = this.backoffMs;
-      await new Promise((r) => setTimeout(r, wait));
-    }
+  /** When the next poll may run (backoff). Never slept on: the service loop must keep deciding meanwhile. */
+  private retryAt = 0;
+
+  /**
+   * Read every referee room forward from its cursor. Never throws. After a failure the observer backs off WITHOUT
+   * blocking (the call returns [] until the backoff has passed), and a timeout / network error ends this poll at once:
+   * technocore unreachable costs one timeout per poll, not one per room (29 Sep: 5 rooms x 20 s + a slept 60 s backoff
+   * stalled the whole service loop for minutes).
+   */
+  async pollOnce(nowMs = Date.now()): Promise<ObserverEvent[]> {
+    if (nowMs < this.retryAt) return [];
     const events: ObserverEvent[] = [];
     for (const room of REFEREE_ROOMS) {
       try {
         events.push(...(await this.readRoom(room)));
         this.backoffMs = 0;
+        this.retryAt = 0;
         this.lastOkAt = Date.now();
       } catch (e) {
-        const err = e as Error;
+        const err = e as { name?: unknown; message?: unknown };
+        const name = typeof err?.name === "string" ? err.name : "";
+        const message = typeof err?.message === "string" ? err.message : String(e);
         this.errors++;
-        if (err.name === "TimeoutError" || err.name === "AbortError") this.timeouts++;
-        if (err instanceof HttpStatusError && err.status === 429) {
-          this.backoffMs = Math.min(120_000, Math.max(5_000, (err.retryAfterS ?? 0) * 1000, this.backoffMs * 2));
+        if (name === "TimeoutError" || name === "AbortError") this.timeouts++;
+        if (e instanceof HttpStatusError && e.status === 429) {
+          this.backoffMs = Math.min(120_000, Math.max(5_000, (e.retryAfterS ?? 0) * 1000, this.backoffMs * 2));
+          this.retryAt = Date.now() + this.backoffMs;
           ccLog("ERROR", { stage: "observe", room, status: 429, backoff_ms: this.backoffMs });
           break;
         }
         this.backoffMs = Math.min(60_000, Math.max(2_000, this.backoffMs * 2));
-        ccLog("ERROR", { stage: "observe", room, error: err.message, backoff_ms: this.backoffMs });
+        this.retryAt = Date.now() + this.backoffMs;
+        ccLog("ERROR", { stage: "observe", room, error: message, backoff_ms: this.backoffMs });
+        if (!(e instanceof HttpStatusError)) break;                   // unreachable / timeout: the other rooms would wait too
       }
     }
     return events;

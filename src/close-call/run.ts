@@ -40,6 +40,51 @@ export interface RunOptions {
   canTrade?: () => string | null;
   /** Live: room upkeep (RoomKeeper.tick: ownership/allow-list/existence check, 5-day refresh, keepalive), every minute. */
   maintenance?: () => Promise<unknown>;
+  /** Tests: the network (technocore + Hyperliquid). */
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * An error's code, only when it is a string. A network timeout from AbortSignal.timeout() is a DOMException whose
+ * `code` is the NUMBER 23: `err.code?.startsWith(...)` then throws inside the catch itself (29 Sep: that TypeError
+ * escaped the stage guard, ended the service loop at sweep 961 and the restarts hit the same technocore timeouts).
+ */
+export function errorCode(e: unknown): string | null {
+  const c = (e as { code?: unknown } | null)?.code;
+  return typeof c === "string" ? c : null;
+}
+
+/** A printable message for anything thrown (an Error, a DOMException, a string, an object, null). */
+export function errorText(e: unknown): string {
+  if (e instanceof Error) return e.message;
+  if (typeof e === "object" && e !== null && typeof (e as { message?: unknown }).message === "string") return (e as { message: string }).message;
+  return String(e);
+}
+
+/**
+ * The stage guard of the service loop: a failing stage is logged and the loop goes on. Only a real SQLite error
+ * (string code SQLITE_*, not BUSY) halts as db_corruption. Never throws, whatever was thrown.
+ */
+export function makeGuard(db: CcDb, onError: (stage: string, text: string) => void, alerts?: Alerts) {
+  return async <T>(stage: string, fn: () => Promise<T> | T): Promise<T | undefined> => {
+    try {
+      return await fn();
+    } catch (e) {
+      try {
+        const text = errorText(e);
+        onError(stage, text);
+        ccLog("ERROR", { stage, name: (e as { name?: unknown } | null)?.name ?? typeof e, error: (e as { stack?: unknown } | null)?.stack ?? text });
+        const code = errorCode(e);
+        if (code !== null && code.startsWith("SQLITE_") && !code.includes("BUSY")) {
+          halt(db, "db_corruption", `${stage}: ${code} ${text}`, alerts);
+          if (alerts) void alerts.raise({ event: "db_error", severity: "critical", message: `${stage}: ${code}` });
+        }
+      } catch (inner) {
+        process.stderr.write(`[CLOSECALL][ERROR] stage=${stage} error handler failed: ${String(inner)}\n`);
+      }
+      return undefined;
+    }
+  };
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
@@ -72,8 +117,8 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
       message: cleanStop ? "service restarted after a clean stop" : `service restarted after an unclean stop (last heartbeat ${prevBeat})` });
   }
 
-  const observer = new RefereeObserver(db, cfg.technocoreBaseUrl, cfg.rawLogDir, fetch, cfg.refereeStaleAgeS);
-  const hl = new HyperliquidObserver(db, cfg.hyperliquidInfoUrl, cfg.hyperliquidCoin);
+  const observer = new RefereeObserver(db, cfg.technocoreBaseUrl, cfg.rawLogDir, opts.fetchImpl ?? fetch, cfg.refereeStaleAgeS);
+  const hl = new HyperliquidObserver(db, cfg.hyperliquidInfoUrl, cfg.hyperliquidCoin, opts.fetchImpl ?? fetch);
   const folds: OfficialFold[] = [];
   let paper: PaperTrader | null = null;
   let server: Server | null = null;
@@ -82,20 +127,7 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
     estimator: cfg.estimator, stale_policy: cfg.stalePolicy, confirmation_policy: cfg.confirmationPolicy, strategy: opts.paper ? cfg.strategy : undefined,
     writes: opts.executor ? "LIVE: signed trades are posted by the LiveExecutor" : "NONE (paper/observe: no writer exists in this process)" });
 
-  const guard = async <T>(stage: string, fn: () => Promise<T> | T): Promise<T | undefined> => {
-    try {
-      return await fn();
-    } catch (e) {
-      const err = e as Error & { code?: string };
-      rt.lastError = `${stage}: ${err.message}`;
-      ccLog("ERROR", { stage, error: err.stack ?? String(e) });
-      if (err.code?.startsWith("SQLITE_") && !/BUSY/.test(err.code)) {
-        halt(db, "db_corruption", `${stage}: ${err.code} ${err.message}`, alerts);
-        void alerts.raise({ event: "db_error", severity: "critical", message: `${stage}: ${err.code}` });
-      }
-      return undefined;
-    }
-  };
+  const guard = makeGuard(db, (stage, text) => { rt.lastError = `${stage}: ${text}`; }, alerts);
 
   try {
     await guard("observe", () => observer.pollOnce());
@@ -129,7 +161,9 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
     let lastStateSweep = -1;
     const decided = new Set<number>();
 
+    let loopErrors = 0;
     while (!stop) {
+     try {
       const t = Date.now();
       if (opts.maxMinutes && t - started > opts.maxMinutes * 60_000) {
         ccLog("START", { minutes: opts.maxMinutes }, "time limit reached, stopping");
@@ -198,7 +232,15 @@ export async function runLoop(db: CcDb, cfg: CloseCallConfig, contest: Contest, 
         await guard("safety", () => safetyChecks(db, cfg, rt, alerts, observer, hl, t));
         setMeta(db, "heartbeat", new Date(t).toISOString());
       }
+      loopErrors = 0;
       await sleep(1_000);
+     } catch (e) {
+      // Last line of defence: nothing thrown by one iteration ends the service. Log, back off, go on observing.
+      loopErrors++;
+      rt.lastError = `loop: ${errorText(e)}`;
+      try { ccLog("ERROR", { stage: "loop", consecutive: loopErrors, error: (e as { stack?: unknown } | null)?.stack ?? errorText(e) }, "loop iteration failed: backing off, the service keeps running"); } catch { /* logging must not kill the loop */ }
+      await sleep(Math.min(60_000, 2_000 * loopErrors));
+     }
     }
   } finally {
     server?.close();

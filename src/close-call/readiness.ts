@@ -276,6 +276,16 @@ function finish(rows: ReadinessRow[], mode: ReadinessMode): { pass: boolean; row
   return { pass: rows.every((r) => r.ok || (mode === "run" && r.blocksRun === false) || (mode === "bootstrap" && r.bootOptional)), rows };
 }
 
+/**
+ * What stops `live run` from starting. A DISARMED writer does not: the service then starts in catch-up / observe
+ * mode (no intent, no signature, no POST) and the operator arms it later with `live arm`, which re-runs the gate.
+ * With the writer disarmed, only GRAVE halts block the start: a transient one (referee_stale left by an outage)
+ * clears itself once the service observes again -- it could never clear if it kept the service from starting.
+ */
+export function runStartBlockers(rows: ReadinessRow[], writerArmed: boolean, onlyTransientHalts: boolean): ReadinessRow[] {
+  return rows.filter((r) => !r.ok && r.name !== "writer" && !(r.name === "not halted" && !writerArmed && onlyTransientHalts));
+}
+
 export function renderReadiness(r: { pass: boolean; rows: ReadinessRow[] }): string {
   return [...r.rows.map((x) => `${x.name.padEnd(26)}${x.ok ? "" : "FAIL  "}${x.value}`), "", `LIVE READINESS: ${r.pass ? "PASS" : "FAIL"}`].join("\n");
 }

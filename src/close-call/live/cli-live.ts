@@ -35,7 +35,7 @@ import { acquireLock, LockHeldError } from "../lock.js";
 import { ccLog, setLogSink, setQuiet } from "../logger.js";
 import { RefereeObserver } from "../observer.js";
 import { getRoom } from "../room.js";
-import { disarm, halt, haltSummary, rearm, unhalt, writerState } from "../safety.js";
+import { activeHalts, disarm, halt, haltSummary, rearm, unhalt, writerState } from "../safety.js";
 import { openCloseCallDb } from "../store.js";
 import { openReadonly } from "../monitor.js";
 import { mkdirSync, writeFileSync } from "node:fs";
@@ -46,6 +46,7 @@ import { banner, runLoop } from "../run.js";
 import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
 import { liveReadiness, renderReadiness } from "./readiness.js";
+import { runStartBlockers } from "../readiness.js";
 import { renderDrill, restoreDrill } from "./restore-drill.js";
 import { contraShadow } from "../contra-shadow.js";
 import { importSeed, seedImportProvenance, SeedImportRefused } from "./import-seed.js";
@@ -115,9 +116,16 @@ async function main(argv: string[]): Promise<number> {
   if (cmd === "run") {
     const r = await liveReadiness(cfg, contest, "run", { envFile });
     process.stdout.write(banner("live") + "\n");
-    if (!r.pass) {
-      process.stderr.write(renderReadiness(r) + "\n[CLOSECALL][HALT] live readiness FAILED: refusing to start. NO WRITE.\n");
+    const armedAtStart = writerState(cfg).armed;
+    const halts = (() => { const { db: h } = openReadonly(cfg.liveDbPath); if (!h) return []; try { return Object.values(activeHalts(h)); } finally { h.close(); } })();
+    const blockers = runStartBlockers(r.rows, armedAtStart, halts.every((x) => x.severity === "transient"));
+    if (blockers.length) {
+      process.stderr.write(renderReadiness(r) + `\n[CLOSECALL][HALT] live readiness FAILED (${blockers.map((x) => x.name).join(", ")}): refusing to start. NO WRITE.\n`);
       return 3;
+    }
+    if (!armedAtStart) {
+      process.stderr.write(`[CLOSECALL][SAFE MODE] starting DISARMED (${writerState(cfg).reason}): catch-up / observe only -- no intent, no signature, no POST. ` +
+        "When caught up: flop-closecall live-check, then flop-closecall live arm (it re-runs the gate).\n");
     }
     const lock = await acquireLock(cfg.lockPath, "close-call live run");
     setLogSink(cfg.logDir);
