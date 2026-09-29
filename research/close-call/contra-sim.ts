@@ -20,7 +20,7 @@ import { decideStale } from "../../src/close-call/stale-policy.js";
 export type Dir = 1 | -1;
 export interface Info { n: number; close: Micro; ref: Micro; est: Micro | null; limits: [Micro, Micro]; policy: "TRADE" | "REDUCE" | "HALT_NEW_ENTRIES" }
 export interface ChampSpec { x: number; dir: Dir; cps: number }
-export interface Portfolio { name: string; kPairs: number; kX?: number; champs: ChampSpec[] }
+export interface Portfolio { name: string; kPairs: number; kX?: number; champs: ChampSpec[]; /** K resumes from these levels (live state) instead of the first estimate */ kLo?: number; kHi?: number }
 export interface SimTrade { n: number; role: string; buyer: string; seller: string; qty: string; px: string }
 export interface RunOut {
   best: number; bestKey: string; scores: Map<string, number>; champScores: number[]; keysUsed: number; flips: number[]; cpsUsed: number[];
@@ -81,7 +81,7 @@ export function makeSim(cfg: CloseCallConfig, P: FoldParams, dids: string[]) {
     });
     const kKeys: string[] = [];
     for (let i = 0; i < pf.kPairs * 2; i++) { const k = takeKey(); if (k) kKeys.push(k); }
-    let kNext = 0, lo = 0, hi = 0;
+    let kNext = 0, lo = pf.kLo ?? 0, hi = pf.kHi ?? 0;
     const kx = pf.kX ?? cfg.strategy.threshold;
     const voids: Record<string, number> = {};
     const trades: WireTrade[][] = [];
