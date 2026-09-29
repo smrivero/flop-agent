@@ -50,10 +50,13 @@ export interface ContraConfig {
   enabled: boolean;
   /** Reserved keys, in order: champion LONG, its counterparties, champion SHORT, its counterparties. [] = none. */
   keys: string[];
-  /** Take profit and reverse when the estimate moves this far in the champion's favour (0.0025 = 0.25%). */
-  threshold: number;
-  /** Counterparties per champion (each leg burns one, never reused). */
-  counterparties: number;
+  /**
+   * Per champion (named by its START direction): take profit and reverse when the estimate moves this far in its
+   * favour (0.0025 = 0.25%). CLOSECALL_CONTRA_THRESHOLD sets both; _THRESHOLD_LONG / _THRESHOLD_SHORT override one.
+   */
+  threshold: { long: number; short: number };
+  /** Counterparties per champion (each leg burns one, never reused). _COUNTERPARTIES sets both; _LONG / _SHORT override. */
+  counterparties: { long: number; short: number };
   /**
    * Cash each side keeps unspent on an OPEN/REOPEN leg (0.04 = 4%). An all-in champion could not pay the fee of its
    * own close (~1.1% of the position), and a fresh counterparty buying the close ~2.4% above the entry price could not
@@ -245,8 +248,11 @@ export function loadCloseCallConfig(env: NodeJS.ProcessEnv = process.env, cwd = 
 
 /** CLOSECALL_CONTRA_KEYS=CC061-CC100 (a range) or a comma list; CLOSECALL_CONTRA_ENABLED=true to trade. */
 function contraConfig(env: NodeJS.ProcessEnv): ContraConfig {
-  const counterparties = num(env, "CLOSECALL_CONTRA_COUNTERPARTIES", 19, 1, 48);
-  const threshold = num(env, "CLOSECALL_CONTRA_THRESHOLD", 0.0025, 0.0005, 0.1);
+  const cps = num(env, "CLOSECALL_CONTRA_COUNTERPARTIES", 19, 1, 96);
+  const counterparties = { long: num(env, "CLOSECALL_CONTRA_COUNTERPARTIES_LONG", cps, 1, 96), short: num(env, "CLOSECALL_CONTRA_COUNTERPARTIES_SHORT", cps, 1, 96) };
+  const x = num(env, "CLOSECALL_CONTRA_THRESHOLD", 0.0025, 0.0005, 0.1);
+  const threshold = { long: num(env, "CLOSECALL_CONTRA_THRESHOLD_LONG", x, 0.0005, 0.1), short: num(env, "CLOSECALL_CONTRA_THRESHOLD_SHORT", x, 0.0005, 0.1) };
+  const total = 2 + counterparties.long + counterparties.short;
   const raw = env.CLOSECALL_CONTRA_KEYS?.trim() ?? "";
   let keys: string[] = [];
   const range = raw.match(/^CC(\d{3})-CC(\d{3})$/);
@@ -259,8 +265,8 @@ function contraConfig(env: NodeJS.ProcessEnv): ContraConfig {
     if (keys.some((k) => !/^CC\d{3}$/.test(k))) throw new CloseCallConfigError(`CLOSECALL_CONTRA_KEYS must be CCnnn-CCnnn or a CCnnn list, got ${JSON.stringify(raw)}`);
   }
   if (new Set(keys).size !== keys.length) throw new CloseCallConfigError("CLOSECALL_CONTRA_KEYS lists a key twice");
-  if (keys.length && keys.length !== 2 * (1 + counterparties)) {
-    throw new CloseCallConfigError(`CLOSECALL_CONTRA_KEYS must hold exactly ${2 * (1 + counterparties)} keys (2 champions x (1 + ${counterparties} counterparties)), got ${keys.length}`);
+  if (keys.length && keys.length !== total) {
+    throw new CloseCallConfigError(`CLOSECALL_CONTRA_KEYS must hold exactly ${total} keys (2 champions + ${counterparties.long} + ${counterparties.short} counterparties), got ${keys.length}`);
   }
   const enabled = bool(env, "CLOSECALL_CONTRA_ENABLED", false);
   if (enabled && !keys.length) throw new CloseCallConfigError("CLOSECALL_CONTRA_ENABLED=true needs CLOSECALL_CONTRA_KEYS");

@@ -34,7 +34,7 @@ const Q = 43_000_000n;                                                          
 // ------------------------------------------------------------------ pure state machine
 const KEYS = Array.from({ length: 40 }, (_, i) => `CC${String(61 + i).padStart(3, "0")}`);
 const SPECS = contraSpecs(KEYS, 19);
-const decide = (s: ContraState, e: number, pos: Record<string, bigint> = {}, sweep = 100) => contraDecide(s, SPECS, 0.0025, { sweep, estimate: e, lockSweep: 2556, positions: pos });
+const decide = (s: ContraState, e: number, pos: Record<string, bigint> = {}, sweep = 100) => contraDecide(s, SPECS, { sweep, estimate: e, lockSweep: 2556, positions: pos });
 
 test("CONTRA layout: champion LONG CC061 + CC062..CC080, champion SHORT CC081 + CC082..CC100", () => {
   assert.equal(SPECS[0].champion, "CC061");
@@ -296,4 +296,17 @@ test("live: a reserved key that already traded (not virgin) -> CONTRA stays OFF;
   const sent = await p.decide(3, true, at(3));
   assert.equal(sent.filter((s) => s.contra).length, 0);
   assert.ok(sent.length > 0, "K still trades");
+});
+
+test("CONTRA per champion: its own threshold and its own counterparty count (layout long, cps, short, cps)", () => {
+  const keys = Array.from({ length: 40 }, (_, i) => `K${i}`);
+  const specs = contraSpecs(keys, { long: 24, short: 14 }, { long: 0.0025, short: 0.01 });
+  assert.deepEqual([specs[0].champion, specs[0].counterparties.length, specs[1].champion, specs[1].counterparties.length], ["K0", 24, "K25", 14]);
+  let s = contraDecide(contraInitial(specs), specs, { sweep: 1, estimate: 100, lockSweep: 2556, positions: {} }).state;
+  const r = contraDecide(s, specs, { sweep: 2, estimate: 99.5, lockSweep: 2556, positions: { K0: Q, K25: -Q } });
+  assert.deepEqual(r.intents.map((i) => i.champion), [], "-0.5%: below the short champion's 1% and against the long");
+  s = contraDecide(s, specs, { sweep: 2, estimate: 100.3, lockSweep: 2556, positions: { K0: Q, K25: -Q } }).state;
+  assert.equal(s.champions[0].flips, 1, "+0.3%: the 0.25% long champion flips");
+  assert.equal(s.champions[1].flips, 0, "the 1% short champion does not");
+  assert.throws(() => contraSpecs(keys, 19, 0.0025).length && contraSpecs(keys.slice(1), 19), /needs 40 keys/);
 });

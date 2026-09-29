@@ -32,7 +32,7 @@ for (const [from, to] of windows) {
   const idOf = new Map(r.trader.allKeys().map((k) => [k.did, k.id]));
   const dids = cfg.contra.keys.map((id) => r.trader.allKeys().find((k) => k.id === id)!.did);
   const info = loadInfo(r.db as never, cfg, contest).filter((i) => i.n >= from - 1 && i.n <= to);
-  const sim = makeSim(cfg, foldParams(contest), dids)({ name: "B", kPairs: 0, champs: [{ x: cfg.contra.threshold, dir: 1, cps: 19 }, { x: cfg.contra.threshold, dir: -1, cps: 19 }] }, info);
+  const sim = makeSim(cfg, foldParams(contest), dids)({ name: "B", kPairs: 0, champs: [{ x: cfg.contra.threshold.long, dir: 1, cps: 19 }, { x: cfg.contra.threshold.short, dir: -1, cps: 19 }] }, info);
   const e = eng.map((x) => `${x.n} ${x.trigger.split(":")[0]} ${x.b}>${x.s} ${x.qty}@${x.px}`);
   const s = sim.log.map((x) => `${x.n} ${x.role.split(":")[0]} ${idOf.get(x.buyer)}>${idOf.get(x.seller)} ${x.qty}@${x.px}`);
   const legsOk = JSON.stringify(e) === JSON.stringify(s);

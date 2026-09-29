@@ -31,14 +31,15 @@ function bestRealKey(liveDbPath: string, close: number): string {
 export async function contraShadow(cfg: CloseCallConfig, contest: Contest, o: { warmup: number; minutes: number; from?: number; out: (s: string) => void }): Promise<void> {
   const from = o.from ?? lastClosedSweep(contest, Date.now()) + 1 - o.warmup;
   const env: Record<string, string> = {
-    CLOSECALL_KEY_COUNT: String(2 * (1 + cfg.contra.counterparties)), CLOSECALL_CONTRA_KEYS: `CC001-CC${String(2 * (1 + cfg.contra.counterparties)).padStart(3, "0")}`,
-    CLOSECALL_CONTRA_ENABLED: "true", CLOSECALL_CONTRA_THRESHOLD: String(cfg.contra.threshold), CLOSECALL_CONTRA_COUNTERPARTIES: String(cfg.contra.counterparties),
+    CLOSECALL_KEY_COUNT: String(2 + cfg.contra.counterparties.long + cfg.contra.counterparties.short),
+    CLOSECALL_CONTRA_KEYS: `CC001-CC${String(2 + cfg.contra.counterparties.long + cfg.contra.counterparties.short).padStart(3, "0")}`,
+    CLOSECALL_CONTRA_ENABLED: "true", CLOSECALL_CONTRA_THRESHOLD_LONG: String(cfg.contra.threshold.long), CLOSECALL_CONTRA_THRESHOLD_SHORT: String(cfg.contra.threshold.short),
+    CLOSECALL_CONTRA_COUNTERPARTIES_LONG: String(cfg.contra.counterparties.long), CLOSECALL_CONTRA_COUNTERPARTIES_SHORT: String(cfg.contra.counterparties.short),
     CLOSECALL_CONTRA_RESERVE: String(cfg.contra.reserve), CLOSECALL_ESTIMATOR: cfg.estimator,
   };
-  o.out(`CONTRA SHADOW (hypothetical: fake keys, nothing signed or sent, live DB read-only)  threshold ${(cfg.contra.threshold * 100).toFixed(2)}%  ` +
-    `${cfg.contra.counterparties} counterparties/champion  reserve ${(cfg.contra.reserve * 100).toFixed(1)}%  warm-up from #${from}`);
+  o.out(`CONTRA SHADOW (hypothetical: fake keys, nothing signed or sent, live DB read-only)  thresholds long ${(cfg.contra.threshold.long * 100).toFixed(2)}% / short ${(cfg.contra.threshold.short * 100).toFixed(2)}%  ` +
+    `counterparties ${cfg.contra.counterparties.long}/${cfg.contra.counterparties.short}  reserve ${(cfg.contra.reserve * 100).toFixed(1)}%  warm-up from #${from}`);
   const r = await engineReplay({ source: cfg.liveDbPath, vendorRoot: cfg.vendorRoot, contest, from, env, python: cfg.python });
-  const x = cfg.contra.threshold;
   const until = Date.now() + o.minutes * 60_000;
   let printedAt = -1;
   try {
@@ -53,10 +54,11 @@ export async function contraShadow(cfg: CloseCallConfig, contest: Contest, o: { 
           const did = r.trader.allKeys().find((k) => k.id === c.champion)!.did;
           const pos = Number(r.trader.ledger.accounts.get(did)?.position ?? 0n) / 1e6;
           const side = pos > 0 ? "LONG " : pos < 0 ? "SHORT" : "flat ";
+          const x = cfg.contra.threshold[c.name];
           const trig = c.anchor === null ? "-" : pos > 0 ? `>= ${(c.anchor * (1 + x)).toFixed(2)} (take profit, go short)` : pos < 0 ? `<= ${(c.anchor * (1 - x)).toFixed(2)} (take profit, go long)` : "reopen next sweep";
           const s = sc.byKey.get(c.champion) ?? 0;
           return `  champion ${c.name.padEnd(5)} ${side} ${Math.abs(pos).toFixed(2).padStart(6)}  anchor ${c.anchor?.toFixed(2) ?? "-"}  next ${trig}\n` +
-            `                  score ${s >= 0 ? "+" : ""}${s.toFixed(2)}  flips ${c.flips}  counterparties ${c.next}/${cfg.contra.counterparties}${c.exhausted ? " EXHAUSTED (holding)" : ""}${c.pending.length ? `  pending ${c.pending.length}` : ""}`;
+            `                  score ${s >= 0 ? "+" : ""}${s.toFixed(2)}  flips ${c.flips}  counterparties ${c.next}/${cfg.contra.counterparties[c.name]}${c.exhausted ? " EXHAUSTED (holding)" : ""}${c.pending.length ? `  pending ${c.pending.length}` : ""}`;
         });
         o.out(`\n#${last}  close ${sc.mark}  shadow best ${sc.best.id} ${sc.best.score >= 0 ? "+" : ""}${sc.best.score.toFixed(2)}  |  our best REAL key (K) ${bestRealKey(cfg.liveDbPath, close)}\n${lines.join("\n")}`);
       }

@@ -181,7 +181,7 @@ export class PaperTrader {
       const missing = this.cfg.contra.keys.filter((id) => !byId.has(id));
       if (missing.length) throw new Error(`CLOSECALL_CONTRA_KEYS names keys that do not exist: ${missing.join(" ")}`);
       this.contraKeys = this.cfg.contra.keys.map((id) => byId.get(id)!);
-      this.contraSpecs = contraSpecs(this.cfg.contra.keys, this.cfg.contra.counterparties);
+      this.contraSpecs = contraSpecs(this.cfg.contra.keys, this.cfg.contra.counterparties, this.cfg.contra.threshold);
       this.contraState = loadStrategyState<ContraState>(this.db, "CONTRA") ?? contraInitial(this.contraSpecs);
     }
     const rows = this.db.prepare("SELECT * FROM paper_sweeps ORDER BY n").all() as
@@ -390,7 +390,7 @@ export class PaperTrader {
     const work: WorkItem[] = decision.intents.map((intent) => ({ intent, buyer: this.keys[2 * intent.pairIndex], seller: this.keys[2 * intent.pairIndex + 1], qtyCap: null, reserve: this.cfg.strategy.reserve }));
     if (this.contraState && !this.contraOff) {
       const positions = Object.fromEntries(this.contraKeys.map((k) => [k.id, this.ledger.accounts.get(k.did)?.position ?? 0n]));
-      const cd = contraDecide(this.contraState, this.contraSpecs!, this.cfg.contra.threshold, { sweep: n, estimate: toNumber(est.value), lockSweep: this.contest.lockSweep, positions });
+      const cd = contraDecide(this.contraState, this.contraSpecs!, { sweep: n, estimate: toNumber(est.value), lockSweep: this.contest.lockSweep, positions });
       for (const note of cd.notes) ccLog("STRATEGY", { sweep: n, strategy: "CONTRA", threshold: this.cfg.contra.threshold }, note);
       if (commit) {
         // Counterparties are consumed HERE, persisted before any intent row or POST: never reused, even after a crash.

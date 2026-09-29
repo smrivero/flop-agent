@@ -19,7 +19,7 @@ import type { Favored } from "./k-ladder.js";
 export type ContraLeg = "open" | "close" | "reopen";
 export type Dir = 1 | -1;
 
-export interface ChampionSpec { name: "long" | "short"; startDir: Dir; champion: string; counterparties: string[] }
+export interface ChampionSpec { name: "long" | "short"; startDir: Dir; threshold: number; champion: string; counterparties: string[] }
 
 export interface ChampionState {
   name: "long" | "short";
@@ -61,12 +61,15 @@ export interface ContraInput {
   positions: Record<string, bigint>;
 }
 
-export function contraSpecs(keys: string[], counterparties: number): ChampionSpec[] {
-  if (keys.length !== 2 * (1 + counterparties)) throw new Error(`CONTRA needs ${2 * (1 + counterparties)} keys, got ${keys.length}`);
-  const half = 1 + counterparties;
+/** Layout: champion LONG, its counterparties, champion SHORT, its counterparties. */
+export function contraSpecs(keys: string[], counterparties: { long: number; short: number } | number, threshold: { long: number; short: number } | number = 0.0025): ChampionSpec[] {
+  const cps = typeof counterparties === "number" ? { long: counterparties, short: counterparties } : counterparties;
+  const thr = typeof threshold === "number" ? { long: threshold, short: threshold } : threshold;
+  if (keys.length !== 2 + cps.long + cps.short) throw new Error(`CONTRA needs ${2 + cps.long + cps.short} keys, got ${keys.length}`);
+  const s = 1 + cps.long;
   return [
-    { name: "long", startDir: 1, champion: keys[0], counterparties: keys.slice(1, half) },
-    { name: "short", startDir: -1, champion: keys[half], counterparties: keys.slice(half + 1) },
+    { name: "long", startDir: 1, threshold: thr.long, champion: keys[0], counterparties: keys.slice(1, s) },
+    { name: "short", startDir: -1, threshold: thr.short, champion: keys[s], counterparties: keys.slice(s + 1) },
   ];
 }
 
@@ -79,7 +82,7 @@ export function contraInitial(specs: ChampionSpec[]): ContraState {
 
 const fav = (dir: Dir): Favored => (dir > 0 ? "long" : "short");
 
-export function contraDecide(prev: ContraState, specs: ChampionSpec[], threshold: number, input: ContraInput): { state: ContraState; intents: ContraIntent[]; notes: string[] } {
+export function contraDecide(prev: ContraState, specs: ChampionSpec[], input: ContraInput): { state: ContraState; intents: ContraIntent[]; notes: string[] } {
   const s: ContraState = JSON.parse(JSON.stringify(prev));
   const intents: ContraIntent[] = [];
   const notes: string[] = [];
@@ -104,7 +107,7 @@ export function contraDecide(prev: ContraState, specs: ChampionSpec[], threshold
     }
     const long = pos > 0n;
     if (c.anchor === null) c.anchor = e;                            // restart with a position and no anchor: measure from now
-    const take = long ? e >= c.anchor * (1 + threshold) : e <= c.anchor * (1 - threshold);
+    const take = long ? e >= c.anchor * (1 + spec.threshold) : e <= c.anchor * (1 - spec.threshold);
     if (!take) continue;
     if (c.next + 2 > cps.length) {
       if (!c.exhausted) notes.push(`${c.name}: take-profit at ${e} but only ${cps.length - c.next} counterparty left: holding ${long ? "long" : "short"} until S`);

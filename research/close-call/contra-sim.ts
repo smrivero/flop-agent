@@ -25,6 +25,8 @@ export interface SimTrade { n: number; role: string; buyer: string; seller: stri
 export interface RunOut {
   best: number; bestKey: string; scores: Map<string, number>; champScores: number[]; keysUsed: number; flips: number[]; cpsUsed: number[];
   exhausted: number; trades: WireTrade[][]; log: SimTrade[]; sweeps: Info[]; voids: Record<string, number>;
+  /** Each champion at the end (position in contracts, last anchor); synced = same side from the same anchor. */
+  champEnd: { pos: number; anchor: number }[]; synced: boolean;
 }
 
 /** The information set per sweep, from a DB holding sweeps + estimates (+ stale-check halts). */
@@ -135,7 +137,9 @@ export function makeSim(cfg: CloseCallConfig, P: FoldParams, dids: string[]) {
     let best = -Infinity, bestKey = "";
     for (const [k, s] of scores) if (s > best) { best = s; bestKey = k; }
     const keysUsed = champs.reduce((a, c) => a + 1 + c.used, 0) + kNext;
+    const champEnd = champs.map((c) => ({ pos: num(l.accounts.get(c.did)!.position), anchor: c.entry }));
+    const synced = champEnd.length === 2 && champEnd.every((c) => c.pos !== 0) && Math.sign(champEnd[0].pos) === Math.sign(champEnd[1].pos) && champEnd[0].anchor === champEnd[1].anchor;
     return { best, bestKey, scores, champScores: champs.map((c) => scores.get(c.did)!), keysUsed, flips: champs.map((c) => c.flips), cpsUsed: champs.map((c) => c.used),
-      exhausted: champs.filter((c) => c.exhausted).length, trades, log, sweeps, voids };
+      exhausted: champs.filter((c) => c.exhausted).length, trades, log, sweeps, voids, champEnd, synced };
   };
 }
