@@ -199,9 +199,25 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
       add("network checks", true, "skipped (local mode: see live-check / service start)", false);
     } else {
       const ntp = ntpLocal;
-      const cfgRes = await timed(async () => { const r = await f(`${cfg.technocoreBaseUrl}/config`, { signal: AbortSignal.timeout(10_000) }); await r.text(); return r.headers.get("date"); });
-      const skew = cfgRes.value ? Math.round(nowMs + cfgRes.ms / 2 - Date.parse(cfgRes.value)) : null;
-      add("clock skew", ntp !== false && (skew === null || Math.abs(skew) < 2_000), `skew vs technocore ${skew === null ? "n/a" : `${skew} ms`} (±1000 ms resolution)`);
+      // Skew against technocore's Date header, measured at THIS request (the midpoint of send/receive), never against
+      // `nowMs` -- taken before the local checks, seconds earlier (30 Sep: a -2156 ms "skew" with NTP synchronised made
+      // the restart refuse). Uncached (fresh=), 3 samples, the smallest |skew| kept: the header has 1 s resolution.
+      const clock = deps.now ?? Date.now;
+      const samples: number[] = [];
+      let skewErr: string | null = null;
+      for (let i = 0; i < 3; i++) {
+        try {
+          const t0 = clock();
+          const r = await f(fresh(`${cfg.technocoreBaseUrl}/config`), { signal: AbortSignal.timeout(10_000) });
+          await r.text();
+          const t1 = clock();
+          const d = r.headers.get("date");
+          if (d) samples.push(Math.round((t0 + t1) / 2 - Date.parse(d)));
+        } catch (e) { skewErr = e instanceof Error ? e.message : String(e); }
+      }
+      const skew = samples.length ? samples.reduce((a, b) => (Math.abs(b) < Math.abs(a) ? b : a)) : null;
+      add("clock skew", ntp !== false && (skew === null || Math.abs(skew) < 2_000),
+        `skew vs technocore ${skew === null ? `n/a${skewErr ? ` (${skewErr})` : ""}` : `${skew} ms`} (best of ${samples.length}; ±1000 ms header resolution)`);
       const ref = await timed(async () => {
         const r = await f(`${cfg.technocoreBaseUrl}/r/d-close1-price?format=json&limit=1`, { signal: AbortSignal.timeout(10_000) });
         const v = JSON.parse(await r.text()) as { messages: { ts: string }[] };
@@ -218,7 +234,7 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
       const sample = async (fn: () => Promise<unknown>) => { const ms: number[] = []; for (let i = 0; i < 5; i++) ms.push((await timed(fn as () => Promise<unknown>)).ms); ms.sort((a, b) => a - b); return { p50: ms[2], p95: ms[4] }; };
       const tc = await sample(async () => (await f(`${cfg.technocoreBaseUrl}/config`, { signal: AbortSignal.timeout(10_000) })).text());
       const hs = await sample(async () => (await f(cfg.hyperliquidInfoUrl, { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ type: "recentTrades", coin: cfg.hyperliquidCoin }), signal: AbortSignal.timeout(10_000) })).text());
-      add("latency", tc.p95 < 2_000 && hs.p95 < 2_000 && !cfgRes.error, `technocore p50 ${tc.p50} / p95 ${tc.p95} ms, referee read ${ref.ms} ms, Hyperliquid p50 ${hs.p50} / p95 ${hs.p95} ms`);
+      add("latency", tc.p95 < 2_000 && hs.p95 < 2_000 && samples.length > 0, `technocore p50 ${tc.p50} / p95 ${tc.p95} ms, referee read ${ref.ms} ms, Hyperliquid p50 ${hs.p50} / p95 ${hs.p95} ms`);
       // Posting path per sweep: ~3 reads (writers, generation) + up to maxTradesPerSweep serialized POSTs, each ~ one round trip,
       // twice for safety, must fit in (decision lead - posting guard).
       const need = 2 * (3 + cfg.maxTradesPerSweep) * tc.p95;

@@ -78,7 +78,7 @@ function net(db: CcDb, o: { skewMs?: number; serverNonceBump?: bigint; owner?: s
     const headers = new Headers({ date: new Date(Date.now() - (o.skewMs ?? 0)).toUTCString() });
     const json = (v: unknown) => new Response(JSON.stringify(v), { status: 200, headers });
     if (init?.method && init.method !== "GET" && !u.includes("hyperliquid")) throw new Error(`non-GET to ${u}`);
-    if (u.endsWith("/config")) return json({ version: "0.14.5" });
+    if (u.split("?")[0].endsWith("/config")) return json({ version: "0.14.5" });
     if (u.includes("/r/d-close1-price")) return json({ messages: [{ ts: new Date(Date.now() - 30_000).toISOString() }] });
     if (u.includes("hyperliquid")) return json([{ time: Date.now() - 400_000, px: "224.1", tid: 1, coin: "xyz:NVDA" }]);
     if (u.includes("/kv/room-owners/")) return new Response(o.owner ?? admin.did, { status: 200, headers });
@@ -102,6 +102,17 @@ test("live-check: a fully prepared state PASSES; only GETs are made", async () =
   const rows = rowsOf(r);
   assert.match(rows["Hyperliquid feed"].value, /feed OK .* last trade 400 s ago \(a quiet market is not a broken feed\)/);
   assert.match(rows["isolation from paper"].value, /all inside/);
+});
+
+test("clock skew is measured at the request, not against the time taken before the local checks (30 Sep: -2156 ms with NTP synchronised)", async () => {
+  const { db, env } = prepared();
+  db.prepare("INSERT INTO nonces (signer_id, scope, last_nonce, updated_at) VALUES ('CC001', ?, '5000', ?)").run(`room:${ROOM}`, now());
+  let first = true;
+  const lateStart = () => { if (first) { first = false; return Date.now() - 3_000; } return Date.now(); };   // nowMs 3 s before the network checks
+  const r = await liveReadiness(testConfig(env), C, "check", { fetch: net(db), ntp: () => true, now: lateStart });
+  const row = r.rows.find((x) => x.name === "clock skew")!;
+  assert.ok(row.ok, row.value);
+  assert.match(row.value, /best of 3/);
 });
 
 test("live-check FAILS, with the reason, on each missing condition", async () => {
