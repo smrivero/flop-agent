@@ -76,6 +76,12 @@ export interface MonitorSources {
 
 const safe = <T>(f: () => T, dflt: T): T => { try { return f(); } catch { return dflt; } };
 
+/** The service unit the monitor watches: the LIVE unit in live mode (2 Oct: `watch --live` read the paper unit and showed
+ * "LIVE up 2d" while flop-closecall-live had failed 12 min earlier). */
+export function serviceUnit(mode: string): string {
+  return mode === "live" ? "flop-closecall-live.service" : "flop-closecall.service";
+}
+
 export function readSystemd(unit = "flop-closecall.service"): SystemdInfo | null {
   try {
     const outp = execFileSync("systemctl", ["show", unit, "--timestamp=unix", "--property=ActiveState,SubState,MainPID,NRestarts,ActiveEnterTimestamp,MemoryCurrent,CPUUsageNSec"],
@@ -169,7 +175,7 @@ const bps = (a: number, b: number) => ((a - b) / b) * 10_000;
 export async function collect(src: MonitorSources): Promise<MonitorData> {
   const { cfg, contest } = src;
   const now = src.now ?? Date.now();
-  const sd = safe(() => (src.systemd ?? readSystemd)(), null);
+  const sd = safe(() => (src.systemd ?? (() => readSystemd(serviceUnit(src.cfg.mode))))(), null);
   const h = await safe(() => (src.fetchHealth ?? (() => fetchHealth(cfg)))(), Promise.resolve(null)).catch(() => null);
   const live = cfg.mode === "live";
   const { db, error: dbError } = openReadonly(cfg.dbPath);
@@ -698,7 +704,7 @@ export async function watch(src: MonitorSources, opts: { intervalS: number; colo
     const t0 = Date.now();
     let frame: string;
     try {
-      const sd = (src.systemd ?? readSystemd)();
+      const sd = (src.systemd ?? (() => readSystemd(serviceUnit(src.cfg.mode))))();
       const data = await collect({ ...src, now: undefined, systemd: () => sd, prev });
       if (sd?.cpuNs !== null && sd?.cpuNs !== undefined) prev = { at: data.at, cpuNs: sd.cpuNs };
       frame = render(data, { color: opts.color, width: out.columns || 100, compact: opts.compact }) + `\n\n${opts.color ? "\x1b[2m" : ""}refresh ${opts.intervalS}s · Ctrl+C to quit · read only${opts.color ? "\x1b[0m" : ""}`;

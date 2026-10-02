@@ -211,3 +211,20 @@ test("live run start: a DISARMED writer starts in catch-up mode; a transient hal
   halt(db, "referee_stale", "no new referee message for 4000 s");
   assert.equal(activeHalts(db).referee_stale.severity, "transient");
 });
+
+test("start gate: a slow latency sample / skew read / referee read is RETRIED (the service stays up); structural failures still refuse", async () => {
+  const { startGateDecision } = await import("./readiness.js");
+  const row = (name: string): ReadinessRow => ({ name, ok: false, value: "x" });
+  assert.equal(startGateDecision([]), "start");
+  assert.equal(startGateDecision([row("deadline margin")]), "retry", "2 Oct: one slow latency sample exited the service");
+  assert.equal(startGateDecision([row("clock skew"), row("latency"), row("referee"), row("Hyperliquid feed"), row("state backup (DB)")]), "retry");
+  for (const structural of ["key files", "room on server", "nonce reconciliation", "not halted", "restore verification", "key dir perms", "unknown trades", "pending writes"]) {
+    assert.equal(startGateDecision([row("latency"), row(structural)]), "refuse", structural);
+  }
+});
+
+test("the live monitor watches the LIVE unit (2 Oct: it read the paper unit and showed LIVE up 2d while live had failed)", async () => {
+  const { serviceUnit } = await import("./monitor.js");
+  assert.equal(serviceUnit("live"), "flop-closecall-live.service");
+  assert.equal(serviceUnit("paper"), "flop-closecall.service");
+});

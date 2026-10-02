@@ -302,6 +302,18 @@ function finish(rows: ReadinessRow[], mode: ReadinessMode): { pass: boolean; row
  * With the writer disarmed, only GRAVE halts block the start: a transient one (referee_stale left by an outage)
  * clears itself once the service observes again -- it could never clear if it kept the service from starting.
  */
+/**
+ * Start-gate rows that a network hiccup can fail for a minute (latency samples, clock-skew read, referee / Hyperliquid
+ * reads) or that a cron fixes (DB backup age). When ONLY these block, `live run` re-runs the gate instead of exiting:
+ * an exit leaves the unit down for good (30 Sep: 2 days on a false clock skew; 2 Oct: a slow latency sample).
+ */
+export const TRANSIENT_START_ROWS: ReadonlySet<string> = new Set(["latency", "deadline margin", "clock skew", "referee", "Hyperliquid feed", "state backup (DB)"]);
+
+export function startGateDecision(blockers: ReadinessRow[]): "start" | "retry" | "refuse" {
+  if (!blockers.length) return "start";
+  return blockers.every((r) => TRANSIENT_START_ROWS.has(r.name)) ? "retry" : "refuse";
+}
+
 export function runStartBlockers(rows: ReadinessRow[], writerArmed: boolean, onlyTransientHalts: boolean): ReadinessRow[] {
   return rows.filter((r) => !r.ok && r.name !== "writer" && !(r.name === "not halted" && !writerArmed && onlyTransientHalts));
 }

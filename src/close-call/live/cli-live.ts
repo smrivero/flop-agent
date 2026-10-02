@@ -46,7 +46,7 @@ import { banner, runLoop } from "../run.js";
 import { LiveExecutor } from "./executor.js";
 import { HttpTransport } from "./http-transport.js";
 import { liveReadiness, renderReadiness } from "./readiness.js";
-import { runStartBlockers } from "../readiness.js";
+import { runStartBlockers, startGateDecision } from "../readiness.js";
 import { renderDrill, restoreDrill } from "./restore-drill.js";
 import { contraShadow } from "../contra-shadow.js";
 import { importSeed, seedImportProvenance, SeedImportRefused } from "./import-seed.js";
@@ -114,14 +114,24 @@ async function main(argv: string[]): Promise<number> {
   }
 
   if (cmd === "run") {
-    const r = await liveReadiness(cfg, contest, "run", { envFile });
     process.stdout.write(banner("live") + "\n");
-    const armedAtStart = writerState(cfg).armed;
-    const halts = (() => { const { db: h } = openReadonly(cfg.liveDbPath); if (!h) return []; try { return Object.values(activeHalts(h)); } finally { h.close(); } })();
-    const blockers = runStartBlockers(r.rows, armedAtStart, halts.every((x) => x.severity === "transient"));
-    if (blockers.length) {
-      process.stderr.write(renderReadiness(r) + `\n[CLOSECALL][HALT] live readiness FAILED (${blockers.map((x) => x.name).join(", ")}): refusing to start. NO WRITE.\n`);
-      return 3;
+    let r = await liveReadiness(cfg, contest, "run", { envFile });
+    let armedAtStart = writerState(cfg).armed;
+    for (let attempt = 1; ; attempt++) {
+      armedAtStart = writerState(cfg).armed;
+      const halts = (() => { const { db: h } = openReadonly(cfg.liveDbPath); if (!h) return []; try { return Object.values(activeHalts(h)); } finally { h.close(); } })();
+      const blockers = runStartBlockers(r.rows, armedAtStart, halts.every((x) => x.severity === "transient"));
+      const decision = startGateDecision(blockers);
+      if (decision === "start") break;
+      if (decision === "refuse") {
+        process.stderr.write(renderReadiness(r) + `\n[CLOSECALL][HALT] live readiness FAILED (${blockers.map((x) => x.name).join(", ")}): refusing to start. NO WRITE.\n`);
+        return 3;
+      }
+      // Only transient rows: stay up and re-run the gate (nothing is written meanwhile; the service is not running yet).
+      process.stderr.write(`[CLOSECALL][HALT] start gate attempt ${attempt}: transient failure (${blockers.map((x) => `${x.name}: ${x.value}`).join(" | ")}); ` +
+        "retrying in 30 s. NO WRITE.\n");
+      await sleep(30_000);
+      r = await liveReadiness(cfg, contest, "run", { envFile });
     }
     if (!armedAtStart) {
       process.stderr.write(`[CLOSECALL][SAFE MODE] starting DISARMED (${writerState(cfg).reason}): catch-up / observe only -- no intent, no signature, no POST. ` +
