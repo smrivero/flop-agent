@@ -177,6 +177,52 @@ test("disaster recovery drill: backup -> brand-new dir -> live-check --offline P
   assert.ok(r.pass, renderReadiness(r));
 });
 
+test("RoomKeeper while DISARMED: the refresh is due but nothing is planned, reserved or signed; armed, it writes (2 Oct: a prepared note blocked `live arm`)", async () => {
+  const x = prepared();
+  const signers = loadSigners(x.db, join(x.dir, "keys"));
+  const srv = new MockTechnocore();
+  let t = Date.parse("2026-09-27T00:00:00Z");
+  srv.clock = () => t;
+  const admin = keysByRole(x.db, "admin")[0];
+  const others = [...keysByRole(x.db, "staging"), ...keysByRole(x.db, "strategy")];
+  srv.notes.set(`room-owners/${ROOM}`, admin.did);
+  srv.notes.set(`room-allow/${ROOM}`, others.map((k) => k.did).join(" "));
+  srv.notes.set(`room-nonce/${ROOM}`, "1");
+  srv.rooms.set(ROOM, [{ seq: 1, from: others[0].did, text: "a", ts: new Date(t).toISOString() }, { seq: 2, from: others[1].did, text: "b", ts: new Date(t).toISOString() }]);
+  setMeta(x.db, "bootstrap_done_at", new Date(t - 6 * 86_400_000).toISOString());   // the 5-day refresh is due
+  let armed = false;
+  const journal = new WriteJournal(x.db, signers, srv, { clock: () => t, canWrite: () => (armed ? null : "kill switch: recovery") });
+  const keeper = new RoomKeeper({ db: x.db, journal, transport: srv, room: ROOM, clock: () => t });
+  const nonces0 = JSON.stringify(x.db.prepare("SELECT * FROM nonces ORDER BY signer_id, scope").all());
+  const r = await keeper.tick();
+  assert.equal(r.wrote, 0);
+  assert.match(r.detail, /upkeep skipped: writer disarmed/);
+  assert.equal((x.db.prepare("SELECT COUNT(*) c FROM write_attempts").get() as { c: number }).c, 0, "no journal row at all");
+  assert.equal(JSON.stringify(x.db.prepare("SELECT * FROM nonces ORDER BY signer_id, scope").all()), nonces0, "no nonce reserved");
+  assert.equal(srv.posts, 0);
+  armed = true;
+  const r2 = await keeper.tick();
+  assert.ok(r2.wrote >= 2, "armed: owners + allow refreshed");
+  assert.equal((x.db.prepare("SELECT COUNT(*) c FROM write_attempts WHERE state <> 'CONFIRMED'").get() as { c: number }).c, 0);
+});
+
+test("pending writes: a write queued and NEVER sent does not block (it is sent as signed once armed); one in flight still does", async () => {
+  const { db, env } = prepared();
+  db.prepare("INSERT INTO nonces (signer_id, scope, last_nonce, updated_at) VALUES ('CC001', ?, '5000', ?)").run(`room:${ROOM}`, now());
+  const row = (id: string, state: string, tries: number) => db.prepare(`INSERT INTO write_attempts (attempt_id, op_key, kind, room, ns, note_key, signer_id, nonce, payload_sha256, body, state, tries, created_at, updated_at)
+    VALUES (?, ?, 'note-owners', NULL, 'room-owners', ?, 'CC-ADMIN', '9', 'x', '{}', ?, ?, ?, ?)`).run(id, `refresh:${ROOM}:${id}:owners`, ROOM, state, tries, now(), now());
+  row("q", "PREPARED", 0);
+  let r = await liveReadiness(testConfig(env), C, "check", { fetch: net(db), ntp: () => true });
+  let p = r.rows.find((x) => x.name === "pending writes")!;
+  assert.ok(p.ok, p.value);
+  assert.match(p.value, /0 in flight; 1 queued, never sent/);
+  row("s", "SENDING", 1);
+  r = await liveReadiness(testConfig(env), C, "check", { fetch: net(db), ntp: () => true });
+  p = r.rows.find((x) => x.name === "pending writes")!;
+  assert.equal(p.ok, false, "a write that may have reached the server blocks");
+  assert.match(p.value, /^1 in flight/);
+});
+
 test("RoomKeeper: 5-day refresh (CAS, current values), 48 h keepalive, foreign allow-list -> grave halt with an alert", async () => {
   const x = prepared();
   const signers = loadSigners(x.db, join(x.dir, "keys"));

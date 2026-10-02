@@ -187,8 +187,12 @@ export async function liveReadiness(cfg: CloseCallConfig, contest: Contest, mode
     add("nonce store", future === 0, future ? `${future} nonces more than a day ahead of the clock` : `${(db.prepare("SELECT COUNT(*) n FROM nonces").get() as { n: number }).n} scopes persisted`);
     const halts = Object.values(activeHalts(db));
     add("not halted", halts.length === 0, halts.length ? halts.map((h) => `${h.kind}: ${h.reason}`).join(" | ") : "no halt", false);
-    const pending = (db.prepare("SELECT COUNT(*) n FROM write_attempts WHERE state NOT IN ('CONFIRMED','FAILED')").get() as { n: number }).n;
-    add("pending writes", pending === 0, String(pending), false);
+    // In flight (SENDING / UNKNOWN / a PREPARED row already tried) blocks; a write queued and NEVER sent (tries = 0) did
+    // not leave this process -- nothing is ambiguous -- and is sent exactly as signed once armed.
+    const inFlight = (db.prepare(`SELECT COUNT(*) n FROM write_attempts WHERE state NOT IN ('CONFIRMED','FAILED')
+      AND NOT (state IN ('PLANNED','PREPARED') AND tries = 0)`).get() as { n: number }).n;
+    const queued = (db.prepare("SELECT COUNT(*) n FROM write_attempts WHERE state IN ('PLANNED','PREPARED') AND tries = 0").get() as { n: number }).n;
+    add("pending writes", inFlight === 0, `${inFlight} in flight${queued ? `; ${queued} queued, never sent (sent as signed once armed)` : ""}`, false);
     const unknown = (db.prepare("SELECT COUNT(*) n FROM live_trades WHERE state = 'UNKNOWN'").get() as { n: number }).n;
     add("unknown trades", unknown === 0, String(unknown), false);
 

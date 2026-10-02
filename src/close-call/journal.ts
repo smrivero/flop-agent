@@ -132,6 +132,11 @@ export class WriteJournal {
     return next.toString();
   }
 
+  /** Non-null: the writer is disarmed (config or kill switch) and nothing may be planned, signed or sent. */
+  writeBlocked(): string | null {
+    return this.opts.canWrite?.() ?? null;
+  }
+
   get(opKey: string): AttemptRow | undefined {
     return this.db.prepare("SELECT * FROM write_attempts WHERE op_key = ? ORDER BY created_at DESC, rowid DESC LIMIT 1").get(opKey) as AttemptRow | undefined;
   }
@@ -188,9 +193,11 @@ export class WriteJournal {
    * (FAILED) and nothing is ever re-sent: the caller reconciles with readBackOnly().
    */
   async send(row: AttemptRow, opts: { noResend?: boolean } = {}): Promise<AttemptRow> {
-    if (row.state === "PLANNED") row = this.prepare(row);
+    // The kill switch BEFORE anything is reserved or signed (2 Oct: a room upkeep note prepared while disarmed sat in
+    // the journal as a pending write and blocked `live arm`).
     const blocked = this.opts.canWrite?.() ?? null;
     if (blocked) throw new WriterDisarmed(`writer disarmed: ${blocked}`);
+    if (row.state === "PLANNED") row = this.prepare(row);
     const req = this.request(row);
     row = this.set(row, { state: "SENDING", tries: row.tries + 1 });
     let res: TransportResponse;

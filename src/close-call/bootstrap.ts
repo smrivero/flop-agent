@@ -78,6 +78,8 @@ const realSleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 /** Shared by Bootstrap and RoomKeeper: journaled write with 429 back-off, UNKNOWN resolved by read-back, anything else ambiguous halts. */
 export async function journaledWrite(d: Pick<BootstrapDeps, "db" | "journal" | "pace" | "sleep">, op: WriteOp, label: string):
   Promise<{ row: AttemptRow } | { halted: string } | { blocked: string }> {
+  const disarmed = d.journal.writeBlocked();
+  if (disarmed) return { blocked: `writer disarmed: ${disarmed}` };     // nothing planned, reserved or signed while disarmed
   try {
     let row = await d.journal.execute(op);
     for (let i = 0; row.state === "PREPARED" && row.http_status === 429 && i < 6; i++) {
